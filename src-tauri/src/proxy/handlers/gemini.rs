@@ -70,6 +70,7 @@ pub async fn handle_generate(
     State(state): State<AppState>,
     Path(model_action): Path<String>,
     headers: HeaderMap,          // [NEW] Extract headers for adapter detection
+    upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // 解析 model:method
@@ -261,6 +262,10 @@ pub async fn handle_generate(
             token_obj.as_ref(),
             Some(&token_manager),
         );
+
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&wrapped_body);
+        }
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({

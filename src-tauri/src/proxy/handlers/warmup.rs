@@ -239,6 +239,7 @@ pub async fn handle_warmup(
                     "{{\"type\": \"warmup\", \"model\": \"{}\"}}",
                     req.model
                 )),
+                upstream_request_body: None,
                 response_body: None,
                 input_tokens: Some(0),
                 output_tokens: Some(0),
@@ -337,6 +338,7 @@ pub async fn handle_warmup(
                     "{{\"type\": \"warmup\", \"model\": \"{}\"}}",
                     req.model
                 )),
+                upstream_request_body: None,
                 response_body: Some(e.clone()),
                 input_tokens: None,
                 output_tokens: None,

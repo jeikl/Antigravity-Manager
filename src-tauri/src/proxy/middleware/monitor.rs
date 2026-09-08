@@ -1,5 +1,5 @@
 use crate::proxy::middleware::auth::UserTokenIdentity;
-use crate::proxy::monitor::ProxyRequestLog;
+use crate::proxy::monitor::{ProxyRequestLog, UpstreamRequestBodyHolder};
 use crate::proxy::server::AppState;
 use axum::{
     body::Body,
@@ -458,7 +458,12 @@ pub async fn monitor_middleware(
         request
     };
 
+    let upstream_holder = UpstreamRequestBodyHolder::new();
+    let mut request = request;
+    request.extensions_mut().insert(upstream_holder.clone());
+
     let response = next.run(request).await;
+    let upstream_request_body = upstream_holder.take();
 
     // user_token_identity 已在上面从请求 extensions 中提取
 
@@ -519,6 +524,7 @@ pub async fn monitor_middleware(
         client_ip,
         error: None,
         request_body: request_body_str,
+        upstream_request_body,
         response_body: None,
         input_tokens: None,
         output_tokens: None,

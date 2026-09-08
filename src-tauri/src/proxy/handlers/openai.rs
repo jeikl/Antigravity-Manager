@@ -1688,6 +1688,7 @@ fn prefix_with_step_marker(_marker: Option<String>, content: String) -> String {
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap, // [CHANGED] Extract headers
+    upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // [NEW] Check for Image Model Redirection
@@ -2003,6 +2004,9 @@ pub async fn handle_chat_completions(
             &mapped_model,
             proxy_token.as_ref(),
         );
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
         let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
 
@@ -2820,6 +2824,7 @@ pub async fn handle_completions(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     State(state): State<AppState>,
     headers: HeaderMap,
+    upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>,
 ) -> Response {
     debug!(
@@ -3733,6 +3738,9 @@ pub async fn handle_completions(
             &mapped_model,
             proxy_token.as_ref(),
         );
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
         let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
         if debug_logger::is_enabled(&debug_cfg) {
@@ -4435,9 +4443,10 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
 pub async fn handle_chat_redirection(
     State(state): State<AppState>,
     headers: HeaderMap,
+    upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    handle_chat_completions(State(state), headers, Json(body)).await
+    handle_chat_completions(State(state), headers, upstream_recorder, Json(body)).await
 }
 
 async fn intercept_chat_to_image(
@@ -5669,7 +5678,7 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
 
         let openai_body = convert_codex_to_openai_request(normalized);
         let response_result =
-            handle_chat_completions(State(state.clone()), headers.clone(), Json(openai_body)).await;
+            handle_chat_completions(State(state.clone()), headers.clone(), None, Json(openai_body)).await;
 
         let response = match response_result {
             Ok(res) => res.into_response(),

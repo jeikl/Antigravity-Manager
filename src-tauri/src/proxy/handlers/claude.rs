@@ -388,6 +388,7 @@ fn apply_variant(
 pub async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
+    upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(body): Json<Value>,
 ) -> Response {
     // [FIX] 保存原始请求体的完整副本，用于日志记录
@@ -641,6 +642,10 @@ pub async fn handle_messages(
 
         // Inject cache_control into the XML summary message if it is a Forked session
         inject_cache_control_to_forked_summary(&mut new_body);
+
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&new_body);
+        }
 
         return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
             &state,
@@ -1129,6 +1134,10 @@ pub async fn handle_messages(
                     .into_response();
             }
         };
+
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({

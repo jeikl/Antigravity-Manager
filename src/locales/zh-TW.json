@@ -1028,6 +1028,7 @@
     "details": {
       "title": "請求詳情",
       "request_payload": "請求封包 (Request)",
+      "upstream_request_payload": "轉出封包 (Forwarded)",
       "response_payload": "回應封包 (Response)",
       "duration": "耗時",
       "tokens": "Token 消耗 (輸入/輸出)",

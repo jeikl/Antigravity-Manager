@@ -18,12 +18,72 @@ pub struct ProxyRequestLog {
     pub client_ip: Option<String>, // 客户端 IP 地址
     pub error: Option<String>,
     pub request_body: Option<String>,
+    pub upstream_request_body: Option<String>, // 网关转出给上游(Antigravity)的报文
     pub response_body: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
+}
+
+#[derive(Clone, Default)]
+pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl UpstreamRequestBodyHolder {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    pub fn set(&self, body: String) {
+        if let Ok(mut lock) = self.0.lock() {
+            *lock = Some(body);
+        }
+    }
+
+    pub fn set_value(&self, val: &serde_json::Value) {
+        let clean = sanitize_upstream_debug_value(val);
+        if let Ok(s) = serde_json::to_string(&clean) {
+            self.set(s);
+        }
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
+fn sanitize_upstream_debug_value(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s)
+            if s.starts_with("data:image/") || s.starts_with("data:audio/") =>
+        {
+            serde_json::Value::String(format!("[inline data omitted: {} chars]", s.len()))
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sanitize_upstream_debug_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let is_inline = map.get("mimeType").and_then(serde_json::Value::as_str).is_some()
+                && map.get("data").and_then(serde_json::Value::as_str).is_some();
+            serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        let v = if is_inline && k == "data" {
+                            serde_json::Value::String(format!(
+                                "[inline data omitted: {} chars]",
+                                v.as_str().map(str::len).unwrap_or_default()
+                            ))
+                        } else {
+                            sanitize_upstream_debug_value(v)
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            )
+        }
+        _ => val.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -164,6 +224,7 @@ impl ProxyMonitor {
                 client_ip: log.client_ip.clone(),
                 error: log.error.clone(),
                 request_body: None,  // Don't send body in event
+                upstream_request_body: None,
                 response_body: None, // Don't send body in event
                 input_tokens: log.input_tokens,
                 output_tokens: log.output_tokens,

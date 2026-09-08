@@ -1183,6 +1183,7 @@
     "details": {
       "title": "Request Details",
       "request_payload": "Request Payload",
+      "upstream_request_payload": "Forwarded Request Payload",
       "response_payload": "Response Payload",
       "duration": "Duration",
       "tokens": "Tokens (I/O)",

@@ -23,6 +23,7 @@ interface ProxyRequestLog {
     mapped_model?: string;
     error?: string;
     request_body?: string;
+    upstream_request_body?: string;
     response_body?: string;
     input_tokens?: number;
     output_tokens?: number;
@@ -306,6 +307,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 const logSummary = {
                     ...newLog,
                     request_body: undefined,
+                    upstream_request_body: undefined,
                     response_body: undefined
                 };
 
@@ -678,6 +680,46 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     </div>
                                     <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">{formatBody(selectedLog.request_body)}</div>
                                 </div>
+                                {selectedLog.upstream_request_body && (
+                                    <div>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">
+                                                {t('monitor.details.upstream_request_payload', '转出报文 (Forwarded)')}
+                                            </h3>
+                                            <button
+                                                type="button"
+                                                className="btn btn-ghost btn-xs gap-1"
+                                                onClick={async () => {
+                                                    if (!selectedLog.upstream_request_body) return;
+                                                    const success = await copyToClipboard(getCopyPayload(selectedLog.upstream_request_body));
+                                                    if (success) {
+                                                        setCopiedRequestId(selectedLog.id ? `${selectedLog.id}-upstream` : null);
+                                                        setTimeout(() => {
+                                                            setCopiedRequestId((current) =>
+                                                                current === `${selectedLog.id}-upstream` ? null : current
+                                                            );
+                                                        }, 2000);
+                                                    }
+                                                }}
+                                                disabled={!selectedLog.upstream_request_body}
+                                                title={copiedRequestId === `${selectedLog.id}-upstream` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                                aria-label={t('proxy.config.btn_copy')}
+                                            >
+                                                {copiedRequestId === `${selectedLog.id}-upstream` ? (
+                                                    <CheckCircle size={12} className="text-green-500" />
+                                                ) : (
+                                                    <Copy size={12} />
+                                                )}
+                                                <span className="text-[10px]">
+                                                    {copiedRequestId === `${selectedLog.id}-upstream` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
+                                                </span>
+                                            </button>
+                                        </div>
+                                        <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">
+                                            {formatBody(selectedLog.upstream_request_body)}
+                                        </div>
+                                    </div>
+                                )}
                                 <div>
                                     <div className="flex items-center justify-between mb-2">
                                         <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">{t('monitor.details.response_payload')}</h3>

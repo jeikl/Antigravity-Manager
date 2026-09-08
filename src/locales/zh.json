@@ -1176,6 +1176,7 @@
     "details": {
       "title": "请求详情",
       "request_payload": "请求报文 (Request)",
+      "upstream_request_payload": "转出报文 (Forwarded)",
       "response_payload": "响应报文 (Response)",
       "duration": "耗时",
       "tokens": "Token 消耗 (输入/输出)",
