@@ -2,10 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { X, Sparkles, Loader2, CheckCircle, RotateCcw } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { useTranslation } from 'react-i18next';
-import { check as tauriCheck } from '@tauri-apps/plugin-updater';
 import { relaunch as tauriRelaunch } from '@tauri-apps/plugin-process';
-import { isTauri } from '../utils/env';
-import { showToast } from './common/ToastContainer';
 
 interface UpdateInfo {
   has_update: boolean;
@@ -45,67 +42,14 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
 
       setUpdateInfo(info);
 
-      // 2. If not in Tauri — no auto-update possible
-      if (!isTauri()) {
-        console.warn('Auto update is only available in Tauri environment');
-        onClose();
-        return;
-      }
-
-      // Check if Linux and not AppImage (e.g. RPM or DEB packages).
-      // Tauri updater only supports AppImage on Linux.
-      if (navigator.userAgent.toLowerCase().includes('linux')) {
-        const isAppImage = await invoke<boolean>('check_appimage_installation');
-        if (!isAppImage) {
-          setUpdateState('manual');
-          setTimeout(() => setIsVisible(true), 100);
-          return;
-        }
-      }
-
-      // 3. Start background download immediately
-      if (downloadStarted.current) return;
-      downloadStarted.current = true;
-
-      setUpdateState('downloading');
+      // 2. Custom build protection:
+      // Prevent automatic silent downloading and installation that overwrites custom build features
+      setUpdateState('manual');
       setTimeout(() => setIsVisible(true), 100);
-
-      const update = await tauriCheck();
-      if (!update) {
-        // updater.json not ready yet or no update via native channel
-        console.warn('Native updater returned null');
-        showToast(t('update_notification.toast.not_ready'), 'info');
-        handleClose();
-        return;
-      }
-
-      let downloaded = 0;
-      let contentLength = 0;
-
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case 'Started':
-            contentLength = event.data.contentLength || 0;
-            break;
-          case 'Progress':
-            downloaded += event.data.chunkLength;
-            if (contentLength > 0) {
-              setDownloadProgress(Math.round((downloaded / contentLength) * 100));
-            }
-            break;
-          case 'Finished':
-            break;
-        }
-      });
-
-      // 4. Download complete — show restart prompt
-      setUpdateState('ready');
-      setDownloadProgress(100);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error('Auto update failed:', errorMsg);
-      setUpdateState('error');
-      showToast(`${t('update_notification.toast.failed')}: ${errorMsg}`, 'error');
+      console.error('Update check failed:', errorMsg);
+      onClose();
     }
   };
 
@@ -196,8 +140,8 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
               {updateState === 'error' && `${t('update_notification.toast.failed')}`}
               {updateState === 'manual' && (
                 navigator.language.startsWith('zh')
-                  ? '检测到您当前运行的不是 AppImage 格式，自动更新仅支持 AppImage。请点击下方按钮手动下载更新。'
-                  : 'We detected that you are not running the AppImage version. Auto-updates are only supported for AppImage. Please download the update manually.'
+                  ? '检测到官方新版本发布。当前程序为定制增强版本（包含思考块与审计转出报文等定制功能），为防止定制功能被官方安装包覆盖，已关闭自动静默覆盖。您可以前往 GitHub 查看发布详情或手动下载。'
+                  : 'A new official version is available. Since you are running a custom enhanced build, automatic silent updates are disabled to prevent overwriting your customizations. You can view the release on GitHub or download manually.'
               )}
             </p>
           </div>
@@ -280,7 +224,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({ onClose 
                   active:scale-[0.98]
                 "
               >
-                <span>{navigator.language.startsWith('zh') ? '手动下载' : 'Download Manually'}</span>
+                <span>{navigator.language.startsWith('zh') ? '前往查看' : 'View on GitHub'}</span>
               </button>
               <button
                 onClick={handleClose}
