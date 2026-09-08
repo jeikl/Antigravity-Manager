@@ -237,7 +237,9 @@ function extractConcisePayload(
                     return {
                         type: 'thinking',
                         thinking: item.thinking,
-                        ...(item.signature ? { signature: item.signature } : {})
+                        ...(item.signature ? { signature: item.signature } : {}),
+                        ...(item.thought_signature ? { thought_signature: item.thought_signature } : {}),
+                        ...(item.thinking_signature ? { thinking_signature: item.thinking_signature } : {})
                     };
                 }
                 // Claude redacted_thinking 块
@@ -275,6 +277,12 @@ function extractConcisePayload(
             if (m.signature !== undefined) {
                 res.signature = m.signature;
             }
+            if (m.thought_signature !== undefined) {
+                res.thought_signature = m.thought_signature;
+            }
+            if (m.thinking_signature !== undefined) {
+                res.thinking_signature = m.thinking_signature;
+            }
             if (m.tool_calls) {
                 res.tool_calls = simplifyToolCalls(m.tool_calls);
             }
@@ -297,10 +305,11 @@ function extractConcisePayload(
             if (Array.isArray(c.parts)) {
                 res.parts = c.parts.map((p: any) => {
                     if (!p || typeof p !== 'object') return p;
-                    if (p.thought !== undefined || p.thought_signature !== undefined) {
+                    if (p.thought !== undefined || p.thought_signature !== undefined || p.signature !== undefined) {
                         const tPart: any = {};
                         if (p.thought !== undefined) tPart.thought = p.thought;
                         if (p.thought_signature !== undefined) tPart.thought_signature = p.thought_signature;
+                        if (p.signature !== undefined) tPart.signature = p.signature;
                         if (p.text !== undefined) tPart.text = p.text;
                         return tPart;
                     }
@@ -325,6 +334,21 @@ function extractConcisePayload(
             }
             return res;
         });
+    };
+
+    // 简化系统提示词 (Gemini / Anthropic)
+    const simplifySystemInstruction = (sys: any): any => {
+        if (!sys || typeof sys !== 'object') return sys;
+        if (Array.isArray(sys.parts)) {
+            return {
+                parts: sys.parts.map((p: any) => {
+                    if (typeof p === 'string') return { text: p };
+                    if (p && typeof p === 'object' && p.text !== undefined) return { text: p.text };
+                    return p;
+                })
+            };
+        }
+        return sys;
     };
 
     // 提取用量与缓存命中率
@@ -366,11 +390,16 @@ function extractConcisePayload(
 
     const concise: any = {};
 
-    // 保留用于标识思考块/会话的单行标识
-    if (obj._session_id || obj.session_id) {
-        concise._session_thinking_id = obj._session_id || obj.session_id;
-    } else if (log?.id) {
-        concise._request_id = log.id;
+    // 保留用于标识思考块/会话的单行标识 (支持 requestId, sessionId, trace_id 等)
+    const candidateSessionId =
+        obj.requestId ||
+        obj.request?.sessionId ||
+        obj._session_id ||
+        obj.session_id ||
+        (log?.id ? log.id : undefined);
+
+    if (candidateSessionId) {
+        concise._session_thinking_id = candidateSessionId;
     }
 
     // 模型
@@ -389,7 +418,7 @@ function extractConcisePayload(
 
     // 系统提示词
     if (obj.system !== undefined) concise.system = obj.system;
-    if (obj.systemInstruction !== undefined) concise.systemInstruction = obj.systemInstruction;
+    if (obj.systemInstruction !== undefined) concise.systemInstruction = simplifySystemInstruction(obj.systemInstruction);
 
     // 对话主体 (OpenAI / Claude)
     if (obj.messages) {
@@ -406,6 +435,49 @@ function extractConcisePayload(
         concise.tools = simplifyTools(obj.tools);
     }
 
+    // Antigravity 专用的 request 嵌套包装层 (核心：正确映射原中转报文的嵌套层级)
+    if (obj.request && typeof obj.request === 'object') {
+        const innerReq: any = {};
+
+        // 单行会话标识
+        if (obj.request.sessionId) {
+            innerReq.sessionId = obj.request.sessionId;
+        }
+
+        // 思考配置 (thinkingConfig / generationConfig)
+        if (obj.request.generationConfig?.thinkingConfig !== undefined) {
+            innerReq.thinkingConfig = obj.request.generationConfig.thinkingConfig;
+        } else if (obj.request.thinkingConfig !== undefined) {
+            innerReq.thinkingConfig = obj.request.thinkingConfig;
+        }
+
+        // 系统提示词
+        if (obj.request.systemInstruction !== undefined) {
+            innerReq.systemInstruction = simplifySystemInstruction(obj.request.systemInstruction);
+        }
+
+        // 对话主体与思考块 (Gemini contents 或 Claude messages)
+        if (obj.request.contents) {
+            innerReq.contents = simplifyGeminiContents(obj.request.contents);
+        }
+        if (obj.request.messages) {
+            innerReq.messages = simplifyMessages(obj.request.messages);
+        }
+
+        // 工具声明
+        if (obj.request.tools) {
+            innerReq.tools = simplifyTools(obj.request.tools);
+        }
+
+        concise.request = innerReq;
+    }
+
+    // 响应：思考块与思考签名 (顶层响应或非流式)
+    if (obj.thinking !== undefined) concise.thinking = obj.thinking;
+    if (obj.thinking_signature !== undefined) concise.thinking_signature = obj.thinking_signature;
+    if (obj.thought_signature !== undefined) concise.thought_signature = obj.thought_signature;
+    if (obj.signature !== undefined) concise.signature = obj.signature;
+
     // 响应：Choices / Candidates / 聚合响应
     if (obj.choices && Array.isArray(obj.choices)) {
         concise.choices = obj.choices.map((c: any) => {
@@ -416,6 +488,8 @@ function extractConcisePayload(
                     role: c.message.role,
                     ...(c.message.reasoning_content !== undefined ? { reasoning_content: c.message.reasoning_content } : {}),
                     ...(c.message.thinking !== undefined ? { thinking: c.message.thinking } : {}),
+                    ...(c.message.thinking_signature !== undefined ? { thinking_signature: c.message.thinking_signature } : {}),
+                    ...(c.message.thought_signature !== undefined ? { thought_signature: c.message.thought_signature } : {}),
                     ...(c.message.signature !== undefined ? { signature: c.message.signature } : {}),
                     ...(c.message.content !== undefined ? { content: c.message.content } : {}),
                     ...(c.message.tool_calls ? { tool_calls: simplifyToolCalls(c.message.tool_calls) } : {})
@@ -424,6 +498,10 @@ function extractConcisePayload(
                 choiceRes.delta = {
                     role: c.delta.role,
                     ...(c.delta.reasoning_content !== undefined ? { reasoning_content: c.delta.reasoning_content } : {}),
+                    ...(c.delta.thinking !== undefined ? { thinking: c.delta.thinking } : {}),
+                    ...(c.delta.thinking_signature !== undefined ? { thinking_signature: c.delta.thinking_signature } : {}),
+                    ...(c.delta.thought_signature !== undefined ? { thought_signature: c.delta.thought_signature } : {}),
+                    ...(c.delta.signature !== undefined ? { signature: c.delta.signature } : {}),
                     ...(c.delta.content !== undefined ? { content: c.delta.content } : {}),
                     ...(c.delta.tool_calls ? { tool_calls: simplifyToolCalls(c.delta.tool_calls) } : {})
                 };
@@ -443,7 +521,7 @@ function extractConcisePayload(
         });
     }
 
-    if (obj.content !== undefined && !obj.messages && !obj.choices) {
+    if (obj.content !== undefined && !obj.messages && !obj.choices && !obj.request) {
         concise.content = simplifyContent(obj.content);
     }
     if (obj.reasoning_content !== undefined && !obj.messages && !obj.choices) {
@@ -1211,30 +1289,30 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             {/* Mode & Toolbar Bar */}
                             <div className="flex flex-wrap items-center justify-between gap-2 px-1 shrink-0">
                                 <div className="flex items-center gap-2">
-                                    <div className="join border border-gray-200 dark:border-base-300 rounded-lg p-0.5 bg-gray-100 dark:bg-base-200">
+                                    <div className="inline-flex items-center p-1 bg-gray-100 dark:bg-base-200/90 rounded-xl border border-gray-200/90 dark:border-base-300 gap-1 shadow-inner">
                                         <button
                                             type="button"
                                             onClick={() => setPayloadViewMode('concise')}
-                                            className={`btn btn-xs join-item border-none gap-1.5 font-bold ${
+                                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer select-none ${
                                                 payloadViewMode === 'concise'
-                                                    ? 'bg-blue-600 text-white shadow-sm'
-                                                    : 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/5'
+                                                    ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm border border-gray-200/80 dark:border-base-300'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-base-content hover:bg-black/[0.03] dark:hover:bg-white/[0.04]'
                                             }`}
                                         >
-                                            <Sparkles size={12} />
-                                            {t('monitor.details.concise_mode', '简要模式')}
+                                            <Sparkles size={13} className={payloadViewMode === 'concise' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
+                                            <span>{t('monitor.details.concise_mode', '简要模式')}</span>
                                         </button>
                                         <button
                                             type="button"
                                             onClick={() => setPayloadViewMode('full')}
-                                            className={`btn btn-xs join-item border-none gap-1.5 font-bold ${
+                                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer select-none ${
                                                 payloadViewMode === 'full'
-                                                    ? 'bg-blue-600 text-white shadow-sm'
-                                                    : 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/5'
+                                                    ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm border border-gray-200/80 dark:border-base-300'
+                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-base-content hover:bg-black/[0.03] dark:hover:bg-white/[0.04]'
                                             }`}
                                         >
-                                            <FileCode2 size={12} />
-                                            {t('monitor.details.full_mode', '完整模式')}
+                                            <FileCode2 size={13} className={payloadViewMode === 'full' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
+                                            <span>{t('monitor.details.full_mode', '完整模式')}</span>
                                         </button>
                                     </div>
                                     <span className="hidden sm:inline-block text-[11px] text-gray-500 dark:text-gray-400">

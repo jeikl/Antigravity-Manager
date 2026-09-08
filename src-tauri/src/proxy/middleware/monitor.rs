@@ -594,6 +594,14 @@ pub async fn monitor_middleware(
                                     {
                                         thinking_content.push_str(thinking);
                                     }
+                                    // Thinking signature in OpenAI delta
+                                    if let Some(sig) = delta
+                                        .get("signature")
+                                        .or_else(|| delta.get("thought_signature"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        thinking_signature = sig.to_string();
+                                    }
                                     // Main response content
                                     if let Some(content) =
                                         delta.get("content").and_then(|v| v.as_str())
@@ -652,6 +660,42 @@ pub async fn monitor_middleware(
                             }
                         }
 
+                        // Gemini format: candidates[0].content.parts
+                        if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
+                            for cand in candidates {
+                                if let Some(content) = cand.get("content") {
+                                    if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                                        for part in parts {
+                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                                                    thinking_content.push_str(text);
+                                                } else {
+                                                    response_content.push_str(text);
+                                                }
+                                            }
+                                            if let Some(sig) = part
+                                                .get("thought_signature")
+                                                .or_else(|| part.get("signature"))
+                                                .and_then(|s| s.as_str())
+                                            {
+                                                thinking_signature = sig.to_string();
+                                            }
+                                            if let Some(fc) = part.get("functionCall") {
+                                                if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
+                                                    let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
+                                                    tool_calls.push(serde_json::json!({
+                                                        "id": "",
+                                                        "type": "function",
+                                                        "function": { "name": name, "arguments": args }
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Claude/Anthropic format: content_block_start, content_block_delta, etc.
                         let msg_type = json.get("type").and_then(|t| t.as_str());
                         match msg_type {
@@ -678,6 +722,16 @@ pub async fn monitor_middleware(
                                             "type": "function",
                                             "function": { "name": name, "arguments": "" }
                                         });
+                                    }
+                                    if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                                        thinking_content.push_str(thinking);
+                                    }
+                                    if let Some(sig) = block
+                                        .get("signature")
+                                        .or_else(|| block.get("thought_signature"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        thinking_signature = sig.to_string();
                                     }
                                 }
                             }
@@ -708,6 +762,14 @@ pub async fn monitor_middleware(
                                         delta.get("thinking").and_then(|v| v.as_str())
                                     {
                                         thinking_content.push_str(thinking);
+                                    }
+                                    // Thinking signature in delta (Claude signature_delta or direct signature)
+                                    if let Some(sig) = delta
+                                        .get("signature")
+                                        .or_else(|| delta.get("thought_signature"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        thinking_signature = sig.to_string();
                                     }
                                     // Text content
                                     if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
