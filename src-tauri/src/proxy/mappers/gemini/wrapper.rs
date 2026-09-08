@@ -331,6 +331,10 @@ pub fn wrap_request_v2(
                 }
             }
         }
+        if let Some(s_id) = session_id {
+            crate::proxy::thinking_store::ThinkingStore::global()
+                .restore_gemini_contents(s_id, contents);
+        }
     }
 
     // [FIX Issue #1355] Gemini Flash thinking budget capping
@@ -338,9 +342,17 @@ pub fn wrap_request_v2(
     // [FIX #1557] Also apply to Pro/Thinking models to ensure budget processing
     // [FIX #1557] Auto-inject thinkingConfig if missing for these models
     let lower_model = final_model_name.to_lowercase();
-    if lower_model.contains("flash")
+    let force_server_thinking =
+        crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+            final_model_name,
+            original_model,
+        ]);
+    if force_server_thinking
+        || lower_model.contains("flash")
         || lower_model.contains("pro")
         || lower_model.contains("thinking")
+        || lower_model.contains("agent")
+        || lower_model.contains("gemini")
     {
         // [NEW] Extract OpenAI-style max_tokens before mutably borrowing gen_config
         let req_max_tokens = inner_request.get("max_tokens").and_then(|v| v.as_u64());
@@ -348,7 +360,8 @@ pub fn wrap_request_v2(
         // Determine model family and capability beforehand to avoid borrow checker conflicts
         let is_claude = lower_model.contains("claude");
         let is_preview = lower_model.contains("preview");
-        let should_inject = lower_model.contains("thinking")
+        let should_inject = force_server_thinking
+            || lower_model.contains("thinking")
             || (lower_model.contains("gemini-2.0-pro") && !is_preview)
             || (lower_model.contains("gemini-3-pro") && !is_preview)
             || (lower_model.contains("gemini-3.1-pro") && !is_preview);
@@ -411,6 +424,26 @@ pub fn wrap_request_v2(
         }
         if !gen_config.contains_key("topP") {
             gen_config.insert("topP".to_string(), json!(1.0));
+        }
+
+        if force_server_thinking {
+            let default_budget =
+                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
+            let thinking_config = gen_config
+                .entry("thinkingConfig".to_string())
+                .or_insert(json!({}))
+                .as_object_mut()
+                .unwrap();
+            thinking_config.insert("includeThoughts".to_string(), json!(true));
+            if !thinking_config.contains_key("thinkingBudget")
+                && !thinking_config.contains_key("thinkingLevel")
+            {
+                thinking_config.insert("thinkingBudget".to_string(), json!(default_budget));
+            }
+            tracing::debug!(
+                "[Gemini-Wrap] Forced includeThoughts=true for keyword model {}",
+                final_model_name
+            );
         }
 
         // [FIX] Convert v1beta thinkingLevel (string) to v1internal thinkingBudget (number).

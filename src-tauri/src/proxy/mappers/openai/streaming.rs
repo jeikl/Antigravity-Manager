@@ -126,6 +126,7 @@ where
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
         let mut tool_call_index = 0;
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -162,6 +163,7 @@ where
 
                                                     if let Some(parts_list) = parts {
                                                         for part in parts_list {
+                                                            thinking_acc.ingest_part(part);
                                                             let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
@@ -364,6 +366,7 @@ where
             }
         }
 
+        thinking_acc.commit(&session_id);
         if !error_occurred {
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
@@ -599,6 +602,7 @@ where
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
         let mut accumulated_thinking = String::new();
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
         let mut has_seen_tool_calls = false;
         let mut final_finish_reason: Option<String> = None;
 
@@ -641,6 +645,7 @@ where
                                                 }
                                                 if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                     for part in parts {
+                                                        thinking_acc.ingest_part(part);
                                                         let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
 
                                                         // Codex Desktop renders `reasoning` as compact/ephemeral status
@@ -1188,6 +1193,8 @@ where
                 }
             }
         }
+
+        thinking_acc.commit(&session_id);
 
         let mut completed_ev = json!({
             "type": terminal_type,

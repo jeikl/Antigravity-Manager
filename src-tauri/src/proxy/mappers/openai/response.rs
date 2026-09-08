@@ -224,6 +224,9 @@ pub fn transform_openai_response(
                         }
                     }
                 }
+                if let Some(sid) = session_id {
+                    crate::proxy::thinking_store::capture_gemini_parts(sid, parts);
+                }
             }
 
             // 提取并处理该候选结果的联网搜索引文 (Grounding Metadata)

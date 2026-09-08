@@ -236,6 +236,7 @@ pub struct StreamingState {
     pub registered_tool_names: Vec<String>,
     // [FIX #3379] Track whether any text_delta was emitted this turn (guard G7)
     pub text_delta_emitted_this_turn: bool,
+    pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
 }
 
 impl StreamingState {
@@ -266,6 +267,7 @@ impl StreamingState {
             client_adapter: None,
             registered_tool_names: Vec::new(),
             text_delta_emitted_this_turn: false,
+            thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
         }
     }
 

@@ -189,7 +189,11 @@ pub async fn handle_generate(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
-        let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
+        let fallback_sid = SessionManager::extract_gemini_session_id(&body, &model_name);
+        let session_scope =
+            crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+        let session_id = session_scope.store_key.clone();
+        let client_session_id = session_scope.client_id.clone();
 
         // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
         let (access_token, project_id, email, account_id, _wait_ms) =
@@ -448,6 +452,7 @@ pub async fn handle_generate(
                     let mut meta_sent = false;
                     let mut saw_image_data = false;
                     let mut stream_failed = false;
+                    let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
 
                     loop {
                         // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
@@ -536,6 +541,7 @@ pub async fn handle_generate(
                                                     for cand in candidates {
                                                         if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                             for part in parts {
+                                                                thinking_acc.ingest_part(part);
                                                                 if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
                                                                     crate::proxy::SignatureCache::global()
                                                                         .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
@@ -576,6 +582,7 @@ pub async fn handle_generate(
                         }
                     }
 
+                    thinking_acc.commit(&s_id_for_stream);
                     if track_image_success && saw_image_data && !stream_failed {
                         image_success_manager.mark_account_success(&image_success_account);
                         image_success_manager
@@ -595,6 +602,7 @@ pub async fn handle_generate(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Session-Id", &client_session_id)
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -673,6 +681,7 @@ pub async fn handle_generate(
                 }
             }
 
+            crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
             let unwrapped = unwrap_response(&gemini_resp);
             return Ok((
                 StatusCode::OK,

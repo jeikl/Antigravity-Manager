@@ -675,6 +675,15 @@ impl AxumServer {
             .route("/internal/warmup", post(handlers::warmup::handle_warmup)) // 内部预热端点
             .route("/v1/api/event_logging/batch", post(silent_ok_handler))
             .route("/v1/api/event_logging", post(silent_ok_handler))
+            .route(
+                "/v1/thinking/end",
+                post(handlers::thinking::handle_end_session),
+            )
+            .route(
+                "/v1/thinking/sessions/:session_id",
+                axum::routing::get(handlers::thinking::handle_session_stats)
+                    .delete(handlers::thinking::handle_delete_session),
+            )
             // 应用 AI 服务特定的层
             // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
             // 请求: ip_filter -> auth -> monitor -> handler

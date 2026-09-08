@@ -417,9 +417,12 @@ pub fn transform_claude_request_in(
 
     let claude_req = &cleaned_req; // 后续使用清理后的请求
 
-    // [NEW] Generate session ID for signature tracking
-    // This enables session-isolated signature storage, preventing cross-conversation pollution
-    let session_id = SessionManager::extract_session_id(claude_req);
+    // Prefer the handler-resolved session id (tenant + X-Session-Id) when provided.
+    let session_id = if !_session_id.is_empty() {
+        _session_id.to_string()
+    } else {
+        SessionManager::extract_session_id(claude_req)
+    };
     tracing::debug!("[Claude-Request] Session ID: {}", session_id);
 
     // 检测是否有联网工具 (server tool or built-in tool)
@@ -505,8 +508,14 @@ pub fn transform_claude_request_in(
 
     // Check if thinking is enabled in the request
     let thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
+    let force_server_thinking =
+        crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+            claude_req.model.as_str(),
+            mapped_model.as_str(),
+        ]);
     let mut is_thinking_enabled = thinking_type == Some("enabled")
         || thinking_type == Some("adaptive")
+        || force_server_thinking
         || (thinking_type.is_none() && should_enable_thinking_by_default(&claude_req.model));
 
     // [NEW FIX] Check if target model supports thinking
@@ -515,7 +524,7 @@ pub fn transform_claude_request_in(
     // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to be recognized as thinking capable
     let target_model_supports_thinking = model_supports_thinking(&mapped_model);
 
-    if is_thinking_enabled && !target_model_supports_thinking {
+    if is_thinking_enabled && !target_model_supports_thinking && !force_server_thinking {
         tracing::warn!(
             "[Thinking-Mode] Target model '{}' does not support thinking. Force disabling thinking mode.",
             mapped_model
@@ -799,6 +808,9 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
 /// (`openai/request.rs` `is_gemini_3_thinking` includes `-pro-agent`) and the
 /// model spec `SPEC_PRO_AGENT { include_thoughts: true }` (`variant_mapping.rs`).
 fn model_supports_thinking(mapped_model: &str) -> bool {
+    if crate::proxy::thinking_store::model_forces_server_thinking(mapped_model) {
+        return true;
+    }
     mapped_model.contains("-thinking")
         || mapped_model.starts_with("claude-")
         || mapped_model.contains("gemini-2.0-pro")
@@ -1770,6 +1782,12 @@ fn build_google_contents(
         for msg in &mut merged_contents {
             clean_thinking_fields_recursive(msg);
         }
+    }
+    if is_thinking_enabled
+        || crate::proxy::thinking_store::model_forces_server_thinking(mapped_model)
+    {
+        crate::proxy::thinking_store::ThinkingStore::global()
+            .restore_gemini_contents(session_id, &mut merged_contents);
     }
 
     Ok(json!(merged_contents))
@@ -3338,9 +3356,9 @@ mod tests {
         assert!(model_supports_thinking("gemini-3.1-flash"));
         assert!(model_supports_thinking("claude-opus-4-6-thinking"));
 
-        // Regular non-thinking Gemini models stay excluded.
-        assert!(!model_supports_thinking("gemini-2.5-pro"));
-        assert!(!model_supports_thinking("gemini-1.5-pro"));
+        // Keyword models (gemini/flash/pro/agent) now force server-side thinking.
+        assert!(model_supports_thinking("gemini-2.5-pro"));
+        assert!(model_supports_thinking("gemini-1.5-pro"));
     }
 
     #[test]

@@ -264,7 +264,15 @@ pub fn transform_openai_request(
     let is_claude_model = mapped_model_lower.contains("claude");
     let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
         || (is_claude_model && user_enabled_thinking);
-    let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
+    let force_server_thinking =
+        crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+            request.model.as_str(),
+            mapped_model,
+        ]);
+    let is_thinking_model = is_gemini_3_thinking
+        || is_claude_thinking
+        || is_gemini_flash_thinking
+        || force_server_thinking;
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
     let has_incompatible_assistant_history = request.messages.iter().any(|msg| {
@@ -287,7 +295,9 @@ pub fn transform_openai_request(
     // Claude 上游严格要求每个 thinking 块必须有真实签名且不支持哨兵签名，
     // 注入无签名占位块必触发 400 thinking.signature: Field required。
     // 因此对于带有不兼容历史的 Claude 思考请求，安全降级为不开启 thinking。
-    let mut actual_include_thinking = is_thinking_model || user_enabled_thinking;
+    // Clients typically omit thinking config. Keyword models still force includeThoughts.
+    let mut actual_include_thinking =
+        is_thinking_model || user_enabled_thinking || force_server_thinking;
 
     // [REFACTORED] 使用 SignatureCache 获取 Session 级别的签名
     let session_thought_sig =
@@ -809,6 +819,8 @@ pub fn transform_openai_request(
         }
         merged_contents.push(msg);
     }
+    crate::proxy::thinking_store::ThinkingStore::global()
+        .restore_gemini_contents(&session_id, &mut merged_contents);
     let contents = merged_contents;
 
     // 3. 构建请求体

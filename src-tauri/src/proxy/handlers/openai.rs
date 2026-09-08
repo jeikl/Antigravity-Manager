@@ -1907,6 +1907,11 @@ pub async fn handle_chat_completions(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
+    let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
+    let session_scope =
+        crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+    openai_req.session_id = Some(session_scope.store_key.clone());
+    let client_session_id = session_scope.client_id.clone();
 
     while let Some(attempt) = next_rotation_attempt(
         &mut used_attempts,
@@ -1929,7 +1934,7 @@ pub async fn handle_chat_completions(
         );
 
         // 3. 提取 SessionId (粘性指纹)
-        let session_id = SessionManager::extract_openai_session_id(&openai_req);
+        let session_id = session_scope.store_key.clone();
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
@@ -2329,6 +2334,7 @@ pub async fn handle_chat_completions(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Session-Id", &client_session_id)
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -2813,6 +2819,7 @@ fn web_tools_guidance_message() -> Value {
 pub async fn handle_completions(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     debug!(
@@ -3417,7 +3424,11 @@ pub async fn handle_completions(
     }
 
     // [NEW v4.2.0] Context Management & Reasoning Replay
-    let session_id_str = SessionManager::extract_openai_session_id(&openai_req);
+    let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
+    let session_scope =
+        crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+    openai_req.session_id = Some(session_scope.store_key.clone());
+    let session_id_str = session_scope.store_key.clone();
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
@@ -3679,7 +3690,7 @@ pub async fn handle_completions(
 
         // 3. 提取 SessionId (复用)
         // [New] 使用 TokenManager 内部逻辑提取 session_id，支持粘性调度
-        let session_id_str = SessionManager::extract_openai_session_id(&openai_req);
+        let session_id_str = session_scope.store_key.clone();
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) =
@@ -3988,6 +3999,7 @@ pub async fn handle_completions(
                         .header("Connection", "keep-alive")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Session-Id", &session_scope.client_id)
                         .body(Body::from_stream(combined_stream))
                         .unwrap()
                         .into_response();

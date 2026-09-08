@@ -85,6 +85,12 @@ impl SessionManager {
 
     /// 根据 OpenAI 请求生成稳定的会话指纹
     pub fn extract_openai_session_id(request: &OpenAIRequest) -> String {
+        if let Some(explicit) = request.session_id.as_ref() {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                return crate::proxy::thinking_store::sanitize_session_id(trimmed);
+            }
+        }
         let mut hasher = Sha256::new();
 
         let mut content_found = false;
@@ -130,6 +136,12 @@ impl SessionManager {
 
     /// 根据 Gemini 原生请求 (JSON) 生成稳定的会话指纹
     pub fn extract_gemini_session_id(request: &Value, _model_name: &str) -> String {
+        if let Some(explicit) = request.get("session_id").and_then(|v| v.as_str()) {
+            let trimmed = explicit.trim();
+            if !trimmed.is_empty() {
+                return crate::proxy::thinking_store::sanitize_session_id(trimmed);
+            }
+        }
         let mut hasher = Sha256::new();
 
         let mut content_found = false;
