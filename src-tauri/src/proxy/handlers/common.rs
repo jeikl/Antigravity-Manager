@@ -105,6 +105,17 @@ pub fn determine_retry_strategy(
     retried_without_thinking: bool,
 ) -> RetryStrategy {
     if status_code == 429 {
+        let lower = error_text.to_lowercase();
+        let is_hard_quota_exhausted = lower.contains("resource_exhausted")
+            || lower.contains("quota_exhausted")
+            || lower.contains("exceeded your current quota")
+            || lower.contains("insufficient_quota");
+
+        // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
+        if is_hard_quota_exhausted {
+            return RetryStrategy::FixedDelay(Duration::from_millis(50));
+        }
+
         return match crate::proxy::upstream::retry::parse_legacy_retry_delay(error_text) {
             Some(delay_ms) if delay_ms > 0 && delay_ms <= 2000 => {
                 let actual_delay = delay_ms.saturating_add(100);
@@ -156,6 +167,16 @@ fn determine_retry_strategy_inner(
 
         // 429 限流错误
         429 => {
+            let is_hard_quota_exhausted = lower.contains("resource_exhausted")
+                || lower.contains("quota_exhausted")
+                || lower.contains("exceeded your current quota")
+                || lower.contains("insufficient_quota");
+
+            // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
+            if is_hard_quota_exhausted {
+                return RetryStrategy::FixedDelay(Duration::from_millis(50));
+            }
+
             // 优先使用服务端返回的 Retry-After / quotaResetDelay
             if let Some(parsed_delay) = crate::proxy::upstream::retry::parse_retry_delay_with_source(
                 error_text,

@@ -1310,6 +1310,8 @@ async fn admin_delete_account(
 #[serde(rename_all = "camelCase")]
 struct SwitchRequest {
     account_id: String,
+    #[serde(default)]
+    target_ide: Option<String>,
 }
 
 async fn admin_switch_account(
@@ -1334,11 +1336,14 @@ async fn admin_switch_account(
     }
 
     let account_id = payload.account_id.clone();
-    logger::log_info(&format!("[API] Starting account switch: {}", account_id));
+    logger::log_info(&format!(
+        "[API] Starting account switch: {} (target_ide: {:?})",
+        account_id, payload.target_ide
+    ));
 
     let result = state
         .account_service
-        .switch_account(&account_id, None)
+        .switch_account(&account_id, payload.target_ide.as_deref())
         .await;
 
     {
@@ -4160,5 +4165,17 @@ mod image_scheduler_tests {
         assert!(scheduler.try_acquire("account-1").is_none());
         drop(permit);
         assert_eq!(scheduler.available_slots(), 1);
+    }
+
+    #[test]
+    fn test_switch_request_deserialization_with_and_without_target_ide() {
+        use super::SwitchRequest;
+        let with_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_1", "targetIde": "agy"}"#).unwrap();
+        assert_eq!(with_ide.account_id, "acc_1");
+        assert_eq!(with_ide.target_ide.as_deref(), Some("agy"));
+
+        let without_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_2"}"#).unwrap();
+        assert_eq!(without_ide.account_id, "acc_2");
+        assert_eq!(without_ide.target_ide, None);
     }
 }

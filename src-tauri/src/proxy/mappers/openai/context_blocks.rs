@@ -23,13 +23,12 @@ pub fn build_official_style_system_instruction(
     global_prompt: Option<&str>,
     request_type: &str,
     mapped_model: &str,
-    session_id: &str,
 ) -> String {
     let mut sections = ContextSections::default();
 
     sections.user_information.push(format!(
-        "Request type: {}\nMapped model: {}\nSession ID: {}",
-        request_type, mapped_model, session_id
+        "Request type: {}\nMapped model: {}",
+        request_type, mapped_model
     ));
 
     if let Some(prompt) = global_prompt.map(str::trim).filter(|s| !s.is_empty()) {

@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info}; // Import Engine trait for encode method
 
 use crate::proxy::mappers::openai::{
-    transform_openai_request, transform_openai_response, OpenAIContent, OpenAIContentBlock,
-    OpenAIMessage, OpenAIRequest, OpenAIResponse,
+    transform_openai_request, transform_openai_request_with_session, transform_openai_response,
+    OpenAIContent, OpenAIContentBlock, OpenAIMessage, OpenAIRequest, OpenAIResponse,
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::debug_logger;
@@ -954,6 +954,7 @@ mod stream_peek_tests {
     use super::response_has_inline_image_data;
     use super::responses_input_item_type;
     use super::responses_message_parts;
+    use super::responses_routing_session_id;
     use super::rewrite_terminal_assistant_prefill;
     use super::save_session_unless_response_cancelled;
     use super::stream_chunk_has_error_event;
@@ -964,6 +965,43 @@ mod stream_peek_tests {
     use super::{MAX_INPUT_IMAGES, MAX_INPUT_IMAGE_BYTES, MAX_TOTAL_INPUT_IMAGE_BYTES};
     use crate::proxy::mappers::openai::{transform_openai_request, OpenAIRequest};
     use serde_json::{json, Value};
+
+    #[test]
+    fn responses_routing_identity_follows_the_response_chain() {
+        let first = responses_routing_session_id(None, None, None, "resp-root-a");
+        let second = responses_routing_session_id(None, None, None, "resp-root-b");
+        assert_eq!(first, "resp-root-a");
+        assert_eq!(second, "resp-root-b");
+        assert_ne!(first, second);
+
+        let continued =
+            responses_routing_session_id(None, Some("resp-parent"), Some(&first), "resp-child");
+        let branch =
+            responses_routing_session_id(None, Some("resp-parent"), Some(&first), "resp-branch");
+        assert_eq!(continued, first);
+        assert_eq!(branch, first);
+        assert_eq!(
+            responses_routing_session_id(
+                Some("client-session"),
+                Some("resp-parent"),
+                Some(&first),
+                "resp-child"
+            ),
+            "client-session"
+        );
+        assert_eq!(
+            responses_routing_session_id(None, Some("resp-missing"), None, "resp-child"),
+            "resp-missing"
+        );
+    }
+
+    #[test]
+    fn responses_store_defaults_to_enabled_and_honors_explicit_false() {
+        assert!(super::responses_store_enabled(&json!({})));
+        assert!(super::responses_store_enabled(&json!({"store": true})));
+        assert!(super::responses_store_enabled(&json!({"store": null})));
+        assert!(!super::responses_store_enabled(&json!({"store": false})));
+    }
 
     #[test]
     fn responses_created_with_null_error_is_not_an_error_event() {
@@ -1222,6 +1260,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
                 Vec::new(),
                 String::new(),
                 "gemini-pro-agent".to_string(),
+                "routing-cancelled".to_string(),
             )
             .await;
         }));
@@ -1663,6 +1702,20 @@ fn codex_ledger_from_body(
     (ledger, markers)
 }
 
+fn responses_routing_session_id(
+    explicit_session_id: Option<&str>,
+    previous_response_id: Option<&str>,
+    stored_routing_session_id: Option<&str>,
+    response_id: &str,
+) -> String {
+    explicit_session_id
+        .filter(|id| !id.is_empty())
+        .or(stored_routing_session_id.filter(|id| !id.is_empty()))
+        .or(previous_response_id.filter(|id| !id.is_empty()))
+        .unwrap_or(response_id)
+        .to_string()
+}
+
 fn strip_codex_step_markers(content: &str) -> String {
     let mut cleaned = Vec::new();
     for line in content.lines() {
@@ -1854,9 +1907,13 @@ pub async fn handle_chat_completions(
     // forwarded request matches the expected upstream format. OpenCode encodes the variant as
     // thinking.budget_tokens; we infer the tier from its magnitude.
     let client_budget = openai_req.thinking.as_ref().and_then(|t| t.budget_tokens);
-    if let Some(spec) =
-        crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
-    {
+    let variant_spec =
+        if crate::proxy::mappers::openai::request::is_tiered_flash_model(&openai_req.model) {
+            None
+        } else {
+            crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
+        };
+    if let Some(spec) = variant_spec {
         tracing::info!(
             "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
             trace_id,
@@ -2818,6 +2875,10 @@ fn web_tools_guidance_message() -> Value {
 
 // --- END Codex GUIDANCE PROMPTS ---
 
+fn responses_store_enabled(body: &Value) -> bool {
+    body.get("store").and_then(Value::as_bool) != Some(false)
+}
+
 /// 处理 Legacy Completions API (/v1/completions)
 /// 将 Prompt 转换为 Chat Message 格式，复用 handle_chat_completions
 pub async fn handle_completions(
@@ -2834,7 +2895,9 @@ pub async fn handle_completions(
     let debug_cfg = state.debug_logging.read().await.clone();
     let original_body =
         debug_logger::is_enabled(&debug_cfg).then(|| debug_value_without_inline_data(&body));
+    let is_responses_api = uri.path() == "/v1/responses";
     let is_codex_style = body.get("input").is_some() || body.get("instructions").is_some();
+    let store_response = responses_store_enabled(&body);
 
     // [MULTI-TURN] 支持 previous_response_id 链式历史恢复
     // 当客户端通过 HTTP POST /v1/responses 传入 previous_response_id 时，
@@ -2843,10 +2906,16 @@ pub async fn handle_completions(
         .get("previous_response_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let explicit_session_id = body
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
     let response_id_for_save = format!("resp-{}", uuid::Uuid::new_v4());
     let http_tool_call_cache: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     let mut session_parent = None;
+    let mut stored_routing_session_id = None;
     let mut session_delta_input = Vec::new();
     if is_codex_style {
         let mut existing_input = body
@@ -2864,13 +2933,15 @@ pub async fn handle_completions(
             if let Some((session, parent)) =
                 crate::proxy::http_session_store::get_session_with_parent(prev_id).await
             {
-                let prepared = crate::proxy::http_session_store::prepare_session_input(
+                stored_routing_session_id = Some(parent.routing_session_id().to_string());
+                let prepared = crate::proxy::http_session_store::prepare_session_input_with_storage(
                     session.input_items,
                     existing_input,
                     &http_tool_call_cache,
+                    store_response,
                 );
                 session_delta_input = prepared.delta;
-                if !prepared.reset_parent {
+                if store_response && !prepared.reset_parent {
                     session_parent = Some(parent);
                 }
                 if let Some(obj) = body.as_object_mut() {
@@ -2888,11 +2959,15 @@ pub async fn handle_completions(
                 );
                 prepared.merged
             } else {
-                session_delta_input = existing_input.clone();
+                if store_response {
+                    session_delta_input = existing_input.clone();
+                }
                 existing_input
             }
         } else {
-            session_delta_input = existing_input.clone();
+            if store_response {
+                session_delta_input = existing_input.clone();
+            }
             existing_input
         };
 
@@ -2903,6 +2978,13 @@ pub async fn handle_completions(
             return (StatusCode::BAD_REQUEST, message).into_response();
         }
     }
+    let routing_session_id = responses_routing_session_id(
+        explicit_session_id.as_deref(),
+        previous_response_id.as_deref(),
+        stored_routing_session_id.as_deref(),
+        &response_id_for_save,
+    );
+    let signature_read_key = previous_response_id.clone();
 
     let mut bounded_session_input = None;
 
@@ -2922,13 +3004,13 @@ pub async fn handle_completions(
                 _ => None,
             })
             .unwrap_or_default();
-        bounded_session_input = Some(
+        bounded_session_input = store_response.then(|| {
             session_delta_input
                 .drain(..)
                 .filter_map(into_history_without_inline_media)
                 .filter(|item| !item.is_null())
-                .collect(),
-        );
+                .collect()
+        });
 
         let mut messages = Vec::new();
 
@@ -3399,7 +3481,14 @@ pub async fn handle_completions(
                 _ => None,
             })
             .unwrap_or_default();
-        (input, instructions)
+        (
+            input,
+            if store_response {
+                instructions
+            } else {
+                String::new()
+            },
+        )
     } else {
         (Vec::new(), String::new())
     };
@@ -3429,18 +3518,29 @@ pub async fn handle_completions(
     }
 
     // [NEW v4.2.0] Context Management & Reasoning Replay
-    let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
+    let fallback_sid = if is_responses_api {
+        routing_session_id.clone()
+    } else {
+        SessionManager::extract_openai_session_id(&openai_req)
+    };
     let session_scope =
         crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
     openai_req.session_id = Some(session_scope.store_key.clone());
     let session_id_str = session_scope.store_key.clone();
+    let signature_session_id_str = if is_responses_api {
+        previous_response_id
+            .clone()
+            .unwrap_or_else(|| response_id_for_save.clone())
+    } else {
+        session_id_str.clone()
+    };
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
 
     crate::proxy::mappers::context_manager::ContextManager::restore_openai_reasoning_content(
         &mut openai_req.messages,
-        &session_id_str,
+        &signature_session_id_str,
     );
 
     let experimental_cfg = state.experimental.read().await;
@@ -3581,7 +3681,7 @@ pub async fn handle_completions(
                 &openai_req,
                 &trace_id,
                 &token_manager_clone,
-                &session_id_str,
+                &signature_session_id_str,
             )
             .await
             {
@@ -3695,7 +3795,7 @@ pub async fn handle_completions(
 
         // 3. 提取 SessionId (复用)
         // [New] 使用 TokenManager 内部逻辑提取 session_id，支持粘性调度
-        let session_id_str = session_scope.store_key.clone();
+        let session_id_str = session_id_str.clone();
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) =
@@ -3732,12 +3832,23 @@ pub async fn handle_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
-        let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
-            &openai_req,
-            &project_id,
-            &mapped_model,
-            proxy_token.as_ref(),
-        );
+        let (gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
+            transform_openai_request_with_session(
+                &openai_req,
+                &project_id,
+                &mapped_model,
+                proxy_token.as_ref(),
+                &routing_session_id,
+                signature_read_key.as_deref(),
+            )
+        } else {
+            transform_openai_request(
+                &openai_req,
+                &project_id,
+                &mapped_model,
+                proxy_token.as_ref(),
+            )
+        };
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
@@ -3876,16 +3987,22 @@ pub async fn handle_completions(
                     let mut session_completion_rx = None;
                     let mut openai_stream = if is_codex_style {
                         use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
-                        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-                        session_completion_rx = Some(completion_rx);
+                        let completion_tx = if store_response {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            session_completion_rx = Some(rx);
+                            Some(tx)
+                        } else {
+                            None
+                        };
                         create_codex_sse_stream(
                             gemini_stream,
                             openai_req.model.clone(),
-                            session_id,
+                            response_id_for_save.clone(),
                             message_count,
                             assistant_turn_index,
                             response_id_for_save.clone(),
-                            Some(completion_tx),
+                            completion_tx,
+                            store_response,
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
@@ -3995,6 +4112,7 @@ pub async fn handle_completions(
                                         outputs,
                                         save_instructions,
                                         save_model,
+                                        routing_session_id,
                                     ),
                                 )
                                 .await;
@@ -4020,7 +4138,11 @@ pub async fn handle_completions(
                     let mut openai_stream = create_openai_sse_stream(
                         gemini_stream,
                         openai_req.model.clone(),
-                        session_id,
+                        if is_responses_api {
+                            response_id_for_save.clone()
+                        } else {
+                            session_id
+                        },
                         message_count,
                         Some(client_tool_names.clone()),
                     );
@@ -4106,7 +4228,28 @@ pub async fn handle_completions(
                             let is_responses_api = uri.path() == "/v1/responses";
 
                             if is_responses_api {
-                                let resp = convert_chat_response_to_responses(&chat_resp);
+                                let mut resp = convert_chat_response_to_responses(&chat_resp);
+                                resp["id"] = json!(response_id_for_save.clone());
+                                let outputs = resp
+                                    .get("output")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter_map(into_history_without_inline_media)
+                                    .collect();
+                                if store_response {
+                                    crate::proxy::http_session_store::save_session_delta(
+                                        response_id_for_save.clone(),
+                                        session_parent,
+                                        session_save_input,
+                                        outputs,
+                                        session_save_instructions,
+                                        openai_req.model.clone(),
+                                        routing_session_id.clone(),
+                                    )
+                                    .await;
+                                }
                                 if debug_logger::is_enabled(&debug_cfg) {
                                     let payload = json!({
                                         "kind": "exchange_summary",

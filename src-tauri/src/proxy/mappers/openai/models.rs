@@ -45,6 +45,9 @@ pub struct OpenAIRequest {
     // [NEW] Thinking/Extended Thinking 支持 (兼容 Anthropic/Claude 协议)
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    // Codex Responses API reasoning controls. Applied only to tiered Flash models.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     // [NEW] Direct imageSize support (for Gemini native parameter)
     #[serde(default, rename = "imageSize")]
     pub image_size: Option<String>,
@@ -62,6 +65,11 @@ pub struct ThinkingConfig {
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // "low", "high", or "max"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReasoningConfig {
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

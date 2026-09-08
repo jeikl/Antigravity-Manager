@@ -33,7 +33,7 @@ Antigravity Gateway 是一个双重角色的服务器：
 | **GET** | `/accounts/current` | 获取当前活跃账号 | - |
 | **POST** | `/accounts` | 添加账号 (OAuth Refresh Token) | `{"refreshToken": "..."}` |
 | **DELETE**| `/accounts/:id` | 删除账号 | - |
-| **POST** | `/accounts/switch` | 切换活跃账号 | `{"accountId": "acc_123"}` |
+| **POST** | `/accounts/switch` | 切换活跃账号 | `{"accountId": "acc_123", "targetIde": "agy"}` (targetIde 可选，如传 `"agy"` 则仅写入凭据免重启 IDE) |
 | **POST** | `/accounts/refresh` | **刷新所有账号配额** | - |
 | **GET** | `/accounts/:id/quota` | **查询特定账号配额** | - |
 | **POST** | `/accounts/:id/toggle-proxy` | 禁用/启用账号代理 | - |

@@ -30,10 +30,17 @@ struct SessionNode {
     response_output: Vec<Value>,
     instructions: String,
     model: String,
+    routing_session_id: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionParent(Arc<SessionNode>);
+
+impl SessionParent {
+    pub fn routing_session_id(&self) -> &str {
+        &self.0.routing_session_id
+    }
+}
 
 struct StoredSession {
     node: Arc<SessionNode>,
@@ -74,6 +81,7 @@ impl HttpSessionStore {
             Vec::new(),
             entry.instructions,
             entry.model,
+            None,
         );
     }
 
@@ -85,7 +93,9 @@ impl HttpSessionStore {
         response_output: Vec<Value>,
         instructions: String,
         model: String,
+        routing_session_id: Option<String>,
     ) {
+        let routing_session_id = routing_session_id.unwrap_or_else(|| response_id.clone());
         self.sessions.insert(
             response_id,
             StoredSession {
@@ -95,6 +105,7 @@ impl HttpSessionStore {
                     response_output,
                     instructions,
                     model,
+                    routing_session_id,
                 }),
                 last_accessed: Instant::now(),
             },
@@ -164,6 +175,7 @@ pub async fn save_session_delta(
     response_output: Vec<Value>,
     instructions: String,
     model: String,
+    routing_session_id: String,
 ) {
     store().lock().await.insert_delta(
         response_id,
@@ -172,6 +184,7 @@ pub async fn save_session_delta(
         response_output,
         instructions,
         model,
+        Some(routing_session_id),
     );
 }
 
@@ -186,6 +199,16 @@ pub fn prepare_session_input(
     history: Vec<Value>,
     new_input: Vec<Value>,
     tool_call_cache: &HashMap<String, Value>,
+) -> PreparedSessionInput {
+    prepare_session_input_with_storage(history, new_input, tool_call_cache, true)
+}
+
+/// Restore the complete model input while optionally retaining a delta for storage.
+pub fn prepare_session_input_with_storage(
+    history: Vec<Value>,
+    new_input: Vec<Value>,
+    tool_call_cache: &HashMap<String, Value>,
+    retain_delta: bool,
 ) -> PreparedSessionInput {
     let reset_parent = new_input.iter().any(|item| {
         matches!(
@@ -229,9 +252,16 @@ pub fn prepare_session_input(
             .all(|(h, n)| items_semantically_equal(h, n));
 
     // Semantic suffix find: find last item of history in new_input
-    let semantic_suffix_idx = if !history.is_empty() && !reset_parent && !exact_replay && replayed_through.is_none() && !semantic_prefix_match {
+    let semantic_suffix_idx = if !history.is_empty()
+        && !reset_parent
+        && !exact_replay
+        && replayed_through.is_none()
+        && !semantic_prefix_match
+    {
         let last_h = &history[history.len() - 1];
-        new_input.iter().rposition(|n| items_semantically_equal(last_h, n))
+        new_input
+            .iter()
+            .rposition(|n| items_semantically_equal(last_h, n))
     } else {
         None
     };
@@ -268,17 +298,22 @@ pub fn prepare_session_input(
     };
 
     let delta = merge_history_with_new_input(Vec::new(), &[], delta_source, tool_call_cache);
-    let merged = if reset_parent || history.is_empty() {
+    let stored_delta = if retain_delta {
         delta.clone()
+    } else {
+        Vec::new()
+    };
+    let merged = if reset_parent || history.is_empty() {
+        delta
     } else if use_new_input_as_merged {
         merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
     } else {
-        merge_history_with_new_input(history, &[], delta.clone(), tool_call_cache)
+        merge_history_with_new_input(history, &[], delta, tool_call_cache)
     };
 
     PreparedSessionInput {
         merged,
-        delta,
+        delta: stored_delta,
         reset_parent,
     }
 }
@@ -447,6 +482,42 @@ mod tests {
     }
 
     #[test]
+    fn responses_store_false_restores_full_input_without_retaining_delta() {
+        let history = vec![
+            json!({"id": "old", "role": "user", "content": "x".repeat(32768)}),
+            json!({"id": "answer", "role": "assistant", "content": "prior answer"}),
+        ];
+        let next = json!({"id": "new", "role": "user", "content": "y".repeat(32768)});
+        let mut full_input = history.clone();
+        full_input.push(next.clone());
+        for replay in [vec![next], full_input.clone()] {
+            let prepared =
+                prepare_session_input_with_storage(history.clone(), replay, &HashMap::new(), false);
+            assert!(prepared.delta.is_empty());
+            assert_eq!(prepared.merged, full_input);
+        }
+        let prepared =
+            prepare_session_input_with_storage(Vec::new(), history.clone(), &HashMap::new(), false);
+        assert!(prepared.delta.is_empty());
+        assert_eq!(prepared.merged, history);
+    }
+
+    #[test]
+    fn responses_store_false_full_tool_replay_needs_no_global_cache() {
+        let call_id = format!("uncached-{}", uuid::Uuid::new_v4());
+        let input = vec![
+            json!({"id":"call-item", "type":"function_call", "call_id":call_id, "name":"shell_command", "arguments":"{\"command\":\"pwd\"}"}),
+            json!({"type":"function_call_output", "call_id":call_id, "output":"/synthetic/workspace"}),
+            json!({"role":"user", "content":"continue"}),
+        ];
+        assert!(get_cached_tool_call(&call_id).is_none());
+        let prepared =
+            prepare_session_input_with_storage(Vec::new(), input.clone(), &HashMap::new(), false);
+        assert!(prepared.delta.is_empty());
+        assert_eq!(prepared.merged, input);
+    }
+
+    #[test]
     fn session_chain_stores_delta_and_materializes_history() {
         let mut store = HttpSessionStore::new();
         store.insert("resp-1".to_string(), entry("first"));
@@ -463,6 +534,7 @@ mod tests {
             vec![json!({"id": "out-second", "content": "answer"})],
             "be concise".to_string(),
             "gemini-3.7-flash-high".to_string(),
+            Some("routing-root".to_string()),
         );
 
         let (previous, _) = store.get("resp-2").expect("child");
@@ -487,6 +559,7 @@ mod tests {
             Vec::new(),
             String::new(),
             String::new(),
+            Some("routing-root".to_string()),
         );
         store.insert_delta(
             "resp-b".to_string(),
@@ -495,11 +568,20 @@ mod tests {
             Vec::new(),
             String::new(),
             String::new(),
+            Some("routing-root".to_string()),
         );
 
         let parent_a = store.sessions["resp-a"].node.parent.as_ref().unwrap();
         let parent_b = store.sessions["resp-b"].node.parent.as_ref().unwrap();
         assert!(Arc::ptr_eq(parent_a, parent_b));
+        assert_eq!(
+            store.sessions["resp-a"].node.routing_session_id,
+            "routing-root"
+        );
+        assert_eq!(
+            store.sessions["resp-b"].node.routing_session_id,
+            "routing-root"
+        );
     }
 
     #[test]

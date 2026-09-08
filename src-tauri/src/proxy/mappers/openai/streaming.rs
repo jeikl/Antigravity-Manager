@@ -559,6 +559,7 @@ pub fn create_codex_sse_stream<S, E>(
     completion_tx: Option<
         tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
     >,
+    cache_tool_calls: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -926,7 +927,9 @@ where
                                                                 yield Ok::<Bytes, String>(codex_sse_frame(&done_ev));
 
                                                                 let tc_val = item_obj.clone();
-                                                                crate::proxy::handlers::openai::insert_cached_tool_call(call_id.clone(), tc_val.clone());
+                                                                if cache_tool_calls {
+                                                                    crate::proxy::handlers::openai::insert_cached_tool_call(call_id.clone(), tc_val.clone());
+                                                                }
                                                                 if is_custom_tool && (actual_name == "apply_patch" || actual_name == "apply_patch_v2") {
                                                                     crate::proxy::adapters::apply_patch_trace::emit(
                                                                         &crate::proxy::adapters::apply_patch_trace::ApplyPatchTrace {
@@ -1245,6 +1248,13 @@ mod tests {
     use serde_json::json;
 
     async fn collect_codex_stream(chunks: Vec<Value>) -> (String, Vec<Value>) {
+        collect_codex_stream_with_cache(chunks, true).await
+    }
+
+    async fn collect_codex_stream_with_cache(
+        chunks: Vec<Value>,
+        cache_tool_calls: bool,
+    ) -> (String, Vec<Value>) {
         let items: Vec<Result<Bytes, String>> = chunks
             .into_iter()
             .map(|chunk| Ok(Bytes::from(format!("data: {chunk}\n\n"))))
@@ -1257,6 +1267,7 @@ mod tests {
             0,
             "resp-test-codex-session".to_string(),
             None,
+            cache_tool_calls,
         );
 
         let mut raw = String::new();
@@ -1269,6 +1280,38 @@ mod tests {
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .collect();
         (raw, events)
+    }
+
+    #[tokio::test]
+    async fn responses_store_false_emits_complete_tool_call_without_caching_it() {
+        let (_, events) = collect_codex_stream_with_cache(vec![json!({
+            "response": {"candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"functionCall": {"name":"shell_command", "args":{"command":"pwd"}}}]}
+            }]}
+        })], false).await;
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed response");
+        let call = completed["response"]["output"]
+            .as_array()
+            .expect("output")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call");
+        let call_id = call["call_id"].as_str().expect("call id");
+        assert_eq!(call["name"], "shell_command");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["arguments"].as_str().expect("arguments"))
+                .expect("JSON arguments"),
+            json!({"command":"pwd"})
+        );
+        assert!(crate::proxy::handlers::openai::get_cached_tool_call(call_id).is_none());
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "response.output_item.done"
+                && event["item"]["call_id"] == call_id));
     }
 
     #[tokio::test]
@@ -1289,6 +1332,7 @@ mod tests {
                 outputs,
                 String::new(),
                 "gemini-pro-agent".to_string(),
+                "routing-test-session".to_string(),
             )
             .await;
             ack_tx.send(()).expect("acknowledge session save");
@@ -1301,6 +1345,7 @@ mod tests {
             0,
             response_id.clone(),
             Some(completion_tx),
+            true,
         );
 
         let mut raw = String::new();
@@ -1325,6 +1370,25 @@ mod tests {
 
         assert!(saw_completed);
         assert!(raw.contains(&format!("\"id\":\"{response_id}\"")));
+    }
+
+    #[test]
+    fn response_branches_store_signatures_under_their_own_response_ids() {
+        let branch_a = format!("resp-signature-a-{}", uuid::Uuid::new_v4());
+        let branch_b = format!("resp-signature-b-{}", uuid::Uuid::new_v4());
+        let signature_a = "a".repeat(64);
+        let signature_b = "b".repeat(64);
+        store_thought_signature(&signature_a, &branch_a, 1);
+        store_thought_signature(&signature_b, &branch_b, 1);
+
+        assert_eq!(
+            crate::proxy::SignatureCache::global().get_session_signature(&branch_a),
+            Some(signature_a)
+        );
+        assert_eq!(
+            crate::proxy::SignatureCache::global().get_session_signature(&branch_b),
+            Some(signature_b)
+        );
     }
 
     #[tokio::test]

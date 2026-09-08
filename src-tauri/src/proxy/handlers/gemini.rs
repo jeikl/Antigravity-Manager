@@ -765,6 +765,12 @@ pub async fn handle_generate(
             }
         }
 
+        // [FIX] 429 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
+        if status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id);
+            tracing::debug!("[Gemini] Unbound session {} from account {} due to status {}", session_id, email, status_code);
+        }
+
         // 确定重试策略
         let strategy = retry_state.determine_strategy(
             &account_id,

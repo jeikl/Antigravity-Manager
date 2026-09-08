@@ -323,6 +323,11 @@ impl StreamingState {
 
         if let Some(u) = usage {
             message["usage"] = json!(u);
+        } else {
+            message["usage"] = json!({
+                "input_tokens": 0,
+                "output_tokens": 0
+            });
         }
 
         let result = self.emit(

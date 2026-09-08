@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.6.8)
+> 专业级 AI 账号管理与协议代理系统 (v4.6.9)
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
 
@@ -8,7 +8,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.6.8-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.6.9-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -452,7 +452,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.6.8**（2026-09-06）彻底修复冷启动无条件 VACUUM 导致磁盘持续 100% 占满与日志保留时间戳秒/毫秒单位不匹配问题（按需门槛式碎片整理、毫秒对齐自动清理，#3386）。包含 v4.6.7 的全部功能与优化。
+> 最新版本 **v4.6.9**（2026-09-08）：全面增强多协议 Agent 稳定性，修复 Responses 会话路由与签名解耦、遵守 store:false 抑制内存泄漏、修复 429 故障转移死循环与熔断切号、增加 Gemini 首轮 User Primer 解决自主智能体 400 轮次报错、修复 /accounts/switch targetIde 免重启 IDE。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

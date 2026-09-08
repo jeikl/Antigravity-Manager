@@ -3,6 +3,25 @@
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
 *   **Version History**:
+    *   **v4.6.9 (2026-09-08)**:
+        -   **[Core Fix] Honor store:false to Inhibit HTTP Session & Global Tool Call Cache Retention (PR #3408)**:
+            -   **Respect store:false Parameter**: When full-replay requests explicitly pass `store:false` in the HTTP Responses path, avoids creating redundant session snapshots and background save tasks, significantly reducing memory growth during large-context replays.
+            -   **Tool-Call Cache Gate & Safe Non-Stream Guard**: Gates redundant writes to the global tool-call cache under `store:false` while still emitting full tool-call arguments, and hardens non-streaming history persistence with `store_response` guard.
+        -   **[Scheduling & Stability] Resolve 429 Failover Dead Loops, Model Circuit Breaker Bypass, and Quota Normalization (PR #3395)**:
+            -   **Align Sticky Sessions with Model-Level Circuit Breakers**: Fixed sticky session availability check querying with global key instead of target model, ensuring accounts locked with `RESOURCE_EXHAUSTED` for specific models are properly detected and not reused.
+            -   **Instant Failover on Hard Quota Limits**: Upstream 429 / 529 now bypasses `GraceRetry` and unbinds the session immediately, breaking infinite retry loops in Balance and CacheFirst modes.
+            -   **Model Normalization for Quota Protection**: Normalized user-configured model IDs (e.g. `gemini-3.7-flash`) to standard quota bucket IDs (`gemini-3-flash`) before evaluating thresholds, restoring quota protection functionality.
+        -   **[Multi-Turn & Agent Compatibility] Prevent Gemini 400 Invalid Argument on Autonomous First Tool Call (PR #3396)**:
+            -   **Inject Lightweight User Turn Primer**: When autonomous agent loops (e.g., Hermes) start with assistant tool calls immediately following the system message, automatically prepends a minimal user turn primer (`"Continue the task."`) to satisfy Google Gemini API turn-ordering requirements.
+            -   **Preserve Empty User Messages**: Ensures user messages with empty content retain whitespace rather than being dropped, maintaining valid role rotation.
+        -   **[OpenAI & Codex Protocols] Separate Routing & Signature Identity, Fresh Request IDs, and Flash Thinking (PR #3404, PR #3405, PR #3406)**:
+            -   **Decouple Routing & Signature Identities**: Separated session routing keys from thought signature lookup keys, and added non-streaming session history persistence.
+            -   **Unique Request ID per Upstream Attempt**: Dynamically generates timestamp-and-random request IDs on every invocation, preventing upstream idempotent blocking or association with previous 429 errors.
+            -   **Map Tiered Flash Reasoning Effort**: Accurately maps OpenAI `reasoning_effort` parameters to upstream Gemini `thinkingLevel` for tiered Flash models.
+        -   **[Claude Protocol Compliance] Always Include usage Object in message_start Event (PR #3397)**:
+            -   **Fallback Usage Object**: When upstream models lack usage metadata in the first chunk, emits a zero-value `usage` object (`{input_tokens: 0, output_tokens: 0}`) to prevent type validation errors on strict clients like OpenCode and `@ai-sdk/anthropic`.
+        -   **[HTTP API & CLI] Fix /accounts/switch Dropping targetIde Causing IDE Restarts on agy Token Refreshes (Issue #3399)**:
+            -   **Pass Through targetIde to Bypass IDE Restarts**: Resolved an issue where `POST /accounts/switch` omitted the `target_ide` field and hardcoded `None`, preventing agy CLI and automation scripts from hitting the pre-existing keyring-only fast path. Passing `{"targetIde": "agy"}` now updates credentials quietly without killing and relaunching the running Antigravity IDE.
     *   **v4.6.8 (2026-09-06)**:
         -   **[Core Fix] Fix Startup Unconditional VACUUM Disk Saturation & Retention Timestamp Unit Bug (Issue #3386)**:
             -   **Align Retention Timestamp to Milliseconds**: Fixed an issue where `cleanup_old_logs` calculated the 30-day cutoff using seconds (`timestamp()`) while request logs were stored in milliseconds (`timestamp_millis()`), causing expiration queries to never match and old logs to never be purged. Unified retention cutoff calculations to milliseconds (`now.timestamp_millis() - days * 24 * 3600 * 1000`).

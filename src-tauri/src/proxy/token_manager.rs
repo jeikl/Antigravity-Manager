@@ -829,8 +829,12 @@ impl TokenManager {
         let mut changed = false;
 
         for std_id in &config.monitored_models {
+            // [FIX] 归一化监控模型为标准 ID（例如用户在 UI 选了 gemini-3.7-flash，对齐到 gemini-3-flash）
+            let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                .unwrap_or_else(|| std_id.clone());
+
             // 获取该组的最高百分比，如果账号没该组型号则视为 100%
-            let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
+            let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
 
             if max_pct < threshold {
                 // 只有组内所有模型都不行，才触发全组保护
@@ -841,7 +845,7 @@ impl TokenManager {
                         account_path,
                         max_pct,
                         threshold,
-                        std_id,
+                        &lookup_key,
                     )
                     .await
                     .unwrap_or(false)
@@ -855,12 +859,12 @@ impl TokenManager {
                     .and_then(|v| v.as_array());
 
                 let is_protected = protected_models.map_or(false, |arr| {
-                    arr.iter().any(|m| m.as_str() == Some(std_id as &str))
+                    arr.iter().any(|m| m.as_str() == Some(lookup_key.as_str()))
                 });
 
                 if is_protected {
                     if self
-                        .restore_quota_protection(account_json, &account_id, account_path, std_id)
+                        .restore_quota_protection(account_json, &account_id, account_path, &lookup_key)
                         .await
                         .unwrap_or(false)
                     {
@@ -1152,7 +1156,7 @@ impl TokenManager {
         account_json["proxy_disabled_at"] = serde_json::Value::Null;
 
         let threshold = config.threshold_percentage as i32;
-        let mut protected_list = Vec::new();
+        let mut protected_list: Vec<serde_json::Value> = Vec::new();
 
         if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
             let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
@@ -1175,9 +1179,11 @@ impl TokenManager {
             }
 
             for std_id in &config.monitored_models {
-                let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
-                if max_pct < threshold {
-                    protected_list.push(serde_json::Value::String(std_id.clone()));
+                let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                    .unwrap_or_else(|| std_id.clone());
+                let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
+                if max_pct < threshold && !protected_list.iter().any(|v| v.as_str() == Some(lookup_key.as_str())) {
+                    protected_list.push(serde_json::Value::String(lookup_key));
                 }
             }
         }
@@ -1892,14 +1898,14 @@ impl TokenManager {
                         let key = self
                             .email_to_account_id(&bound_token.email)
                             .unwrap_or_else(|| bound_token.account_id.clone());
-                        // [FIX] Pass None for specific model wait time if not applicable
-                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, None);
+                        // [FIX] 传入目标模型标准化 ID，检查该模型是否已被熔断器精准锁定
+                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, Some(&normalized_target));
                         if reset_sec > 0 {
                             // 【修复 Issue #284】立即解绑并切换账号，不再阻塞等待
                             // 原因：阻塞等待会导致并发请求时客户端 socket 超时 (UND_ERR_SOCKET)
                             tracing::debug!(
-                                "Sticky Session: Bound account {} is rate-limited ({}s), unbinding and switching.",
-                                bound_token.email, reset_sec
+                                "Sticky Session: Bound account {} is rate-limited for {} ({}s), unbinding and switching.",
+                                bound_token.email, normalized_target, reset_sec
                             );
                             self.session_accounts.remove(sid);
                         } else if !attempted.contains(&bound_id)
@@ -1913,6 +1919,10 @@ impl TokenManager {
                             && bound_token.protected_models.contains(&normalized_target)
                         {
                             tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
+                            self.session_accounts.remove(sid);
+                        } else if attempted.contains(&bound_id) {
+                            // [FIX] 绑定的账号在当前轮次请求中已尝试失败，立即解绑避免死锁
+                            tracing::debug!("Sticky Session: Bound account {} already attempted in current request, unbinding", bound_token.email);
                             self.session_accounts.remove(sid);
                         }
                     } else {
