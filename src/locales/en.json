@@ -1193,7 +1193,12 @@
       "protocol": "Protocol",
       "account_used": "Account Used",
       "id": "Request ID",
-      "payload_empty": "No data"
+      "payload_empty": "No data",
+      "concise_mode": "Concise Mode",
+      "full_mode": "Full Mode",
+      "concise_desc": "Tool arguments and verbose metadata are omitted, highlighting thinking, tokens, and messages",
+      "search_placeholder": "Search payload...",
+      "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)"
     },
     "dialog": {
       "clear_title": "Clear Proxy Logs",

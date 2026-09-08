@@ -1186,7 +1186,12 @@
       "protocol": "请求协议",
       "account_used": "使用账号",
       "id": "请求 ID",
-      "payload_empty": "无数据"
+      "payload_empty": "无数据",
+      "concise_mode": "简要模式",
+      "full_mode": "完整模式",
+      "concise_desc": "已为您精简工具参数与冗余字段，突出思考块、用量与对话主体",
+      "search_placeholder": "搜索此报文...",
+      "no_upstream_payload": "无中转报文 (直接转发或未记录)"
     },
     "dialog": {
       "clear_title": "清除监控日志",

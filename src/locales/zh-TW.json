@@ -1038,7 +1038,12 @@
       "protocol": "協定類型",
       "mapped_model": "路由後模型",
       "account_used": "使用帳號",
-      "payload_empty": "無封包資料"
+      "payload_empty": "無封包資料",
+      "concise_mode": "簡要模式",
+      "full_mode": "完整模式",
+      "concise_desc": "已為您精簡工具參數與冗餘欄位，突出思考塊、用量與對話主體",
+      "search_placeholder": "搜尋此封包...",
+      "no_upstream_payload": "無轉出封包 (直接轉發或未記錄)"
     },
     "dialog": {
       "clear_title": "清除監控紀錄",

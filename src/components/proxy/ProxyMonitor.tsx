@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import ModalDialog from '../common/ModalDialog';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
-import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight, RefreshCw, User } from 'lucide-react';
+import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, RefreshCw, User, Sparkles, FileCode2, Eye, EyeOff } from 'lucide-react';
 
 import { AppConfig } from '../../types/config';
 import { formatCompactNumber } from '../../utils/format';
@@ -140,6 +140,570 @@ const LogTable: React.FC<LogTableProps> = ({
 };
 
 
+// ==========================================
+// 简要模式智能提取与映射算法
+// ==========================================
+function extractConcisePayload(
+    rawStr: string | undefined,
+    kind: 'request' | 'upstream' | 'response',
+    log?: ProxyRequestLog | null
+): string {
+    if (!rawStr) return '';
+    let obj: any;
+    try {
+        obj = JSON.parse(rawStr);
+    } catch {
+        return rawStr;
+    }
+    if (!obj || typeof obj !== 'object') {
+        return rawStr;
+    }
+
+    // 简化工具声明 (保留 name, description，省略超长 parameters/input_schema)
+    const simplifyTools = (tools: any): any => {
+        if (!Array.isArray(tools)) return undefined;
+        return tools.map((tool: any) => {
+            if (!tool || typeof tool !== 'object') return tool;
+            // OpenAI 格式: { type: "function", function: { name, description, parameters } }
+            if (tool.function && typeof tool.function === 'object') {
+                return {
+                    type: tool.type || 'function',
+                    function: {
+                        name: tool.function.name,
+                        ...(tool.function.description ? { description: tool.function.description } : {}),
+                        parameters: '[omitted]'
+                    }
+                };
+            }
+            // Gemini 格式: { functionDeclarations: [...] }
+            if (Array.isArray(tool.functionDeclarations)) {
+                return {
+                    functionDeclarations: tool.functionDeclarations.map((decl: any) => ({
+                        name: decl.name,
+                        ...(decl.description ? { description: decl.description } : {}),
+                        parameters: '[omitted]'
+                    }))
+                };
+            }
+            // Claude 格式: { name, description, input_schema }
+            const res: any = {};
+            if (tool.name) res.name = tool.name;
+            if (tool.description) res.description = tool.description;
+            if (tool.input_schema) res.input_schema = '[omitted]';
+            return Object.keys(res).length > 0 ? res : tool;
+        });
+    };
+
+    // 简化工具调用 (保留 name, id, 省略具体 arguments / input)
+    const simplifyToolCalls = (toolCalls: any): any => {
+        if (!Array.isArray(toolCalls)) return undefined;
+        return toolCalls.map((tc: any) => {
+            if (!tc || typeof tc !== 'object') return tc;
+            const res: any = {};
+            if (tc.id) res.id = tc.id;
+            if (tc.type) res.type = tc.type;
+            if (tc.function && typeof tc.function === 'object') {
+                res.function = {
+                    name: tc.function.name,
+                    arguments: '[omitted]'
+                };
+            } else {
+                if (tc.name) res.name = tc.name;
+                if (tc.input !== undefined) res.input = '[omitted]';
+                if (tc.args !== undefined) res.args = '[omitted]';
+            }
+            return res;
+        });
+    };
+
+    // 简化消息内容 (Claude / OpenAI parts)
+    const simplifyContent = (content: any): any => {
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+            return content.map((item: any) => {
+                if (typeof item === 'string') return item;
+                if (!item || typeof item !== 'object') return item;
+                // Claude tool_use 块
+                if (item.type === 'tool_use') {
+                    return {
+                        type: 'tool_use',
+                        id: item.id,
+                        name: item.name,
+                        input: '[omitted]'
+                    };
+                }
+                // Claude thinking 块与签名
+                if (item.type === 'thinking') {
+                    return {
+                        type: 'thinking',
+                        thinking: item.thinking,
+                        ...(item.signature ? { signature: item.signature } : {})
+                    };
+                }
+                // Claude redacted_thinking 块
+                if (item.type === 'redacted_thinking') {
+                    return {
+                        type: 'redacted_thinking',
+                        data: item.data
+                    };
+                }
+                // 文本块
+                if (item.type === 'text') {
+                    return item;
+                }
+                return item;
+            });
+        }
+        return content;
+    };
+
+    // 简化消息列表
+    const simplifyMessages = (messages: any): any => {
+        if (!Array.isArray(messages)) return undefined;
+        return messages.map((m: any) => {
+            if (!m || typeof m !== 'object') return m;
+            const res: any = { role: m.role };
+            if (m.content !== undefined) {
+                res.content = simplifyContent(m.content);
+            }
+            if (m.reasoning_content !== undefined) {
+                res.reasoning_content = m.reasoning_content;
+            }
+            if (m.thinking !== undefined) {
+                res.thinking = m.thinking;
+            }
+            if (m.signature !== undefined) {
+                res.signature = m.signature;
+            }
+            if (m.tool_calls) {
+                res.tool_calls = simplifyToolCalls(m.tool_calls);
+            }
+            if (m.tool_call_id) {
+                res.tool_call_id = m.tool_call_id;
+            }
+            if (m.name) {
+                res.name = m.name;
+            }
+            return res;
+        });
+    };
+
+    // 简化 Gemini 轮次 (contents)
+    const simplifyGeminiContents = (contents: any): any => {
+        if (!Array.isArray(contents)) return undefined;
+        return contents.map((c: any) => {
+            if (!c || typeof c !== 'object') return c;
+            const res: any = { role: c.role };
+            if (Array.isArray(c.parts)) {
+                res.parts = c.parts.map((p: any) => {
+                    if (!p || typeof p !== 'object') return p;
+                    if (p.thought !== undefined || p.thought_signature !== undefined) {
+                        const tPart: any = {};
+                        if (p.thought !== undefined) tPart.thought = p.thought;
+                        if (p.thought_signature !== undefined) tPart.thought_signature = p.thought_signature;
+                        if (p.text !== undefined) tPart.text = p.text;
+                        return tPart;
+                    }
+                    if (p.functionCall) {
+                        return {
+                            functionCall: {
+                                name: p.functionCall.name,
+                                args: '[omitted]'
+                            }
+                        };
+                    }
+                    if (p.functionResponse) {
+                        return {
+                            functionResponse: {
+                                name: p.functionResponse.name,
+                                response: typeof p.functionResponse.response === 'object' ? '[response data]' : p.functionResponse.response
+                            }
+                        };
+                    }
+                    return p;
+                });
+            }
+            return res;
+        });
+    };
+
+    // 提取用量与缓存命中率
+    const simplifyUsage = (usage: any): any => {
+        if (!usage || typeof usage !== 'object') return undefined;
+        const res: any = {};
+        const input = usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokenCount;
+        const output = usage.completion_tokens ?? usage.output_tokens ?? usage.candidatesTokenCount;
+        const total = usage.total_tokens ?? usage.totalTokenCount ?? (input != null && output != null ? input + output : undefined);
+
+        let cached = usage.cached_tokens ?? usage.cache_read_input_tokens ?? usage.cachedContentTokenCount;
+        if (cached == null && usage.prompt_tokens_details?.cached_tokens != null) {
+            cached = usage.prompt_tokens_details.cached_tokens;
+        }
+        if (cached == null && usage.input_tokens_details?.cached_tokens != null) {
+            cached = usage.input_tokens_details.cached_tokens;
+        }
+
+        if (input != null) res.input_tokens = input;
+        if (output != null) res.output_tokens = output;
+        if (total != null) res.total_tokens = total;
+        if (cached != null) {
+            res.cached_tokens = cached;
+            if (input != null && input > 0) {
+                res.cache_hit_rate = `${((cached / input) * 100).toFixed(1)}%`;
+            }
+        }
+        if (usage.cache_creation_input_tokens != null) {
+            res.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+        }
+        if (usage.completion_tokens_details?.reasoning_tokens != null) {
+            res.reasoning_tokens = usage.completion_tokens_details.reasoning_tokens;
+        }
+        if (usage.output_tokens_details?.reasoning_tokens != null) {
+            res.reasoning_tokens = usage.output_tokens_details.reasoning_tokens;
+        }
+        return res;
+    };
+
+    const concise: any = {};
+
+    // 保留用于标识思考块/会话的单行标识
+    if (obj._session_id || obj.session_id) {
+        concise._session_thinking_id = obj._session_id || obj.session_id;
+    } else if (log?.id) {
+        concise._request_id = log.id;
+    }
+
+    // 模型
+    if (obj.model) concise.model = obj.model;
+
+    // 思考模型配置 (开启、预算、effort、summary)
+    if (obj.thinking !== undefined) concise.thinking = obj.thinking;
+    if (obj.reasoning_effort !== undefined) concise.reasoning_effort = obj.reasoning_effort;
+    if (obj.reasoning !== undefined) concise.reasoning = obj.reasoning;
+    if (obj.summary !== undefined) concise.summary = obj.summary;
+    if (obj.generationConfig?.thinkingConfig !== undefined) {
+        concise.thinkingConfig = obj.generationConfig.thinkingConfig;
+    } else if (obj.thinkingConfig !== undefined) {
+        concise.thinkingConfig = obj.thinkingConfig;
+    }
+
+    // 系统提示词
+    if (obj.system !== undefined) concise.system = obj.system;
+    if (obj.systemInstruction !== undefined) concise.systemInstruction = obj.systemInstruction;
+
+    // 对话主体 (OpenAI / Claude)
+    if (obj.messages) {
+        concise.messages = simplifyMessages(obj.messages);
+    }
+
+    // 对话主体 (Gemini)
+    if (obj.contents) {
+        concise.contents = simplifyGeminiContents(obj.contents);
+    }
+
+    // 工具声明
+    if (obj.tools) {
+        concise.tools = simplifyTools(obj.tools);
+    }
+
+    // 响应：Choices / Candidates / 聚合响应
+    if (obj.choices && Array.isArray(obj.choices)) {
+        concise.choices = obj.choices.map((c: any) => {
+            const choiceRes: any = { index: c.index };
+            if (c.finish_reason) choiceRes.finish_reason = c.finish_reason;
+            if (c.message) {
+                choiceRes.message = {
+                    role: c.message.role,
+                    ...(c.message.reasoning_content !== undefined ? { reasoning_content: c.message.reasoning_content } : {}),
+                    ...(c.message.thinking !== undefined ? { thinking: c.message.thinking } : {}),
+                    ...(c.message.signature !== undefined ? { signature: c.message.signature } : {}),
+                    ...(c.message.content !== undefined ? { content: c.message.content } : {}),
+                    ...(c.message.tool_calls ? { tool_calls: simplifyToolCalls(c.message.tool_calls) } : {})
+                };
+            } else if (c.delta) {
+                choiceRes.delta = {
+                    role: c.delta.role,
+                    ...(c.delta.reasoning_content !== undefined ? { reasoning_content: c.delta.reasoning_content } : {}),
+                    ...(c.delta.content !== undefined ? { content: c.delta.content } : {}),
+                    ...(c.delta.tool_calls ? { tool_calls: simplifyToolCalls(c.delta.tool_calls) } : {})
+                };
+            }
+            return choiceRes;
+        });
+    }
+
+    if (obj.candidates && Array.isArray(obj.candidates)) {
+        concise.candidates = obj.candidates.map((cand: any) => {
+            const candRes: any = {};
+            if (cand.finishReason) candRes.finishReason = cand.finishReason;
+            if (cand.content) {
+                candRes.content = simplifyGeminiContents([cand.content])?.[0] || cand.content;
+            }
+            return candRes;
+        });
+    }
+
+    if (obj.content !== undefined && !obj.messages && !obj.choices) {
+        concise.content = simplifyContent(obj.content);
+    }
+    if (obj.reasoning_content !== undefined && !obj.messages && !obj.choices) {
+        concise.reasoning_content = obj.reasoning_content;
+    }
+    if (obj.tool_calls && !obj.messages && !obj.choices) {
+        concise.tool_calls = simplifyToolCalls(obj.tool_calls);
+    }
+
+    // 用量与缓存
+    const usage = simplifyUsage(obj.usage || obj.usageMetadata);
+    if (usage) {
+        concise.usage = usage;
+    } else if (kind === 'response' && (log?.input_tokens || log?.output_tokens)) {
+        concise.usage = {
+            input_tokens: log.input_tokens,
+            output_tokens: log.output_tokens,
+            ...(log.cached_tokens != null ? {
+                cached_tokens: log.cached_tokens,
+                cache_hit_rate: log.input_tokens ? `${((log.cached_tokens / log.input_tokens) * 100).toFixed(1)}%` : undefined
+            } : {})
+        };
+    }
+
+    return JSON.stringify(concise, null, 2);
+}
+
+// ==========================================
+// 单栏报文展示卡片（含独立搜索、高亮、跳转与复制）
+// ==========================================
+interface PayloadViewerCardProps {
+    cardId: string;
+    title: string;
+    badge: string;
+    badgeStyle: string;
+    rawPayload?: string;
+    concisePayload?: string;
+    viewMode: 'concise' | 'full';
+    emptyPlaceholder: string;
+    onCopy: (content: string) => Promise<void>;
+    isCopied: boolean;
+}
+
+const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
+    cardId,
+    title,
+    badge,
+    badgeStyle,
+    rawPayload,
+    concisePayload,
+    viewMode,
+    emptyPlaceholder,
+    onCopy,
+    isCopied,
+}) => {
+    const { t } = useTranslation();
+    const [searchTerm, setSearchTerm] = useState('');
+    const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    const activeContent = useMemo(() => {
+        if (viewMode === 'concise') {
+            return concisePayload || rawPayload || '';
+        }
+        return rawPayload || '';
+    }, [viewMode, concisePayload, rawPayload]);
+
+    const formattedContent = useMemo(() => {
+        if (!activeContent) return '';
+        try {
+            const obj = JSON.parse(activeContent);
+            return JSON.stringify(obj, null, 2);
+        } catch {
+            return activeContent;
+        }
+    }, [activeContent]);
+
+    const matchesCount = useMemo(() => {
+        if (!searchTerm.trim() || !formattedContent) return 0;
+        try {
+            const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const matches = formattedContent.match(new RegExp(escaped, 'gi'));
+            return matches ? matches.length : 0;
+        } catch {
+            return 0;
+        }
+    }, [searchTerm, formattedContent]);
+
+    useEffect(() => {
+        setCurrentMatchIndex(0);
+    }, [searchTerm, viewMode]);
+
+    useEffect(() => {
+        if (searchTerm.trim() && matchesCount > 0 && containerRef.current) {
+            const activeEl = containerRef.current.querySelector(`#active-match-${cardId}`);
+            if (activeEl) {
+                activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }
+    }, [currentMatchIndex, searchTerm, matchesCount, cardId]);
+
+    const handleNext = () => {
+        if (matchesCount > 0) {
+            setCurrentMatchIndex((prev) => (prev + 1) % matchesCount);
+        }
+    };
+
+    const handlePrev = () => {
+        if (matchesCount > 0) {
+            setCurrentMatchIndex((prev) => (prev - 1 + matchesCount) % matchesCount);
+        }
+    };
+
+    const renderBody = () => {
+        if (!formattedContent) {
+            return (
+                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-gray-400 select-none">
+                    <span className="text-xs italic">{emptyPlaceholder}</span>
+                </div>
+            );
+        }
+
+        if (!searchTerm.trim()) {
+            return (
+                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
+                    {formattedContent}
+                </pre>
+            );
+        }
+
+        try {
+            const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const regex = new RegExp(`(${escaped})`, 'gi');
+            const parts = formattedContent.split(regex);
+            let matchCounter = -1;
+
+            return (
+                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
+                    {parts.map((part, idx) => {
+                        if (part.toLowerCase() === searchTerm.toLowerCase()) {
+                            matchCounter++;
+                            const isActive = matchCounter === currentMatchIndex;
+                            return (
+                                <mark
+                                    key={idx}
+                                    id={isActive ? `active-match-${cardId}` : undefined}
+                                    className={`rounded px-0.5 transition-all duration-150 ${
+                                        isActive
+                                            ? 'bg-amber-400 dark:bg-amber-500 text-black font-extrabold ring-2 ring-amber-600 shadow-sm'
+                                            : 'bg-yellow-200 dark:bg-yellow-700/80 text-gray-900 dark:text-gray-100 font-semibold'
+                                    }`}
+                                >
+                                    {part}
+                                </mark>
+                            );
+                        }
+                        return <span key={idx}>{part}</span>;
+                    })}
+                </pre>
+            );
+        } catch {
+            return (
+                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
+                    {formattedContent}
+                </pre>
+            );
+        }
+    };
+
+    return (
+        <div className="flex flex-col h-full bg-gray-50/70 dark:bg-base-200/50 rounded-xl border border-gray-200 dark:border-base-300 overflow-hidden shadow-sm">
+            {/* Card Header */}
+            <div className="px-3 py-2 border-b border-gray-200 dark:border-base-300 bg-white dark:bg-base-200 flex items-center justify-between gap-2 shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider border shrink-0 ${badgeStyle}`}>
+                        {badge}
+                    </span>
+                    <h3 className="text-xs font-bold text-gray-800 dark:text-gray-200 truncate" title={title}>
+                        {title}
+                    </h3>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                    <button
+                        type="button"
+                        onClick={() => onCopy(formattedContent)}
+                        disabled={!formattedContent}
+                        className="btn btn-ghost btn-xs gap-1 h-7 px-2 text-gray-600 dark:text-gray-300"
+                        title={isCopied ? t('proxy.config.btn_copied', '已复制') : t('proxy.config.btn_copy', '复制')}
+                    >
+                        {isCopied ? <CheckCircle size={12} className="text-green-500" /> : <Copy size={12} />}
+                        <span className="text-[10px] font-medium">{isCopied ? t('proxy.config.btn_copied', '已复制') : t('proxy.config.btn_copy', '复制')}</span>
+                    </button>
+                </div>
+            </div>
+
+            {/* In-block Search Bar */}
+            <div className="px-2.5 py-1.5 bg-gray-100/70 dark:bg-base-300/40 border-b border-gray-200 dark:border-base-300 flex items-center gap-1.5 shrink-0">
+                <div className="relative flex-1 min-w-0 flex items-center">
+                    <Search size={12} className="absolute left-2 text-gray-400 pointer-events-none" />
+                    <input
+                        type="text"
+                        placeholder={t('monitor.details.search_placeholder', '搜索此报文...')}
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                        className="input input-xs input-bordered w-full pl-6 pr-6 text-[11px] h-7 bg-white dark:bg-base-200 rounded-md"
+                    />
+                    {searchTerm && (
+                        <button
+                            type="button"
+                            onClick={() => setSearchTerm('')}
+                            className="absolute right-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-0.5"
+                            title="清除搜索"
+                        >
+                            <X size={12} />
+                        </button>
+                    )}
+                </div>
+
+                {/* Match Counter and Next/Prev Navigation */}
+                {searchTerm.trim() && (
+                    <div className="flex items-center gap-1 shrink-0 bg-white dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-md px-1.5 py-0.5 h-7">
+                        <span className="text-[10px] font-mono font-semibold text-gray-600 dark:text-gray-300">
+                            {matchesCount > 0 ? `${currentMatchIndex + 1}/${matchesCount}` : '0 匹配'}
+                        </span>
+                        <div className="flex items-center">
+                            <button
+                                type="button"
+                                onClick={handlePrev}
+                                disabled={matchesCount <= 1}
+                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
+                                title="上一处"
+                            >
+                                <ChevronUp size={12} />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleNext}
+                                disabled={matchesCount <= 1}
+                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
+                                title="下一处"
+                            >
+                                <ChevronDown size={12} />
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Scrollable Content Body */}
+            <div
+                ref={containerRef}
+                className="flex-1 overflow-y-auto overflow-x-auto p-3 bg-white dark:bg-base-300/60 font-mono text-[11px]"
+            >
+                {renderBody()}
+            </div>
+        </div>
+    );
+};
+
 export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const { t } = useTranslation();
     const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
@@ -153,7 +717,27 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
-    const [copiedRequestId, setCopiedRequestId] = useState<string | null>(null);
+    const [payloadViewMode, setPayloadViewMode] = useState<'concise' | 'full'>('concise');
+    const [showMetadata, setShowMetadata] = useState(true);
+    const [copiedCard, setCopiedCard] = useState<string | null>(null);
+
+    const conciseRequestBody = useMemo(() => {
+        return selectedLog?.request_body
+            ? extractConcisePayload(selectedLog.request_body, 'request', selectedLog)
+            : '';
+    }, [selectedLog?.request_body, selectedLog?.id]);
+
+    const conciseUpstreamBody = useMemo(() => {
+        return selectedLog?.upstream_request_body
+            ? extractConcisePayload(selectedLog.upstream_request_body, 'upstream', selectedLog)
+            : '';
+    }, [selectedLog?.upstream_request_body, selectedLog?.id]);
+
+    const conciseResponseBody = useMemo(() => {
+        return selectedLog?.response_body
+            ? extractConcisePayload(selectedLog.response_body, 'response', selectedLog)
+            : '';
+    }, [selectedLog?.response_body, selectedLog?.id, selectedLog?.input_tokens, selectedLog?.output_tokens, selectedLog?.cached_tokens]);
 
     const { accounts, fetchAccounts } = useAccountStore();
 
@@ -380,7 +964,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     }, []);
 
     useEffect(() => {
-        setCopiedRequestId(null);
+        setCopiedCard(null);
     }, [selectedLog?.id]);
 
     // Reload when pageSize changes
@@ -431,24 +1015,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         }
     };
 
-    const formatBody = (body?: string) => {
-        if (!body) return <span className="text-gray-400 italic">{t('monitor.details.payload_empty')}</span>;
-        try {
-            const obj = JSON.parse(body);
-            return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{JSON.stringify(obj, null, 2)}</pre>;
-        } catch (e) {
-            return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{body}</pre>;
-        }
-    };
 
-    const getCopyPayload = (body: string) => {
-        try {
-            const obj = JSON.parse(body);
-            return JSON.stringify(obj, null, 2);
-        } catch (e) {
-            return body;
-        }
-    };
 
 
     return (
@@ -578,182 +1145,174 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             </div>
 
             {selectedLog && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setSelectedLog(null)}>
-                    <div className="bg-white dark:bg-base-100 rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-2 sm:p-3 md:p-4" onClick={() => setSelectedLog(null)}>
+                    <div className="bg-white dark:bg-base-100 rounded-2xl shadow-2xl w-full max-w-[98vw] xl:max-w-[1720px] h-[94vh] max-h-[94vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
                         {/* Modal Header */}
-                        <div className="px-4 py-3 border-b border-gray-100 dark:border-base-300 flex items-center justify-between bg-gray-50 dark:bg-base-200">
-                            <div className="flex items-center gap-3">
-                                {loadingDetail && <div className="loading loading-spinner loading-sm"></div>}
-                                <span className={`badge badge-sm text-white border-none ${selectedLog.status >= 200 && selectedLog.status < 400 ? 'badge-success' : 'badge-error'}`}>{selectedLog.status}</span>
-                                <span className="font-mono font-bold text-gray-900 dark:text-base-content text-sm">{selectedLog.method}</span>
-                                <span className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate max-w-md hidden sm:inline">{selectedLog.url}</span>
+                        <div className="px-4 py-2.5 border-b border-gray-200 dark:border-base-300 flex items-center justify-between bg-gray-50 dark:bg-base-200 shrink-0">
+                            <div className="flex items-center gap-3 min-w-0">
+                                {loadingDetail && <div className="loading loading-spinner loading-sm shrink-0"></div>}
+                                <span className={`badge badge-sm text-white border-none font-bold shrink-0 ${selectedLog.status >= 200 && selectedLog.status < 400 ? 'badge-success' : 'badge-error'}`}>{selectedLog.status}</span>
+                                <span className="font-mono font-bold text-gray-900 dark:text-base-content text-sm shrink-0">{selectedLog.method}</span>
+                                <span className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate max-w-lg hidden sm:inline" title={selectedLog.url}>{selectedLog.url}</span>
                             </div>
-                            <button onClick={() => setSelectedLog(null)} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300"><X size={18} /></button>
+                            <button onClick={() => setSelectedLog(null)} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300" aria-label="关闭"><X size={18} /></button>
                         </div>
 
                         {/* Modal Content */}
-                        <div className="flex-1 overflow-y-auto p-4 space-y-6 bg-white dark:bg-base-100">
-                            {/* Metadata Section */}
-                            <div className="bg-gray-50 dark:bg-base-200 p-5 rounded-xl border border-gray-200 dark:border-base-300 shadow-inner">
-                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-y-5 gap-x-10">
-                                    <div className="space-y-1.5">
-                                        <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.time')}</span>
-                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{new Date(selectedLog.timestamp).toLocaleString()}</span>
-                                    </div>
-                                    <div className="space-y-1.5">
-                                        <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.duration')}</span>
-                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.duration}ms</span>
-                                    </div>
-                                    <div className="space-y-1.5">
-                                        <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.tokens')}</span>
-                                        <div className="font-mono text-[11px] flex gap-2">
-                                            <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-2.5 py-1 rounded-md border border-blue-200 dark:border-blue-800/50 font-bold">In: {formatCompactNumber(selectedLog.input_tokens ?? 0)}</span>
-                                            <span className="text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 px-2.5 py-1 rounded-md border border-green-200 dark:border-green-800/50 font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
+                        <div className="flex-1 min-h-0 flex flex-col p-3 sm:p-4 space-y-2.5 bg-white dark:bg-base-100 overflow-hidden">
+                            {/* Metadata Section (Collapsible) */}
+                            {showMetadata && (
+                                <div className="bg-gray-50/80 dark:bg-base-200/70 p-3 sm:p-3.5 rounded-xl border border-gray-200 dark:border-base-300 shadow-inner shrink-0 text-xs transition-all duration-200">
+                                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.time')}</span>
+                                            <span className="font-mono font-semibold text-gray-800 dark:text-base-content text-[11px] truncate block" title={new Date(selectedLog.timestamp).toLocaleString()}>{new Date(selectedLog.timestamp).toLocaleString()}</span>
+                                        </div>
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.duration')}</span>
+                                            <span className="font-mono font-semibold text-gray-800 dark:text-base-content text-[11px]">{selectedLog.duration}ms</span>
+                                        </div>
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.tokens')}</span>
+                                            <div className="font-mono text-[10px] flex items-center gap-1.5 mt-0.5">
+                                                <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded font-bold">In: {formatCompactNumber(selectedLog.input_tokens ?? 0)}</span>
+                                                <span className="text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 px-1.5 py-0.5 rounded font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
+                                                {selectedLog.cached_tokens != null && selectedLog.cached_tokens > 0 && (
+                                                    <span className="text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/40 px-1.5 py-0.5 rounded font-bold">Cache: {formatCompactNumber(selectedLog.cached_tokens)}</span>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.protocol')}</span>
+                                            <span className={`inline-block px-1.5 py-0.5 rounded font-mono font-black text-[10px] uppercase mt-0.5 ${
+                                                selectedLog.protocol === 'openai' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50' :
+                                                selectedLog.protocol === 'anthropic' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400 border border-orange-200 dark:border-orange-800/50' :
+                                                selectedLog.protocol === 'gemini' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50' :
+                                                'bg-gray-100 text-gray-700 dark:bg-gray-900/40 dark:text-gray-400'
+                                            }`}>
+                                                {selectedLog.protocol || '-'}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.model')}</span>
+                                            <span className="font-mono font-bold text-blue-600 dark:text-blue-400 truncate block text-[11px]" title={selectedLog.model}>{selectedLog.model || '-'}</span>
+                                            {selectedLog.mapped_model && selectedLog.model !== selectedLog.mapped_model && (
+                                                <span className="font-mono text-green-600 dark:text-green-400 truncate block text-[10px]" title={selectedLog.mapped_model}>➔ {selectedLog.mapped_model}</span>
+                                            )}
+                                        </div>
+                                        <div>
+                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.account_used')}</span>
+                                            <span className="font-mono text-gray-800 dark:text-base-content truncate block text-[11px]" title={selectedLog.account_email || '-'}>{selectedLog.account_email || '-'}</span>
                                         </div>
                                     </div>
                                 </div>
-                                <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
-                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-                                        {selectedLog.protocol && (
-                                            <div className="space-y-1.5">
-                                                <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.protocol')}</span>
-                                                <span className={`inline-block px-2.5 py-1 rounded-md font-mono font-black text-xs uppercase ${selectedLog.protocol === 'openai' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50' :
-                                                    selectedLog.protocol === 'anthropic' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400 border border-orange-200 dark:border-orange-800/50' :
-                                                        selectedLog.protocol === 'gemini' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50' :
-                                                            'bg-gray-100 text-gray-700 dark:bg-gray-900/40 dark:text-gray-400'
-                                                    }`}>
-                                                    {selectedLog.protocol}
-                                                </span>
-                                            </div>
-                                        )}
-                                        <div className="space-y-1.5">
-                                            <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.model')}</span>
-                                            <span className="font-mono font-black text-blue-600 dark:text-blue-400 break-all text-sm">{selectedLog.model || '-'}</span>
-                                        </div>
-                                        {selectedLog.mapped_model && selectedLog.model !== selectedLog.mapped_model && (
-                                            <div className="space-y-1.5">
-                                                <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.mapped_model')}</span>
-                                                <span className="font-mono font-black text-green-600 dark:text-green-400 break-all text-sm">{selectedLog.mapped_model}</span>
-                                            </div>
-                                        )}
+                            )}
+
+                            {/* Mode & Toolbar Bar */}
+                            <div className="flex flex-wrap items-center justify-between gap-2 px-1 shrink-0">
+                                <div className="flex items-center gap-2">
+                                    <div className="join border border-gray-200 dark:border-base-300 rounded-lg p-0.5 bg-gray-100 dark:bg-base-200">
+                                        <button
+                                            type="button"
+                                            onClick={() => setPayloadViewMode('concise')}
+                                            className={`btn btn-xs join-item border-none gap-1.5 font-bold ${
+                                                payloadViewMode === 'concise'
+                                                    ? 'bg-blue-600 text-white shadow-sm'
+                                                    : 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/5'
+                                            }`}
+                                        >
+                                            <Sparkles size={12} />
+                                            {t('monitor.details.concise_mode', '简要模式')}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setPayloadViewMode('full')}
+                                            className={`btn btn-xs join-item border-none gap-1.5 font-bold ${
+                                                payloadViewMode === 'full'
+                                                    ? 'bg-blue-600 text-white shadow-sm'
+                                                    : 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-black/5 dark:hover:bg-white/5'
+                                            }`}
+                                        >
+                                            <FileCode2 size={12} />
+                                            {t('monitor.details.full_mode', '完整模式')}
+                                        </button>
                                     </div>
+                                    <span className="hidden sm:inline-block text-[11px] text-gray-500 dark:text-gray-400">
+                                        {payloadViewMode === 'concise'
+                                            ? t('monitor.details.concise_desc', '已为您精简工具参数与冗余字段，突出思考块、用量与对话主体')
+                                            : '显示原始完整未修剪报文'}
+                                    </span>
                                 </div>
-                                {selectedLog.account_email && (
-                                    <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
-                                        <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest mb-2">{t('monitor.details.account_used')}</span>
-                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.account_email}</span>
-                                    </div>
-                                )}
+
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowMetadata((prev) => !prev)}
+                                        className="btn btn-xs btn-ghost text-gray-500 dark:text-gray-400 gap-1 text-[11px]"
+                                        title={showMetadata ? '折叠元数据以增大报文视野' : '展开元数据信息'}
+                                    >
+                                        {showMetadata ? <EyeOff size={13} /> : <Eye size={13} />}
+                                        <span>{showMetadata ? '收起元数据' : '展开元数据'}</span>
+                                    </button>
+                                </div>
                             </div>
 
-                            {/* Payloads */}
-                            <div className="space-y-4">
-                                <div>
-                                    <div className="flex items-center justify-between mb-2">
-                                        <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">{t('monitor.details.request_payload')}</h3>
-                                        <button
-                                            type="button"
-                                            className="btn btn-ghost btn-xs gap-1"
-                                            onClick={async () => {
-                                                if (!selectedLog.request_body) return;
-                                                const success = await copyToClipboard(getCopyPayload(selectedLog.request_body));
-                                                if (success) {
-                                                    setCopiedRequestId(selectedLog.id);
-                                                    setTimeout(() => {
-                                                        setCopiedRequestId((current) => (current === selectedLog.id ? null : current));
-                                                    }, 2000);
-                                                }
-                                            }}
-                                            disabled={!selectedLog.request_body}
-                                            title={copiedRequestId === selectedLog.id ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                            aria-label={t('proxy.config.btn_copy')}
-                                        >
-                                            {copiedRequestId === selectedLog.id ? (
-                                                <CheckCircle size={12} className="text-green-500" />
-                                            ) : (
-                                                <Copy size={12} />
-                                            )}
-                                            <span className="text-[10px]">
-                                                {copiedRequestId === selectedLog.id ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                            </span>
-                                        </button>
-                                    </div>
-                                    <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">{formatBody(selectedLog.request_body)}</div>
-                                </div>
-                                {selectedLog.upstream_request_body && (
-                                    <div>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">
-                                                {t('monitor.details.upstream_request_payload', '转出报文 (Forwarded)')}
-                                            </h3>
-                                            <button
-                                                type="button"
-                                                className="btn btn-ghost btn-xs gap-1"
-                                                onClick={async () => {
-                                                    if (!selectedLog.upstream_request_body) return;
-                                                    const success = await copyToClipboard(getCopyPayload(selectedLog.upstream_request_body));
-                                                    if (success) {
-                                                        setCopiedRequestId(selectedLog.id ? `${selectedLog.id}-upstream` : null);
-                                                        setTimeout(() => {
-                                                            setCopiedRequestId((current) =>
-                                                                current === `${selectedLog.id}-upstream` ? null : current
-                                                            );
-                                                        }, 2000);
-                                                    }
-                                                }}
-                                                disabled={!selectedLog.upstream_request_body}
-                                                title={copiedRequestId === `${selectedLog.id}-upstream` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                                aria-label={t('proxy.config.btn_copy')}
-                                            >
-                                                {copiedRequestId === `${selectedLog.id}-upstream` ? (
-                                                    <CheckCircle size={12} className="text-green-500" />
-                                                ) : (
-                                                    <Copy size={12} />
-                                                )}
-                                                <span className="text-[10px]">
-                                                    {copiedRequestId === `${selectedLog.id}-upstream` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                                </span>
-                                            </button>
-                                        </div>
-                                        <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">
-                                            {formatBody(selectedLog.upstream_request_body)}
-                                        </div>
-                                    </div>
-                                )}
-                                <div>
-                                    <div className="flex items-center justify-between mb-2">
-                                        <h3 className="text-xs font-bold uppercase text-gray-400 flex items-center gap-2">{t('monitor.details.response_payload')}</h3>
-                                        <button
-                                            type="button"
-                                            className="btn btn-ghost btn-xs gap-1"
-                                            onClick={async () => {
-                                                if (!selectedLog.response_body) return;
-                                                const success = await copyToClipboard(getCopyPayload(selectedLog.response_body));
-                                                if (success) {
-                                                    setCopiedRequestId(selectedLog.id ? `${selectedLog.id}-response` : null);
-                                                    setTimeout(() => {
-                                                        setCopiedRequestId((current) =>
-                                                            current === `${selectedLog.id}-response` ? null : current
-                                                        );
-                                                    }, 2000);
-                                                }
-                                            }}
-                                            disabled={!selectedLog.response_body}
-                                            title={copiedRequestId === `${selectedLog.id}-response` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                            aria-label={t('proxy.config.btn_copy')}
-                                        >
-                                            {copiedRequestId === `${selectedLog.id}-response` ? (
-                                                <CheckCircle size={12} className="text-green-500" />
-                                            ) : (
-                                                <Copy size={12} />
-                                            )}
-                                            <span className="text-[10px]">
-                                                {copiedRequestId === `${selectedLog.id}-response` ? t('proxy.config.btn_copied') : t('proxy.config.btn_copy')}
-                                            </span>
-                                        </button>
-                                    </div>
-                                    <div className="bg-gray-50 dark:bg-base-300 rounded-lg p-3 border border-gray-100 dark:border-base-300 overflow-hidden">{formatBody(selectedLog.response_body)}</div>
-                                </div>
+                            {/* Horizontal 3-Column Grid */}
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 flex-1 min-h-0 overflow-hidden">
+                                <PayloadViewerCard
+                                    cardId="req"
+                                    title={t('monitor.details.request_payload', '请求报文 (Request)')}
+                                    badge="REQUEST"
+                                    badgeStyle="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 border-blue-200 dark:border-blue-800/50"
+                                    rawPayload={selectedLog.request_body}
+                                    concisePayload={conciseRequestBody}
+                                    viewMode={payloadViewMode}
+                                    emptyPlaceholder={t('monitor.details.payload_empty', '无请求报文')}
+                                    onCopy={async (text) => {
+                                        const success = await copyToClipboard(text);
+                                        if (success) {
+                                            setCopiedCard('req');
+                                            setTimeout(() => setCopiedCard(null), 2000);
+                                        }
+                                    }}
+                                    isCopied={copiedCard === 'req'}
+                                />
+                                <PayloadViewerCard
+                                    cardId="upstream"
+                                    title={t('monitor.details.upstream_request_payload', '中转报文 (Forwarded)')}
+                                    badge="FORWARDED"
+                                    badgeStyle="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200 dark:border-amber-800/50"
+                                    rawPayload={selectedLog.upstream_request_body}
+                                    concisePayload={conciseUpstreamBody}
+                                    viewMode={payloadViewMode}
+                                    emptyPlaceholder={t('monitor.details.no_upstream_payload', '无中转报文 (直接转发或未记录)')}
+                                    onCopy={async (text) => {
+                                        const success = await copyToClipboard(text);
+                                        if (success) {
+                                            setCopiedCard('upstream');
+                                            setTimeout(() => setCopiedCard(null), 2000);
+                                        }
+                                    }}
+                                    isCopied={copiedCard === 'upstream'}
+                                />
+                                <PayloadViewerCard
+                                    cardId="resp"
+                                    title={t('monitor.details.response_payload', '响应报文 (Response)')}
+                                    badge="RESPONSE"
+                                    badgeStyle="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/50"
+                                    rawPayload={selectedLog.response_body}
+                                    concisePayload={conciseResponseBody}
+                                    viewMode={payloadViewMode}
+                                    emptyPlaceholder={t('monitor.details.payload_empty', '无响应报文')}
+                                    onCopy={async (text) => {
+                                        const success = await copyToClipboard(text);
+                                        if (success) {
+                                            setCopiedCard('resp');
+                                            setTimeout(() => setCopiedCard(null), 2000);
+                                        }
+                                    }}
+                                    isCopied={copiedCard === 'resp'}
+                                />
                             </div>
                         </div>
                     </div>
