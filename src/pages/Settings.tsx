@@ -18,6 +18,22 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 
+function normalizeDataDirDisplay(path: string): string {
+    const trimmed = path.trim();
+    if (trimmed.startsWith('\\\\?\\UNC\\')) {
+        return `\\\\${trimmed.slice('\\\\?\\UNC\\'.length)}`;
+    }
+    if (trimmed.startsWith('\\\\?\\')) {
+        return trimmed.slice('\\\\?\\'.length);
+    }
+    if (trimmed.startsWith('//?/UNC/')) {
+        return `//${trimmed.slice('//?/UNC/'.length)}`;
+    }
+    if (trimmed.startsWith('//?/')) {
+        return trimmed.slice('//?/'.length);
+    }
+    return trimmed;
+}
 
 function Settings() {
     const { t, i18n } = useTranslation();
@@ -118,7 +134,7 @@ function Settings() {
 
         // 获取真实数据目录路径
         invoke<string>('get_data_dir_path')
-            .then(path => setDataDirPath(path))
+            .then(path => setDataDirPath(normalizeDataDirDisplay(path)))
             .catch(err => console.error('Failed to get data dir:', err));
 
         // 加载更新设置
@@ -230,7 +246,7 @@ function Settings() {
         setIsMigratingDataDir(true);
         try {
             const newPath = await invoke<string>('set_data_dir', { path: pendingDataDir });
-            setDataDirPath(newPath);
+            setDataDirPath(normalizeDataDirDisplay(newPath));
             setIsMigrateDataDirOpen(false);
             setPendingDataDir('');
             showToast(t('settings.advanced.data_dir_migrated'), 'success');

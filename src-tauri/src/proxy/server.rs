@@ -2079,7 +2079,7 @@ async fn admin_get_proxy_stats(
 
 async fn admin_get_data_dir_path() -> impl IntoResponse {
     match crate::modules::account::get_data_dir() {
-        Ok(p) => Json(p.to_string_lossy().to_string()),
+        Ok(p) => Json(crate::modules::account::format_data_dir_path(&p)),
         Err(e) => Json(format!("Error: {}", e)),
     }
 }
@@ -2111,7 +2111,7 @@ async fn admin_set_data_dir(
             Json(ErrorResponse { error: e }),
         )
     })?;
-    Ok(Json(new_path.to_string_lossy().to_string()))
+    Ok(Json(crate::modules::account::format_data_dir_path(&new_path)))
 }
 
 // --- User Token Handlers ---

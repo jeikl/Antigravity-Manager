@@ -97,6 +97,30 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_data_dir_path_strips_windows_prefix() {
+        assert_eq!(
+            format_data_dir_path(Path::new(r"\\?\F:\antigravity-tools-data")),
+            r"F:\antigravity-tools-data"
+        );
+        assert_eq!(
+            format_data_dir_path(Path::new(r"\\?\UNC\server\share\data")),
+            r"\\server\share\data"
+        );
+        assert_eq!(
+            format_data_dir_path(Path::new("//?/C:/data")),
+            "C:/data"
+        );
+        assert_eq!(
+            format_data_dir_path(Path::new("/app/data")),
+            "/app/data"
+        );
+        assert_eq!(
+            format_data_dir_path(Path::new(r"F:\antigravity-tools-data")),
+            r"F:\antigravity-tools-data"
+        );
+    }
+
+    #[test]
     fn test_migrate_data_dir_rename_and_copy() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let pointer_path = dirs::home_dir()
@@ -136,6 +160,11 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(resolved.join("marker.txt")).unwrap(),
                 "hello"
+            );
+            let shown = format_data_dir_path(&resolved);
+            assert!(
+                !shown.contains(r"\\?\"),
+                "migrated path must not keep Windows verbatim prefix: {shown}"
             );
         }));
         restore();
@@ -607,6 +636,93 @@ fn ensure_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Strip Windows `\\?\` / `\\?\UNC\` prefixes and quotes so paths stay portable
+/// across Windows, Linux, macOS and Docker (`ABV_DATA_DIR=/app/data`).
+fn strip_extended_path_prefix(input: &str) -> String {
+    let s = input.trim().trim_matches(|c| c == '"' || c == '\'' || c == '\u{feff}');
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        return format!("//{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    s.to_string()
+}
+
+fn expand_user_path(input: &str) -> Option<PathBuf> {
+    if input == "~" || input.starts_with("~/") || input.starts_with("~\\") {
+        let home = dirs::home_dir()?;
+        let rest = input
+            .trim_start_matches('~')
+            .trim_start_matches(['/', '\\']);
+        return Some(if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        });
+    }
+    None
+}
+
+/// Normalize a data-dir path for persistence, env vars and UI display.
+pub fn normalize_data_dir_path(path: impl AsRef<Path>) -> PathBuf {
+    let raw = path.as_ref().to_string_lossy();
+    let stripped = strip_extended_path_prefix(&raw);
+    if let Some(expanded) = expand_user_path(&stripped) {
+        return expanded;
+    }
+    PathBuf::from(stripped)
+}
+
+/// Human-readable path without Windows verbatim prefixes.
+pub fn format_data_dir_path(path: &Path) -> String {
+    normalize_data_dir_path(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn resolve_existing_path(path: &Path) -> PathBuf {
+    let normalized = normalize_data_dir_path(path);
+    match normalized.canonicalize() {
+        Ok(canon) => normalize_data_dir_path(canon),
+        Err(_) => normalized,
+    }
+}
+
+fn path_compare_key(path: &Path) -> String {
+    let mut s = resolve_existing_path(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    #[cfg(windows)]
+    {
+        s = s.to_ascii_lowercase();
+    }
+    s
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    path_compare_key(a) == path_compare_key(b)
+}
+
+fn is_nested_data_dir(inner: &Path, outer: &Path) -> bool {
+    let inner_key = path_compare_key(inner);
+    let outer_key = path_compare_key(outer);
+    inner_key != outer_key && inner_key.starts_with(&(outer_key + "/"))
+}
+
+fn persist_clean_env(dir: &Path) {
+    std::env::set_var("ABV_DATA_DIR", format_data_dir_path(dir));
+}
+
 fn read_location_pointer() -> Option<PathBuf> {
     let path = location_pointer_path().ok()?;
     let content = fs::read_to_string(path).ok()?;
@@ -614,23 +730,17 @@ fn read_location_pointer() -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(PathBuf::from(trimmed))
+    let cleaned = normalize_data_dir_path(trimmed);
+    if format_data_dir_path(&cleaned) != trimmed {
+        let _ = write_location_pointer(&cleaned);
+    }
+    Some(cleaned)
 }
 
 fn write_location_pointer(dir: &Path) -> Result<(), String> {
     let pointer = location_pointer_path()?;
-    fs::write(&pointer, dir.to_string_lossy().as_bytes())
+    fs::write(&pointer, format_data_dir_path(dir).as_bytes())
         .map_err(|e| format!("写入数据目录指针失败: {}", e))
-}
-
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(ca), Ok(cb)) => ca == cb,
-        _ => false,
-    }
 }
 
 fn is_default_data_dir(dir: &Path) -> bool {
@@ -668,18 +778,19 @@ fn dir_is_empty(path: &Path) -> Result<bool, String> {
 }
 
 fn apply_data_dir(dir: &Path) -> Result<(), String> {
-    ensure_dir(dir)?;
-    if is_default_data_dir(dir) {
+    let dir = normalize_data_dir_path(dir);
+    ensure_dir(&dir)?;
+    if is_default_data_dir(&dir) {
         if let Ok(pointer) = location_pointer_path() {
             let _ = fs::remove_file(pointer);
         }
     } else {
-        write_location_pointer(dir)?;
+        write_location_pointer(&dir)?;
     }
     if let Ok(mut guard) = data_dir_override_slot().write() {
-        *guard = Some(dir.to_path_buf());
+        *guard = Some(dir.clone());
     }
-    std::env::set_var("ABV_DATA_DIR", dir);
+    persist_clean_env(&dir);
     Ok(())
 }
 
@@ -688,8 +799,11 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     // 1. Process env (tests, Docker, and in-process override after migrate)
     if let Ok(env_path) = std::env::var("ABV_DATA_DIR") {
         if !env_path.trim().is_empty() {
-            let data_dir = PathBuf::from(env_path);
+            let data_dir = normalize_data_dir_path(&env_path);
             ensure_dir(&data_dir)?;
+            if format_data_dir_path(&data_dir) != env_path {
+                persist_clean_env(&data_dir);
+            }
             return Ok(data_dir);
         }
     }
@@ -697,8 +811,9 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     // 2. Runtime override (pointer already loaded this session)
     if let Ok(guard) = data_dir_override_slot().read() {
         if let Some(ref path) = *guard {
-            ensure_dir(path)?;
-            return Ok(path.clone());
+            let data_dir = normalize_data_dir_path(path);
+            ensure_dir(&data_dir)?;
+            return Ok(data_dir);
         }
     }
 
@@ -719,6 +834,7 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
 
 /// Move the data directory to `new_dir`, persist the location, and switch all runtime lookups.
 pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
+    let new_dir = normalize_data_dir_path(new_dir);
     let new_dir = if new_dir.as_os_str().is_empty() {
         return Err("目标数据目录不能为空".to_string());
     } else if new_dir.is_absolute() {
@@ -729,13 +845,13 @@ pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
             .join(new_dir)
     };
 
-    let old_dir = get_data_dir()?;
+    let old_dir = normalize_data_dir_path(get_data_dir()?);
     if paths_equivalent(&old_dir, &new_dir) {
         apply_data_dir(&old_dir)?;
-        return Ok(old_dir.canonicalize().unwrap_or(old_dir));
+        return Ok(resolve_existing_path(&old_dir));
     }
 
-    if new_dir.starts_with(&old_dir) {
+    if is_nested_data_dir(&new_dir, &old_dir) {
         return Err("不能把数据目录迁移到自身内部".to_string());
     }
 
@@ -761,7 +877,7 @@ pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
         return Err("目标路径无效".to_string());
     }
 
-    let resolved = new_dir.canonicalize().unwrap_or_else(|_| new_dir.clone());
+    let resolved = resolve_existing_path(&new_dir);
     apply_data_dir(&resolved)?;
     Ok(resolved)
 }

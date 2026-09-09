@@ -839,7 +839,7 @@ pub async fn open_data_folder() -> Result<(), String> {
 #[tauri::command]
 pub async fn get_data_dir_path() -> Result<String, String> {
     let path = modules::account::get_data_dir()?;
-    Ok(path.to_string_lossy().to_string())
+    Ok(modules::account::format_data_dir_path(&path))
 }
 
 /// 选择并迁移数据目录（指针写在家目录，删除旧目录后下次启动仍能找到）
@@ -876,7 +876,7 @@ pub async fn set_data_dir(
         *lock = None;
     }
 
-    Ok(new_path.to_string_lossy().to_string())
+    Ok(modules::account::format_data_dir_path(&new_path))
 }
 
 /// 显示主窗口
