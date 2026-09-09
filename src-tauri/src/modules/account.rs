@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::models::{
 };
 use crate::modules;
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Global per-account lock to prevent concurrent write collisions on the same account JSON file
 static ACCOUNT_FILE_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -94,6 +94,54 @@ mod tests {
         let content = serde_json::to_string_pretty(&account).expect("Failed to serialize account");
         let account_path = accounts_dir.join(format!("{}.json", account_id));
         fs::write(&account_path, content).expect("Failed to write account file");
+    }
+
+    #[test]
+    fn test_migrate_data_dir_rename_and_copy() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let pointer_path = dirs::home_dir()
+            .expect("home")
+            .join(".antigravity_tools_location");
+        let previous_env = std::env::var("ABV_DATA_DIR").ok();
+        let previous_pointer = fs::read_to_string(&pointer_path).ok();
+
+        let restore = || {
+            match &previous_env {
+                Some(value) => std::env::set_var("ABV_DATA_DIR", value),
+                None => std::env::remove_var("ABV_DATA_DIR"),
+            }
+            match &previous_pointer {
+                Some(value) => {
+                    let _ = fs::write(&pointer_path, value);
+                }
+                None => {
+                    let _ = fs::remove_file(&pointer_path);
+                }
+            }
+            if let Ok(mut guard) = data_dir_override_slot().write() {
+                *guard = None;
+            }
+        };
+
+        let src = TestDataDir::new();
+        fs::write(src.path().join("marker.txt"), "hello").unwrap();
+        std::env::set_var("ABV_DATA_DIR", src.path());
+
+        let dest_parent = TestDataDir::new();
+        let dest = dest_parent.path().join("moved_data");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let resolved = migrate_data_dir(dest.clone()).unwrap();
+            assert!(resolved.join("marker.txt").exists());
+            assert!(!src.path().join("marker.txt").exists());
+            assert_eq!(
+                fs::read_to_string(resolved.join("marker.txt")).unwrap(),
+                "hello"
+            );
+        }));
+        restore();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -532,32 +580,190 @@ pub(crate) fn lock_account_file_updates() -> Result<std::sync::MutexGuard<'stati
 
 // ... existing constants ...
 const DATA_DIR: &str = ".antigravity_tools";
+const LOCATION_POINTER_FILE: &str = ".antigravity_tools_location";
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
 
+static DATA_DIR_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn data_dir_override_slot() -> &'static RwLock<Option<PathBuf>> {
+    DATA_DIR_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+fn location_pointer_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
+    Ok(home.join(LOCATION_POINTER_FILE))
+}
+
+fn default_data_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
+    Ok(home.join(DATA_DIR))
+}
+
+fn ensure_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        fs::create_dir_all(path).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
+    }
+    Ok(())
+}
+
+fn read_location_pointer() -> Option<PathBuf> {
+    let path = location_pointer_path().ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn write_location_pointer(dir: &Path) -> Result<(), String> {
+    let pointer = location_pointer_path()?;
+    fs::write(&pointer, dir.to_string_lossy().as_bytes())
+        .map_err(|e| format!("写入数据目录指针失败: {}", e))
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn is_default_data_dir(dir: &Path) -> bool {
+    default_data_dir()
+        .map(|d| paths_equivalent(&d, dir) || d == dir)
+        .unwrap_or(false)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("创建目标数据目录失败: {}", e))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("读取原数据目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取数据目录项失败: {}", e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("读取数据目录项类型失败: {}", e))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建目标子目录失败: {}", e))?;
+            }
+            fs::copy(&from, &to)
+                .map_err(|e| format!("复制文件失败 {}: {}", from.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn dir_is_empty(path: &Path) -> Result<bool, String> {
+    let mut entries = fs::read_dir(path).map_err(|e| format!("读取目标目录失败: {}", e))?;
+    Ok(entries.next().is_none())
+}
+
+fn apply_data_dir(dir: &Path) -> Result<(), String> {
+    ensure_dir(dir)?;
+    if is_default_data_dir(dir) {
+        if let Ok(pointer) = location_pointer_path() {
+            let _ = fs::remove_file(pointer);
+        }
+    } else {
+        write_location_pointer(dir)?;
+    }
+    if let Ok(mut guard) = data_dir_override_slot().write() {
+        *guard = Some(dir.to_path_buf());
+    }
+    std::env::set_var("ABV_DATA_DIR", dir);
+    Ok(())
+}
+
 /// Get data directory path
 pub fn get_data_dir() -> Result<PathBuf, String> {
-    // [NEW] Support custom data directory via environment variable
+    // 1. Process env (tests, Docker, and in-process override after migrate)
     if let Ok(env_path) = std::env::var("ABV_DATA_DIR") {
         if !env_path.trim().is_empty() {
             let data_dir = PathBuf::from(env_path);
-            if !data_dir.exists() {
-                fs::create_dir_all(&data_dir)
-                    .map_err(|e| format!("failed_to_create_custom_data_dir: {}", e))?;
-            }
+            ensure_dir(&data_dir)?;
             return Ok(data_dir);
         }
     }
 
-    let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-    let data_dir = home.join(DATA_DIR);
-
-    // Ensure directory exists
-    if !data_dir.exists() {
-        fs::create_dir_all(&data_dir).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
+    // 2. Runtime override (pointer already loaded this session)
+    if let Ok(guard) = data_dir_override_slot().read() {
+        if let Some(ref path) = *guard {
+            ensure_dir(path)?;
+            return Ok(path.clone());
+        }
     }
 
+    // 3. Pointer file outside the data dir so deleting the old folder still finds the new path
+    if let Some(path) = read_location_pointer() {
+        ensure_dir(&path)?;
+        if let Ok(mut guard) = data_dir_override_slot().write() {
+            *guard = Some(path.clone());
+        }
+        return Ok(path);
+    }
+
+    // 4. Default ~/.antigravity_tools
+    let data_dir = default_data_dir()?;
+    ensure_dir(&data_dir)?;
     Ok(data_dir)
+}
+
+/// Move the data directory to `new_dir`, persist the location, and switch all runtime lookups.
+pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
+    let new_dir = if new_dir.as_os_str().is_empty() {
+        return Err("目标数据目录不能为空".to_string());
+    } else if new_dir.is_absolute() {
+        new_dir
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("无法解析相对路径: {}", e))?
+            .join(new_dir)
+    };
+
+    let old_dir = get_data_dir()?;
+    if paths_equivalent(&old_dir, &new_dir) {
+        apply_data_dir(&old_dir)?;
+        return Ok(old_dir.canonicalize().unwrap_or(old_dir));
+    }
+
+    if new_dir.starts_with(&old_dir) {
+        return Err("不能把数据目录迁移到自身内部".to_string());
+    }
+
+    if new_dir.exists() {
+        if new_dir.is_file() {
+            return Err("目标路径已存在且不是目录".to_string());
+        }
+        if !dir_is_empty(&new_dir)? {
+            return Err("目标目录不是空文件夹，请选择空目录或新路径".to_string());
+        }
+        copy_dir_recursive(&old_dir, &new_dir)?;
+        let _ = fs::remove_dir_all(&old_dir);
+    } else if let Some(parent) = new_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败: {}", e))?;
+        match fs::rename(&old_dir, &new_dir) {
+            Ok(()) => {}
+            Err(_) => {
+                copy_dir_recursive(&old_dir, &new_dir)?;
+                let _ = fs::remove_dir_all(&old_dir);
+            }
+        }
+    } else {
+        return Err("目标路径无效".to_string());
+    }
+
+    let resolved = new_dir.canonicalize().unwrap_or_else(|_| new_dir.clone());
+    apply_data_dir(&resolved)?;
+    Ok(resolved)
 }
 
 /// Get accounts directory path

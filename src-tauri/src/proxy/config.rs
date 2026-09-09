@@ -177,7 +177,7 @@ pub fn get_thinking_retention_days() -> u32 {
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|v| *v)
-        .unwrap_or(7)
+        .unwrap_or(15)
         .clamp(1, 3650)
 }
 
@@ -529,7 +529,7 @@ fn default_thinking_store_enabled() -> bool {
     true
 }
 fn default_thinking_retention_days() -> u32 {
-    7
+    15
 }
 
 /// Thinking Budget 模式

@@ -468,7 +468,12 @@
       "select_btn": "选择",
       "open_btn": "打开",
       "data_dir": "数据目录",
-      "data_dir_desc": "账号数据和配置文件的存储位置",
+      "data_dir_desc": "账号数据、配置、日志和思考库的存储位置。选择新目录后会自动迁移并删除原目录（同一父目录则直接重命名）。",
+      "data_dir_select": "选择数据目录",
+      "data_dir_migrate_title": "迁移数据目录",
+      "data_dir_migrate_msg": "将把全部数据迁移到：{{path}}\n原目录会被删除（同一父目录则重命名）。请先停止 API 反代和隧道。",
+      "data_dir_migrated": "数据目录已迁移",
+      "data_dir_restart_hint": "建议重启应用，让日志等仍被占用的文件完全切换到新目录",
       "antigravity_path": "反重力程序路径",
       "antigravity_path_placeholder": "未设置 (将使用自动探测)",
       "antigravity_path_desc": "如果您将 Antigravity 应用安装在非标准位置，可在此手动指定可执行文件路径（MacOS 指向 .app 目录）。",
@@ -835,7 +840,8 @@
         "payload_mode_simple": "简要 (默认)",
         "payload_mode_full": "完整原文",
         "log_retention_days_label": "请求日志保留天数",
-        "thinking_retention_days_label": "思考块保留天数"
+        "thinking_retention_days_label": "思考块保留天数（滑动窗口）",
+        "thinking_retention_days_desc": "默认 15 天滑动窗口。只要客户端 sessionID 仍在活跃窗口内，每次请求都会自动刷新过期时间；超过窗口没有请求后才会清理。"
       },
       "opencode_sync": {
         "card_title": "OpenCode",

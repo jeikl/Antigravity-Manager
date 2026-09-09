@@ -23,7 +23,11 @@ pub const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
 const MAX_SESSIONS: usize = 2000;
 const MAX_TURNS_PER_SESSION: usize = 200;
 const MAX_BYTES_PER_SESSION: usize = 32 * 1024 * 1024;
-const IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn idle_ttl() -> Duration {
+    let days = crate::proxy::config::get_thinking_retention_days().max(1) as u64;
+    Duration::from_secs(days.saturating_mul(24 * 60 * 60))
+}
 
 const PLACEHOLDER_THOUGHTS: &[&str] = &[
     "...",
@@ -181,6 +185,19 @@ impl ThinkingStore {
                 if oldest_key != store_key {
                     map.remove(&oldest_key);
                 }
+            }
+        }
+    }
+
+    /// Refresh the sliding-window expiry for a client session on every request.
+    pub fn touch_session(&self, store_key: &str) {
+        if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
+            return;
+        }
+        let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
+        if let Ok(mut map) = self.sessions.lock() {
+            if let Some(entry) = map.get_mut(store_key) {
+                entry.last_access = Instant::now();
             }
         }
     }
@@ -723,6 +740,7 @@ pub fn capture_gemini_contents(store_key: &str, contents: &[Value]) {
 
 /// Capture client-supplied thinking, restore missing blocks, then prune compressed-away history.
 pub fn hydrate_gemini_contents(store_key: &str, contents: &mut Vec<Value>) -> usize {
+    ThinkingStore::global().touch_session(store_key);
     capture_gemini_contents(store_key, contents);
     let restored = ThinkingStore::global().restore_gemini_contents(store_key, contents);
     ThinkingStore::global().prune_orphaned_records(store_key, contents);
@@ -1037,7 +1055,7 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
 }
 
 fn evict_idle_locked(map: &mut HashMap<String, SessionEntry>) {
-    map.retain(|_, e| e.last_access.elapsed() < IDLE_TTL);
+    map.retain(|_, e| e.last_access.elapsed() < idle_ttl());
 }
 
 #[cfg(test)]

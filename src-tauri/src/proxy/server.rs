@@ -879,7 +879,7 @@ impl AxumServer {
             )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
-            .route("/system/data-dir", get(admin_get_data_dir_path))
+            .route("/system/data-dir", get(admin_get_data_dir_path).post(admin_set_data_dir))
             .route("/system/updates/settings", get(admin_get_update_settings))
             .route(
                 "/system/updates/check-status",
@@ -2082,6 +2082,36 @@ async fn admin_get_data_dir_path() -> impl IntoResponse {
         Ok(p) => Json(p.to_string_lossy().to_string()),
         Err(e) => Json(format!("Error: {}", e)),
     }
+}
+
+#[derive(Deserialize)]
+struct SetDataDirRequest {
+    path: String,
+}
+
+async fn admin_set_data_dir(
+    Json(payload): Json<SetDataDirRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let path = payload.path;
+    let new_path = tokio::task::spawn_blocking(move || {
+        crate::modules::account::migrate_data_dir(std::path::PathBuf::from(path))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    Ok(Json(new_path.to_string_lossy().to_string()))
 }
 
 // --- User Token Handlers ---

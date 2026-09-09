@@ -468,7 +468,12 @@
       "select_btn": "Select",
       "open_btn": "Open",
       "data_dir": "Data Directory",
-      "data_dir_desc": "Account data and config file location",
+      "data_dir_desc": "Where accounts, config, logs and the thinking store live. Choosing a new folder migrates data and deletes the old folder (or renames it when they share a parent).",
+      "data_dir_select": "Select data directory",
+      "data_dir_migrate_title": "Migrate data directory",
+      "data_dir_migrate_msg": "All data will be moved to: {{path}}\nThe old folder will be deleted (or renamed if they share a parent). Stop the API proxy and tunnel first.",
+      "data_dir_migrated": "Data directory migrated",
+      "data_dir_restart_hint": "Restart the app so log files that were in use fully switch to the new folder",
       "antigravity_path": "Antigravity Path",
       "antigravity_path_placeholder": "Not set (Will use auto-detection)",
       "antigravity_path_desc": "If you installed Antigravity in a non-standard location, you can manually specify the executable path here (Points to .app on MacOS).",
@@ -842,7 +847,8 @@
         "payload_mode_simple": "Simple (default)",
         "payload_mode_full": "Full original",
         "log_retention_days_label": "Request log retention (days)",
-        "thinking_retention_days_label": "Thinking-store retention (days)"
+        "thinking_retention_days_label": "Thinking-store retention (sliding window, days)",
+        "thinking_retention_days_desc": "Default is a 15-day sliding window. While the client session ID stays active, each request refreshes expiry; records are cleaned only after the window lapses with no requests."
       },
       "opencode_sync": {
         "card_title": "OpenCode",

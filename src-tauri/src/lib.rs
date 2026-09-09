@@ -616,6 +616,7 @@ pub fn run() {
             commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
+            commands::set_data_dir,
             commands::show_main_window,
             commands::set_window_theme,
             commands::get_antigravity_path,

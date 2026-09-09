@@ -458,6 +458,17 @@ export default function ApiProxy() {
         }
     };
 
+    const handleSaveProxySettings = async () => {
+        if (!appConfig) return;
+        try {
+            await invoke('save_config', { config: appConfig });
+            showToast(t('common.saved'), 'success');
+        } catch (error) {
+            console.error('保存配置失败:', error);
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
     // 专门处理模型映射的热更新 (全量)
     const handleMappingUpdate = async (type: 'custom', key: string, value: string) => {
         if (!appConfig) return;
@@ -1124,6 +1135,14 @@ print(response.choices[0].message.content)`;
 
                             {/* 控制按钮 */}
                             <div className="flex items-center gap-2">
+                                <button
+                                    onClick={handleSaveProxySettings}
+                                    disabled={!appConfig}
+                                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors flex items-center gap-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/40 ${!appConfig ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                >
+                                    <Save size={14} />
+                                    {t('settings.save')}
+                                </button>
                                 <button
                                     onClick={handleToggle}
                                     disabled={loading || !appConfig}
@@ -2079,15 +2098,18 @@ print(response.choices[0].message.content)`;
                                         </div>
                                         <div className="flex flex-col gap-1 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
                                             <span className="text-sm font-bold text-gray-900 dark:text-base-content">
-                                                {t('proxy.config.experimental.thinking_retention_days_label', { defaultValue: '思考块保留天数' })}
+                                                {t('proxy.config.experimental.thinking_retention_days_label', { defaultValue: '思考块保留天数（滑动窗口）' })}
                                             </span>
+                                            <p className="text-[10px] text-gray-500 dark:text-gray-400">
+                                                {t('proxy.config.experimental.thinking_retention_days_desc', { defaultValue: '默认 15 天滑动窗口。只要客户端 sessionID 仍在活跃窗口内，每次请求都会自动刷新过期时间；超过窗口没有请求后才会清理。' })}
+                                            </p>
                                             <input
                                                 type="number"
                                                 min={1}
                                                 max={3650}
                                                 className="input input-sm input-bordered w-full text-xs"
-                                                value={appConfig.proxy.experimental?.thinking_retention_days ?? 7}
-                                                onChange={(e) => updateExperimentalConfig({ thinking_retention_days: Math.max(1, parseInt(e.target.value) || 7) })}
+                                                value={appConfig.proxy.experimental?.thinking_retention_days ?? 15}
+                                                onChange={(e) => updateExperimentalConfig({ thinking_retention_days: Math.max(1, parseInt(e.target.value) || 15) })}
                                             />
                                         </div>
                                     </div>

@@ -842,6 +842,43 @@ pub async fn get_data_dir_path() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 选择并迁移数据目录（指针写在家目录，删除旧目录后下次启动仍能找到）
+#[tauri::command]
+pub async fn set_data_dir(
+    path: String,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    cf_state: tauri::State<'_, crate::commands::cloudflared::CloudflaredState>,
+) -> Result<String, String> {
+    {
+        let instance = proxy_state.instance.read().await;
+        if instance.is_some() {
+            return Err("请先停止 API 反代服务，再迁移数据目录".to_string());
+        }
+    }
+    {
+        let lock = cf_state.manager.read().await;
+        if let Some(manager) = lock.as_ref() {
+            let status = manager.get_status().await;
+            if status.running {
+                return Err("请先停止 Cloudflared 隧道，再迁移数据目录".to_string());
+            }
+        }
+    }
+
+    let new_path = tokio::task::spawn_blocking(move || {
+        modules::account::migrate_data_dir(PathBuf::from(path))
+    })
+    .await
+    .map_err(|e| format!("迁移任务失败: {}", e))??;
+
+    {
+        let mut lock = cf_state.manager.write().await;
+        *lock = None;
+    }
+
+    Ok(new_path.to_string_lossy().to_string())
+}
+
 /// 显示主窗口
 #[tauri::command]
 pub async fn show_main_window(window: tauri::Window) -> Result<(), String> {

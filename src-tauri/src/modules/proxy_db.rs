@@ -28,6 +28,11 @@ fn connect_db() -> Result<Connection, String> {
     let _ = conn.pragma_update(None, "temp_store", "MEMORY");
     let _ = conn.pragma_update(None, "mmap_size", 268435456);
 
+    let _ = conn.execute(
+        "ALTER TABLE thinking_records ADD COLUMN last_accessed INTEGER",
+        [],
+    );
+
     Ok(conn)
 }
 
@@ -160,6 +165,18 @@ pub fn init_db() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_session ON thinking_records (session_key, created_at ASC)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_fp ON thinking_records (session_key, fingerprint)", []);
+    let _ = conn.execute(
+        "ALTER TABLE thinking_records ADD COLUMN last_accessed INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE thinking_records SET last_accessed = created_at WHERE last_accessed IS NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_accessed ON thinking_records (last_accessed ASC)",
+        [],
+    );
 
     Ok(())
 }
@@ -260,7 +277,7 @@ pub fn save_thinking_record(
 
     if let Some(id) = existing_id {
         conn.execute(
-            "UPDATE thinking_records SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6 WHERE id = ?7",
+            "UPDATE thinking_records SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6, last_accessed = ?6 WHERE id = ?7",
             params![
                 thought,
                 signature,
@@ -274,8 +291,8 @@ pub fn save_thinking_record(
         .map_err(|e| e.to_string())?;
     } else {
         conn.execute(
-            "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 session_key,
                 fingerprint,
@@ -336,6 +353,19 @@ pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingR
     Ok(result)
 }
 
+pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
+    if session_key.is_empty() {
+        return Ok(0);
+    }
+    let conn = connect_db()?;
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE thinking_records SET last_accessed = ?1 WHERE session_key = ?2",
+        params![now, session_key],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
     let conn = connect_db()?;
     conn.execute(
@@ -352,7 +382,10 @@ pub fn cleanup_old_thinking_records(days: i64) -> Result<usize, String> {
         .execute("DELETE FROM tool_signatures WHERE created_at < ?1", params![cutoff])
         .unwrap_or(0);
     let deleted_records = conn
-        .execute("DELETE FROM thinking_records WHERE created_at < ?1", params![cutoff])
+        .execute(
+            "DELETE FROM thinking_records WHERE COALESCE(last_accessed, created_at) < ?1",
+            params![cutoff],
+        )
         .unwrap_or(0);
     Ok(deleted_tools + deleted_records)
 }
