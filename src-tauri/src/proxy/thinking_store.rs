@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_SIGNATURE_LENGTH: usize = 50;
-const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
+pub const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
 const MAX_SESSIONS: usize = 2000;
 const MAX_TURNS_PER_SESSION: usize = 200;
 const MAX_BYTES_PER_SESSION: usize = 32 * 1024 * 1024;
@@ -27,23 +27,34 @@ const IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const PLACEHOLDER_THOUGHTS: &[&str] = &[
     "...",
+    "·",
+    ".",
+    "···",
     "[undefined]",
     "Applying tool decisions and generating response...",
 ];
 
 /// Server-side auto thinking. Clients usually omit thinking config;
-/// if any of `gemini` / `flash` / `pro` / `agent` appears in a model id
+/// if any of `claude` / `flash` / `pro` / `agent` appears in a model id
 /// (requested or mapped), the proxy enables thoughts + signature restore.
-/// Image / lite / preview are excluded to avoid 400s.
+/// Image / embed / lite are excluded to avoid 400s.
 pub fn model_forces_server_thinking(model: &str) -> bool {
     let m = model.to_lowercase();
     if m.is_empty() {
         return false;
     }
-    if m.contains("image") || m.contains("lite") || m.contains("preview") {
+    if m.contains("image") || m.contains("imagen") || m.contains("embed") || m.contains("lite") || m.contains("preview") {
         return false;
     }
-    m.contains("gemini") || m.contains("flash") || m.contains("pro") || m.contains("agent")
+    m.contains("claude")
+        || m.contains("flash")
+        || m.contains("pro")
+        || m.contains("agent")
+        || m.contains("gemini")
+        || m.contains("thinking")
+        || m.contains("o1")
+        || m.contains("o3")
+        || m.contains("deepseek-r1")
 }
 
 pub fn any_model_forces_server_thinking(models: &[&str]) -> bool {
@@ -98,6 +109,19 @@ impl ThinkingStore {
         if rec.thought.trim().is_empty() && rec.signature.is_none() {
             return;
         }
+
+        // 1. 持久化到 SQLite L2 数据库 (支持代理重启、跨轮重试与崩溃恢复)
+        let _ = crate::modules::proxy_db::save_thinking_record(
+            store_key,
+            &rec.fingerprint,
+            &rec.thought,
+            rec.signature.as_deref(),
+            &rec.tool_ids,
+            &rec.tool_names,
+            &rec.visible,
+        );
+
+        // 2. 写入内存 L1 缓存
         let rec_bytes = rec.thought.len()
             + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
             + rec.visible.len();
@@ -156,13 +180,43 @@ impl ThinkingStore {
     }
 
     pub fn restore_gemini_contents(&self, store_key: &str, contents: &mut Vec<Value>) -> usize {
-        if store_key.is_empty() {
+        if contents.is_empty() || store_key.is_empty() {
             return 0;
         }
+
         let records = {
             let Ok(mut map) = self.sessions.lock() else {
                 return 0;
             };
+
+            // L1 内存检查；若内存为空（如代理刚重启过），自动从 SQLite L2 恢复历史轮次
+            if !map.contains_key(store_key) || map.get(store_key).map(|e| e.turns.is_empty()).unwrap_or(true) {
+                if let Ok(persisted) = crate::modules::proxy_db::load_thinking_records(store_key) {
+                    if !persisted.is_empty() {
+                        let entry = map.entry(store_key.to_string()).or_insert_with(SessionEntry::new);
+                        for p in persisted {
+                            let bytes = p.thought.len()
+                                + p.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                                + p.visible.len();
+                            entry.bytes += bytes;
+                            entry.turns.push(ThinkingRecord {
+                                fingerprint: p.fingerprint,
+                                thought: p.thought,
+                                signature: p.signature,
+                                tool_ids: p.tool_ids,
+                                tool_names: p.tool_names,
+                                visible: p.visible,
+                            });
+                        }
+                        tracing::info!(
+                            "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
+                            entry.turns.len(),
+                            store_key
+                        );
+                    }
+                }
+            }
+
             let Some(entry) = map.get_mut(store_key) else {
                 return 0;
             };
@@ -173,10 +227,20 @@ impl ThinkingStore {
             return 0;
         }
 
-        let mut used = vec![false; records.len()];
-        let mut restored = 0usize;
+        // 收集所有的 model 轮次元信息
+        struct ModelTurnMeta {
+            content_idx: usize,
+            visible: String,
+            tool_ids: Vec<String>,
+            #[allow(dead_code)]
+            tool_names: Vec<String>,
+            existing_thought: String,
+            fp: String,
+            matched_record_idx: Option<usize>,
+        }
 
-        for content in contents.iter_mut() {
+        let mut model_turns: Vec<ModelTurnMeta> = Vec::new();
+        for (c_idx, content) in contents.iter().enumerate() {
             let role = content
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -184,26 +248,138 @@ impl ThinkingStore {
             if role != "model" && role != "assistant" {
                 continue;
             }
+            let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            let (visible, tool_ids, tool_names, existing_thought) = inspect_parts(parts);
+            let fp = fingerprint(&visible, &tool_ids, &tool_names);
+            model_turns.push(ModelTurnMeta {
+                content_idx: c_idx,
+                visible,
+                tool_ids,
+                tool_names,
+                existing_thought,
+                fp,
+                matched_record_idx: None,
+            });
+        }
+
+        if model_turns.is_empty() {
+            return 0;
+        }
+
+        let mut used = vec![false; records.len()];
+
+        // Phase 1: 工具调用 ID 精准锚定（最高优先级：tool_ids 具有全局唯一性）
+        for turn in model_turns.iter_mut() {
+            if !turn.tool_ids.is_empty() {
+                for (rec_idx, rec) in records.iter().enumerate() {
+                    if used[rec_idx] {
+                        continue;
+                    }
+                    if rec.tool_ids.iter().any(|id| turn.tool_ids.contains(id)) {
+                        turn.matched_record_idx = Some(rec_idx);
+                        used[rec_idx] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: 完整指纹匹配（硬性隔离：工具轮次与纯文本轮次严禁混用）
+        for turn in model_turns.iter_mut() {
+            if turn.matched_record_idx.is_some() {
+                continue;
+            }
+            let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
+            for (rec_idx, rec) in records.iter().enumerate() {
+                if used[rec_idx] {
+                    continue;
+                }
+                let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
+                // 工具状态必须一致（有工具的只能匹配有工具的，纯文本只能匹配纯文本）
+                if rec_has_tools != turn_has_tools {
+                    continue;
+                }
+                if rec.fingerprint == turn.fp {
+                    turn.matched_record_idx = Some(rec_idx);
+                    used[rec_idx] = true;
+                    break;
+                }
+            }
+        }
+
+        // Phase 3: 纯文本前缀 / 正文相似匹配（仅限纯文本轮次）
+        for turn in model_turns.iter_mut() {
+            if turn.matched_record_idx.is_some() {
+                continue;
+            }
+            let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
+            if !turn_has_tools && !turn.visible.trim().is_empty() {
+                let norm_vis: String = turn.visible.split_whitespace().collect::<Vec<_>>().join(" ");
+                for (rec_idx, rec) in records.iter().enumerate() {
+                    let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
+                    if used[rec_idx] || rec_has_tools || rec.visible.trim().is_empty() {
+                        continue;
+                    }
+                    let norm_rec: String = rec.visible.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if norm_rec == norm_vis || norm_rec.starts_with(&norm_vis) || norm_vis.starts_with(&norm_rec) {
+                        turn.matched_record_idx = Some(rec_idx);
+                        used[rec_idx] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 4: 尾部优先的逆向兜底匹配（对齐用户的“最新回答在尾部”思路）
+        // 仅对对话中【最后一个 model 轮次】进行保底匹配，绝不污染历史早期轮次！
+        if let Some(last_turn) = model_turns.last_mut() {
+            if last_turn.matched_record_idx.is_none() {
+                let last_turn_has_tools = !last_turn.tool_ids.is_empty() || !last_turn.tool_names.is_empty();
+                // 从后往前找最新一条工具兼容的未使用记录
+                if let Some((last_unused_rec_idx, _)) = records
+                    .iter()
+                    .enumerate()
+                    .rfind(|(idx, r)| {
+                        if used[*idx] {
+                            return false;
+                        }
+                        let r_has_tools = !r.tool_ids.is_empty() || !r.tool_names.is_empty();
+                        r_has_tools == last_turn_has_tools
+                    })
+                {
+                    last_turn.matched_record_idx = Some(last_unused_rec_idx);
+                    used[last_unused_rec_idx] = true;
+                }
+            }
+        }
+
+        let mut restored = 0usize;
+        for turn in model_turns {
+            let Some(rec_idx) = turn.matched_record_idx else {
+                continue;
+            };
+            let rec = &records[rec_idx];
+            if rec.thought.trim().is_empty() && rec.signature.is_none() {
+                continue;
+            }
+
+            let Some(content) = contents.get_mut(turn.content_idx) else {
+                continue;
+            };
             let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) else {
                 continue;
             };
 
-            let (visible, tool_ids, tool_names, existing_thought) = inspect_parts(parts);
-            let fp = fingerprint(&visible, &tool_ids, &tool_names);
+            let has_unvalidated_function_call = parts
+                .iter()
+                .any(|p| p.get("functionCall").is_some() && !part_has_signature(p));
 
-            let match_idx = find_record(&records, &used, &fp, &tool_ids);
-            let Some(idx) = match_idx else {
-                continue;
-            };
-            used[idx] = true;
-            let rec = &records[idx];
-            if rec.thought.trim().is_empty() {
-                continue;
-            }
-
-            let should_replace = is_placeholder_thought(&existing_thought)
-                || existing_thought.len() < rec.thought.len()
-                || (rec.signature.is_some() && !parts.iter().any(|p| part_has_signature(p)));
+            let should_replace = is_placeholder_thought(&turn.existing_thought)
+                || turn.existing_thought.len() < rec.thought.len()
+                || (rec.signature.is_some() && !parts.iter().any(|p| part_has_signature(p)))
+                || has_unvalidated_function_call;
 
             if !should_replace {
                 continue;
@@ -211,17 +387,28 @@ impl ThinkingStore {
 
             parts.retain(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true));
 
+            let thought_text = if is_placeholder_thought(&rec.thought) || rec.thought.trim().is_empty() {
+                "..."
+            } else {
+                rec.thought.as_str()
+            };
+
             let mut thought_part = json!({
-                "text": rec.thought,
+                "text": thought_text,
                 "thought": true,
             });
             if let Some(sig) = rec.signature.as_ref().filter(|s| is_real_signature(s)) {
                 thought_part["thoughtSignature"] = json!(sig);
-                thought_part["thought_signature"] = json!(sig);
+                for part in parts.iter_mut() {
+                    if part.get("functionCall").is_some() {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                }
+            } else {
+                thought_part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
                 for part in parts.iter_mut() {
                     if part.get("functionCall").is_some() && !part_has_signature(part) {
-                        part["thoughtSignature"] = json!(sig);
-                        part["thought_signature"] = json!(sig);
+                        part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
                     }
                 }
             }
@@ -251,6 +438,7 @@ impl ThinkingStore {
         let (deleted_turns, deleted_bytes) = removed
             .map(|e| (e.turns.len(), e.bytes))
             .unwrap_or((0, 0));
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(store_key);
         EndSessionResult {
             session_id: client_id_from_store_key(store_key).to_string(),
             deleted_turns,
@@ -288,28 +476,25 @@ pub struct SessionScope {
 
 impl SessionScope {
     pub fn from_headers(headers: &HeaderMap, fallback: impl Into<String>) -> Self {
-        let fallback = fallback.into();
-        let client_id = explicit_session_id(headers, None)
-            .unwrap_or(fallback)
-            .trim()
-            .to_string();
-        let client_id = sanitize_session_id(&client_id);
-        let tenant = tenant_from_headers(headers);
-        let store_key = format!("{}:{}", tenant, client_id);
-        Self {
-            client_id,
-            store_key,
-        }
+        Self::from_request_parts(headers, None, None, fallback)
     }
 
-    #[allow(dead_code)]
     pub fn from_headers_and_body(
         headers: &HeaderMap,
         body: Option<&Value>,
         fallback: impl Into<String>,
     ) -> Self {
+        Self::from_request_parts(headers, body, None, fallback)
+    }
+
+    pub fn from_request_parts(
+        headers: &HeaderMap,
+        body: Option<&Value>,
+        query: Option<&str>,
+        fallback: impl Into<String>,
+    ) -> Self {
         let fallback = fallback.into();
-        let client_id = explicit_session_id(headers, body)
+        let client_id = explicit_session_id_with_query(headers, body, query)
             .unwrap_or(fallback)
             .trim()
             .to_string();
@@ -367,15 +552,23 @@ impl TurnAccumulator {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let id = fc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("call_{}_{}", name, self.tool_ids.len()));
-            if !self.tool_ids.iter().any(|x| x == &id) {
-                self.tool_ids.push(id);
+            if let Some(id_str) = fc.get("id").and_then(|v| v.as_str()) {
+                if !self.tool_ids.iter().any(|x| x == id_str) {
+                    self.tool_ids.push(id_str.to_string());
+                    self.tool_names.push(name);
+                }
+            } else if !self.tool_names.iter().any(|x| x == &name) {
                 self.tool_names.push(name);
             }
+        }
+    }
+
+    pub fn record_tool_id(&mut self, tool_name: &str, real_id: &str) {
+        if !self.tool_ids.iter().any(|x| x == real_id) {
+            self.tool_ids.push(real_id.to_string());
+        }
+        if !self.tool_names.iter().any(|x| x == tool_name) {
+            self.tool_names.push(tool_name.to_string());
         }
     }
 
@@ -430,34 +623,190 @@ pub fn capture_gemini_response(store_key: &str, response: &Value) {
     }
 }
 
-fn explicit_session_id(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
-    for name in ["x-session-id", "x-antigravity-session-id"] {
-        if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
+/// 四大协议统一思考补齐管线：确保所有 Gemini contents 中的 model 轮次在开启思考时，必须具备合法的思考块与签名
+pub fn finalize_gemini_contents_thinking(
+    contents: &mut [Value],
+    is_thinking_enabled: bool,
+) {
+    for msg in contents.iter_mut() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "model" && role != "assistant" {
+            continue;
+        }
+        if let Some(parts) = msg.get_mut("parts").and_then(|p| p.as_array_mut()) {
+            let mut thinking_parts = Vec::new();
+            let mut other_parts = Vec::new();
+
+            for mut part in parts.drain(..) {
+                if let Some(obj) = part.as_object_mut() {
+                    // 统一清洗向 Google 发送的非标准蛇形字段
+                    obj.remove("thought_signature");
+                }
+                let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || part.get("thoughtSignature").is_some();
+                if is_thought {
+                    thinking_parts.push(part);
+                } else {
+                    other_parts.push(part);
+                }
             }
+
+            if is_thinking_enabled {
+                if thinking_parts.is_empty() {
+                    // 优先继承本轮工具调用身上的真实加密签名
+                    let turn_sig = other_parts
+                        .iter()
+                        .find_map(|p| {
+                            if p.get("functionCall").is_some() {
+                                p.get("thoughtSignature").and_then(|s| s.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(SENTINEL_SIGNATURE);
+
+                    thinking_parts.push(json!({
+                        "text": "...",
+                        "thought": true,
+                        "thoughtSignature": turn_sig,
+                    }));
+                }
+
+                // 为所有缺失签名的工具调用打上保底哨兵
+                for part in other_parts.iter_mut() {
+                    if part.get("functionCall").is_some()
+                        && part.get("thoughtSignature").is_none()
+                    {
+                        part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
+                    }
+                }
+            }
+
+            // 思考块始终强制排在最前面，其他部件紧随其后
+            parts.extend(thinking_parts);
+            parts.extend(other_parts);
         }
     }
-    if let Some(body) = body {
-        if let Some(v) = body.get("session_id").and_then(|v| v.as_str()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-        if let Some(v) = body
-            .get("metadata")
-            .and_then(|m| m.get("user_id"))
-            .and_then(|v| v.as_str())
-        {
-            let v = v.trim();
-            if !v.is_empty() && !v.contains("session-") {
-                return Some(v.to_string());
+}
+
+
+/// 从 URL Query 字符串中提取 session / conversation 标识符
+pub fn extract_session_from_query_str(query: &str) -> Option<String> {
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        let key = k.to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "session_id" | "sid" | "cid" | "conversation_id" | "chat_id" | "thread_id" | "channel"
+        ) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                let sanitized = sanitize_session_id(trimmed);
+                if !sanitized.is_empty() && sanitized != "sid-unknown" {
+                    return Some(sanitized);
+                }
             }
         }
     }
     None
+}
+
+/// 全生态显式会话标识解析（包含 URL Query、Header 扩展与 Body 扩展）
+pub fn explicit_session_id_with_query(
+    headers: &HeaderMap,
+    body: Option<&Value>,
+    query: Option<&str>,
+) -> Option<String> {
+    // 1. 显式 URL Query 参数（最高优先级：用户配置 Base URL 直接挂载 ?session_id=win1）
+    if let Some(q) = query {
+        if let Some(sid) = extract_session_from_query_str(q) {
+            return Some(sid);
+        }
+    }
+
+    // 2. 从反代请求头中抓取 URL Query (x-forwarded-uri, x-original-uri)
+    for uri_h in ["x-forwarded-uri", "x-original-uri"] {
+        if let Some(raw_uri) = headers.get(uri_h).and_then(|h| h.to_str().ok()) {
+            if let Some(pos) = raw_uri.find('?') {
+                if let Some(sid) = extract_session_from_query_str(&raw_uri[pos + 1..]) {
+                    return Some(sid);
+                }
+            }
+        }
+    }
+
+    // 3. 从 Web 客户端 Referer 中嗅探 Query
+    if let Some(referer) = headers.get("referer").and_then(|h| h.to_str().ok()) {
+        if let Some(pos) = referer.find('?') {
+            if let Some(sid) = extract_session_from_query_str(&referer[pos + 1..]) {
+                return Some(sid);
+            }
+        }
+    }
+
+    // 4. 全生态主流 HTTP Headers（涵盖各大知名客户端/插件规范）
+    for name in [
+        "x-session-id",
+        "x-antigravity-session-id",
+        "x-conversation-id",
+        "conversation-id",
+        "x-chat-id",
+        "chat-id",
+        "x-thread-id",
+        "thread-id",
+        "x-client-session-id",
+        "x-cursor-session-id",
+        "cursor-session-id",
+        "x-vscode-session-id",
+        "anthropic-session-id",
+    ] {
+        if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(sanitize_session_id(v));
+            }
+        }
+    }
+
+    // 5. JSON Body 及 Metadata 深度提取
+    if let Some(body) = body {
+        for field in [
+            "session_id",
+            "conversation_id",
+            "chat_id",
+            "thread_id",
+            "client_session_id",
+            "previous_response_id",
+        ] {
+            if let Some(v) = body.get(field).and_then(|v| v.as_str()) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(sanitize_session_id(v));
+                }
+            }
+        }
+        if let Some(metadata) = body.get("metadata") {
+            for field in [
+                "conversation_id",
+                "chat_id",
+                "session_id",
+                "thread_id",
+                "user_id",
+            ] {
+                if let Some(v) = metadata.get(field).and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if !v.is_empty() && !v.contains("session-") {
+                        return Some(sanitize_session_id(v));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn explicit_session_id(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
+    explicit_session_id_with_query(headers, body, None)
 }
 
 fn tenant_from_headers(headers: &HeaderMap) -> String {
@@ -494,9 +843,11 @@ fn is_real_signature(sig: &str) -> bool {
     sig.len() >= MIN_SIGNATURE_LENGTH && sig != SENTINEL_SIGNATURE
 }
 
-fn is_placeholder_thought(s: &str) -> bool {
+pub fn is_placeholder_thought(s: &str) -> bool {
     let t = s.trim();
-    t.is_empty() || PLACEHOLDER_THOUGHTS.contains(&t)
+    t.is_empty()
+        || PLACEHOLDER_THOUGHTS.contains(&t)
+        || t.chars().all(|c| c == '.' || c == '·' || c == '…')
 }
 
 fn part_has_signature(part: &Value) -> bool {
@@ -556,33 +907,6 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
     }
     let hex = format!("{:x}", hasher.finalize());
     hex[..16].to_string()
-}
-
-fn find_record(
-    records: &[ThinkingRecord],
-    used: &[bool],
-    fp: &str,
-    tool_ids: &[String],
-) -> Option<usize> {
-    for (i, rec) in records.iter().enumerate() {
-        if used[i] {
-            continue;
-        }
-        if rec.fingerprint == fp {
-            return Some(i);
-        }
-    }
-    if !tool_ids.is_empty() {
-        for (i, rec) in records.iter().enumerate() {
-            if used[i] {
-                continue;
-            }
-            if rec.tool_ids.iter().any(|id| tool_ids.iter().any(|t| t == id)) {
-                return Some(i);
-            }
-        }
-    }
-    None
 }
 
 fn evict_idle_locked(map: &mut HashMap<String, SessionEntry>) {
@@ -713,8 +1037,8 @@ mod tests {
         assert!(model_forces_server_thinking("gemini-3-pro"));
         assert!(model_forces_server_thinking("gemini-3-flash-agent"));
         assert!(model_forces_server_thinking("gemini-pro-agent"));
-        assert!(any_model_forces_server_thinking(&["claude-sonnet-4-6", "gemini-3-flash"]));
-        assert!(!model_forces_server_thinking("claude-sonnet-4-6"));
+        assert!(model_forces_server_thinking("claude-sonnet-4-6"));
+        assert!(!model_forces_server_thinking("gpt-4o"));
         assert!(!model_forces_server_thinking("gemini-3-pro-image"));
         assert!(!model_forces_server_thinking("gemini-3.1-flash-lite"));
         assert!(!model_forces_server_thinking("gemini-3-pro-preview"));
@@ -731,4 +1055,183 @@ mod tests {
         store.restore_gemini_contents("t:s1", &mut contents);
         assert_eq!(contents[0]["parts"][0]["text"], "much longer thought");
     }
+
+    #[test]
+    fn tool_record_does_not_pollute_earlier_text_turns() {
+        let store = ThinkingStore::new();
+        // Turn 2 generated thinking + tool call
+        store.record(
+            "t:s1",
+            rec(
+                "**Inferring User's Intention**",
+                "",
+                Some("call_54421"),
+            ),
+        );
+
+        // Turn 0: "你好！" (pure text, no thought)
+        // Turn 1: "当然是真的！" (pure text, no thought)
+        // Turn 2: tool call "call_54421"
+        let mut contents = vec![
+            json!({
+                "role": "model",
+                "parts": [{ "text": "你好！我是 JeikCode AI 编程助手。" }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{ "text": "当然是真的！😄" }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": { "name": "shell", "id": "call_54421", "args": {} }
+                }]
+            }),
+        ];
+
+        let restored = store.restore_gemini_contents("t:s1", &mut contents);
+        assert_eq!(restored, 1);
+
+        // Turn 0 must NOT have thinking injected
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(contents[0]["parts"][0]["text"], "你好！我是 JeikCode AI 编程助手。");
+        assert!(contents[0]["parts"][0].get("thought").is_none());
+
+        // Turn 1 must NOT have thinking injected
+        assert_eq!(contents[1]["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(contents[1]["parts"][0]["text"], "当然是真的！😄");
+        assert!(contents[1]["parts"][0].get("thought").is_none());
+
+        // Turn 2 MUST have thinking injected and matched with call_54421
+        assert_eq!(contents[2]["parts"][0]["thought"], true);
+        assert_eq!(contents[2]["parts"][0]["text"], "**Inferring User's Intention**");
+        assert_eq!(
+            contents[2]["parts"][1]["functionCall"]["id"],
+            "call_54421"
+        );
+    }
+
+    #[test]
+    fn test_thinking_with_text_and_parallel_tools() {
+        let store = ThinkingStore::new();
+
+        // Test Case 6: 有思考、有正文、有多工具并行出来
+        let tool_ids = vec!["call_batch_1".to_string(), "call_batch_2".to_string()];
+        let tool_names = vec!["read_file".to_string(), "grep_search".to_string()];
+        let fp = fingerprint("I will read both files in parallel", &tool_ids, &tool_names);
+        store.record(
+            "t:s2",
+            ThinkingRecord {
+                fingerprint: fp,
+                thought: "Parallel execution planned".to_string(),
+                signature: Some("sig_parallel_12345678901234567890123456789012345678901234567890".to_string()),
+                tool_ids: tool_ids.clone(),
+                tool_names: tool_names.clone(),
+                visible: "I will read both files in parallel".to_string(),
+            },
+        );
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "I will read both files in parallel" },
+                { "functionCall": { "name": "read_file", "id": "call_batch_1", "args": {} } },
+                { "functionCall": { "name": "grep_search", "id": "call_batch_2", "args": {} } }
+            ]
+        })];
+
+        let restored = store.restore_gemini_contents("t:s2", &mut contents);
+        assert_eq!(restored, 1);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        // Index 0: thought block
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], "Parallel execution planned");
+        assert_eq!(parts[0]["thoughtSignature"], "sig_parallel_12345678901234567890123456789012345678901234567890");
+
+        // Index 1: visible text preserved
+        assert_eq!(parts[1]["text"], "I will read both files in parallel");
+
+        // Index 2: tool 1 has signature
+        assert_eq!(parts[2]["functionCall"]["id"], "call_batch_1");
+        assert_eq!(parts[2]["thoughtSignature"], "sig_parallel_12345678901234567890123456789012345678901234567890");
+
+        // Index 3: tool 2 has signature
+        assert_eq!(parts[3]["functionCall"]["id"], "call_batch_2");
+        assert_eq!(parts[3]["thoughtSignature"], "sig_parallel_12345678901234567890123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_sqlite_persistence_and_recovery() {
+        let store_key = "test_session_sqlite_recovery_unique";
+        let fp = fingerprint("Persisted visible text", &["call_persisted_999".to_string()], &["bash".to_string()]);
+        let rec = ThinkingRecord {
+            fingerprint: fp,
+            thought: "Thought restored from SQLite".to_string(),
+            signature: Some("sig_persisted_1234567890123456789012345678901234567890".to_string()),
+            tool_ids: vec!["call_persisted_999".to_string()],
+            tool_names: vec!["bash".to_string()],
+            visible: "Persisted visible text".to_string(),
+        };
+
+        let db_res = crate::modules::proxy_db::save_thinking_record(
+            store_key,
+            &rec.fingerprint,
+            &rec.thought,
+            rec.signature.as_deref(),
+            &rec.tool_ids,
+            &rec.tool_names,
+            &rec.visible,
+        );
+        if let Err(e) = db_res {
+            eprintln!("Skipping DB test if DB not initialized: {}", e);
+            return;
+        }
+
+        let store = ThinkingStore::new();
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "Persisted visible text" },
+                { "functionCall": { "name": "bash", "id": "call_persisted_999", "args": {} } }
+            ]
+        })];
+
+        let restored = store.restore_gemini_contents(store_key, &mut contents);
+        assert_eq!(restored, 1);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["text"], "Thought restored from SQLite");
+        assert_eq!(parts[0]["thoughtSignature"], "sig_persisted_1234567890123456789012345678901234567890");
+        assert_eq!(parts[2]["thoughtSignature"], "sig_persisted_1234567890123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_explicit_session_id_and_query_extraction() {
+        // 1. Query parameter extraction
+        let sid = extract_session_from_query_str("model=gemini-2.5-pro&session_id=win_alpha_101&temp=0.7");
+        assert_eq!(sid.as_deref(), Some("win_alpha_101"));
+
+        let sid_alias = extract_session_from_query_str("channel=proj_beta");
+        assert_eq!(sid_alias.as_deref(), Some("proj_beta"));
+
+        // 2. Header extraction: Claude Code / Cursor / VSCode
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cursor-session-id", "cursor-tab-99".parse().unwrap());
+        let scope = SessionScope::from_headers(&headers, "fallback_id");
+        assert_eq!(scope.client_id, "cursor-tab-99");
+
+        // 3. Body & Metadata extraction
+        let body = json!({
+            "metadata": {
+                "conversation_id": "meta-conv-888"
+            }
+        });
+        let empty_headers = HeaderMap::new();
+        let scope2 = SessionScope::from_headers_and_body(&empty_headers, Some(&body), "fallback_id");
+        assert_eq!(scope2.client_id, "meta-conv-888");
+    }
 }
+

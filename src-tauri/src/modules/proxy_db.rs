@@ -23,6 +23,11 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
 
+    // 大数据量查询性能调优: 64MB 页面缓存 + 内存临时存储 + 256MB 内存映射 (mmap)
+    let _ = conn.pragma_update(None, "cache_size", -64000);
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+    let _ = conn.pragma_update(None, "mmap_size", 268435456);
+
     Ok(conn)
 }
 
@@ -80,7 +85,246 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // 高效复合索引：状态与时间戳倒序（针对错误筛选与分页排序，极大提升大数据量下的响应速度）
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_status_timestamp ON request_logs (status, timestamp DESC)",
+        [],
+    );
+
+    // 复合索引：模型与时间戳倒序（针对模型级日志过滤与排序）
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_timestamp ON request_logs (model, timestamp DESC)",
+        [],
+    );
+
+    // 复合索引：账号邮箱与时间戳倒序（针对多用户/多账号过滤）
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_timestamp ON request_logs (account_email, timestamp DESC)",
+        [],
+    );
+
+    // 复合索引：客户端IP与时间戳倒序（针对安全审计与IP过滤）
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_ip_timestamp ON request_logs (client_ip, timestamp DESC)",
+        [],
+    );
+
+    // 复合索引：用户名与时间戳倒序
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_username_timestamp ON request_logs (username, timestamp DESC)",
+        [],
+    );
+
+    // 单列索引：协议类型
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_protocol ON request_logs (protocol)",
+        [],
+    );
+
+    // 单列索引：请求方法
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_method ON request_logs (method)",
+        [],
+    );
+
+    // 持久化工具签名表 (支持代理重启后根据 tool_id 秒级恢复真实加密签名)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tool_signatures (
+            tool_id TEXT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_sig_created ON tool_signatures (created_at DESC)", []);
+
+    // 持久化思考记录表 (支持多轮对话、代理重启与会话回放时根据 session_key 精准恢复思考正文与签名)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS thinking_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            thought TEXT NOT NULL,
+            signature TEXT,
+            tool_ids TEXT NOT NULL,
+            tool_names TEXT NOT NULL,
+            visible TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_session ON thinking_records (session_key, created_at ASC)", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_fp ON thinking_records (session_key, fingerprint)", []);
+
     Ok(())
+}
+
+pub fn save_tool_signature(tool_id: &str, signature: &str) -> Result<(), String> {
+    if tool_id.is_empty() || signature.is_empty() {
+        return Ok(());
+    }
+    let conn = connect_db()?;
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT OR REPLACE INTO tool_signatures (tool_id, signature, created_at) VALUES (?1, ?2, ?3)",
+        params![tool_id, signature, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn load_tool_signature(tool_id: &str) -> Result<Option<String>, String> {
+    if tool_id.is_empty() {
+        return Ok(None);
+    }
+    let conn = connect_db()?;
+    let mut stmt = conn
+        .prepare("SELECT signature FROM tool_signatures WHERE tool_id = ?1 LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![tool_id]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let sig: String = row.get(0).map_err(|e| e.to_string())?;
+        Ok(Some(sig))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedThinkingRecord {
+    pub fingerprint: String,
+    pub thought: String,
+    pub signature: Option<String>,
+    pub tool_ids: Vec<String>,
+    pub tool_names: Vec<String>,
+    pub visible: String,
+}
+
+pub fn save_thinking_record(
+    session_key: &str,
+    fingerprint: &str,
+    thought: &str,
+    signature: Option<&str>,
+    tool_ids: &[String],
+    tool_names: &[String],
+    visible: &str,
+) -> Result<(), String> {
+    if session_key.is_empty() {
+        return Ok(());
+    }
+    let conn = connect_db()?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let tool_ids_json = serde_json::to_string(tool_ids).unwrap_or_else(|_| "[]".to_string());
+    let tool_names_json = serde_json::to_string(tool_names).unwrap_or_else(|_| "[]".to_string());
+
+    // 检查是否已有相同 session_key 和 fingerprint 的记录
+    let existing_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM thinking_records WHERE session_key = ?1 AND fingerprint = ?2 LIMIT 1",
+            params![session_key, fingerprint],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if let Some(id) = existing_id {
+        conn.execute(
+            "UPDATE thinking_records SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6 WHERE id = ?7",
+            params![
+                thought,
+                signature,
+                tool_ids_json,
+                tool_names_json,
+                visible,
+                now,
+                id,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute(
+            "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_key,
+                fingerprint,
+                thought,
+                signature,
+                tool_ids_json,
+                tool_names_json,
+                visible,
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingRecord>, String> {
+    if session_key.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = connect_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT fingerprint, thought, signature, tool_ids, tool_names, visible 
+             FROM thinking_records 
+             WHERE session_key = ?1 
+             ORDER BY id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![session_key], |row| {
+            let fp: String = row.get(0)?;
+            let thought: String = row.get(1)?;
+            let signature: Option<String> = row.get(2)?;
+            let tool_ids_str: String = row.get(3)?;
+            let tool_names_str: String = row.get(4)?;
+            let visible: String = row.get(5)?;
+            Ok((fp, thought, signature, tool_ids_str, tool_names_str, visible))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        if let Ok((fp, thought, signature, tool_ids_str, tool_names_str, visible)) = row {
+            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
+            result.push(PersistedThinkingRecord {
+                fingerprint: fp,
+                thought,
+                signature,
+                tool_ids,
+                tool_names,
+                visible,
+            });
+        }
+    }
+    Ok(result)
+}
+
+pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
+    let conn = connect_db()?;
+    conn.execute(
+        "DELETE FROM thinking_records WHERE session_key = ?1",
+        params![session_key],
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn cleanup_old_thinking_records(days: i64) -> Result<usize, String> {
+    let conn = connect_db()?;
+    let cutoff = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
+    let deleted_tools = conn
+        .execute("DELETE FROM tool_signatures WHERE created_at < ?1", params![cutoff])
+        .unwrap_or(0);
+    let deleted_records = conn
+        .execute("DELETE FROM thinking_records WHERE created_at < ?1", params![cutoff])
+        .unwrap_or(0);
+    Ok(deleted_tools + deleted_records)
 }
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {

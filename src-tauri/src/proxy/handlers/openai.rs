@@ -1966,8 +1966,11 @@ pub async fn handle_chat_completions(
         &*state.custom_mapping.read().await,
     );
     let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
-    let session_scope =
-        crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+    let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+        &headers,
+        original_body.as_ref(),
+        fallback_sid,
+    );
     openai_req.session_id = Some(session_scope.store_key.clone());
     let client_session_id = session_scope.client_id.clone();
 
@@ -2396,6 +2399,7 @@ pub async fn handle_chat_completions(
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &client_session_id)
+                        .header("X-Antigravity-Session-Id", &client_session_id)
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -2434,6 +2438,8 @@ pub async fn handle_chat_completions(
                                 [
                                     ("X-Account-Email", email.as_str()),
                                     ("X-Mapped-Model", mapped_model.as_str()),
+                                    ("X-Session-Id", client_session_id.as_str()),
+                                    ("X-Antigravity-Session-Id", client_session_id.as_str()),
                                 ],
                                 Json(full_response),
                             )
@@ -3523,8 +3529,11 @@ pub async fn handle_completions(
     } else {
         SessionManager::extract_openai_session_id(&openai_req)
     };
-    let session_scope =
-        crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+    let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+        &headers,
+        original_body.as_ref(),
+        fallback_sid,
+    );
     openai_req.session_id = Some(session_scope.store_key.clone());
     let session_id_str = session_scope.store_key.clone();
     let signature_session_id_str = if is_responses_api {
@@ -3997,7 +4006,7 @@ pub async fn handle_completions(
                         create_codex_sse_stream(
                             gemini_stream,
                             openai_req.model.clone(),
-                            response_id_for_save.clone(),
+                            session_id_str.clone(),
                             message_count,
                             assistant_turn_index,
                             response_id_for_save.clone(),
@@ -4126,6 +4135,7 @@ pub async fn handle_completions(
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &session_scope.client_id)
+                        .header("X-Antigravity-Session-Id", &session_scope.client_id)
                         .body(Body::from_stream(combined_stream))
                         .unwrap()
                         .into_response();
@@ -4275,6 +4285,8 @@ pub async fn handle_completions(
                                     [
                                         ("X-Account-Email", email.as_str()),
                                         ("X-Mapped-Model", mapped_model.as_str()),
+                                        ("X-Session-Id", session_scope.client_id.as_str()),
+                                        ("X-Antigravity-Session-Id", session_scope.client_id.as_str()),
                                     ],
                                     Json(resp),
                                 )

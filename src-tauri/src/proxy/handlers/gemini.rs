@@ -191,8 +191,11 @@ pub async fn handle_generate(
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
         let fallback_sid = SessionManager::extract_gemini_session_id(&body, &model_name);
-        let session_scope =
-            crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+        let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+            &headers,
+            Some(&body),
+            fallback_sid,
+        );
         let session_id = session_scope.store_key.clone();
         let client_session_id = session_scope.client_id.clone();
 
@@ -550,6 +553,9 @@ pub async fn handle_generate(
                                                                 if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
                                                                     crate::proxy::SignatureCache::global()
                                                                         .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
+                                                                    if let Some(call_id) = part.get("functionCall").and_then(|f| f.get("id")).and_then(|id| id.as_str()) {
+                                                                        crate::proxy::SignatureCache::global().cache_tool_signature(call_id, sig.to_string());
+                                                                    }
                                                                     debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
                                                                 }
                                                             }
@@ -608,6 +614,7 @@ pub async fn handle_generate(
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &client_session_id)
+                        .header("X-Antigravity-Session-Id", &client_session_id)
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -626,6 +633,8 @@ pub async fn handle_generate(
                                 [
                                     ("X-Account-Email", email.as_str()),
                                     ("X-Mapped-Model", mapped_model.as_str()),
+                                    ("X-Session-Id", client_session_id.as_str()),
+                                    ("X-Antigravity-Session-Id", client_session_id.as_str()),
                                 ],
                                 Json(unwrapped),
                             )
@@ -678,6 +687,9 @@ pub async fn handle_generate(
                                         sig.to_string(),
                                         1,
                                     );
+                                    if let Some(call_id) = part.get("functionCall").and_then(|f| f.get("id")).and_then(|id| id.as_str()) {
+                                        crate::proxy::SignatureCache::global().cache_tool_signature(call_id, sig.to_string());
+                                    }
                                     debug!("[Gemini-Response] Cached signature (len: {}) for session: {}", sig.len(), session_id);
                                 }
                             }

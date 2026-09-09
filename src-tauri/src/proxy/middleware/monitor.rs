@@ -303,13 +303,27 @@ fn value_as_u32(value: Option<&Value>) -> Option<u32> {
 }
 
 fn extract_input_tokens(usage: &Value) -> Option<u32> {
-    value_as_u32(
+    let raw_input = value_as_u32(
         usage
             .get("prompt_tokens")
             .or_else(|| usage.get("input_tokens"))
             .or_else(|| usage.get("total_input_tokens"))
             .or_else(|| usage.get("promptTokenCount")),
-    )
+    );
+
+    // In Anthropic Claude protocol, `input_tokens` represents only the UNCACHED portion of prompt tokens.
+    // `cache_read_input_tokens` (and optional `cache_creation_input_tokens`) are reported separately.
+    // Therefore, Anthropic total prompt tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens.
+    // In contrast, OpenAI Chat (`prompt_tokens`), OpenAI Responses (`input_tokens` + `input_tokens_details.cached_tokens`),
+    // and Gemini (`promptTokenCount`) already include cached tokens in their prompt/input token count.
+    if let Some(cache_read) = value_as_u32(usage.get("cache_read_input_tokens")) {
+        let cache_creation = value_as_u32(usage.get("cache_creation_input_tokens")).unwrap_or(0);
+        if let Some(inp) = raw_input {
+            return Some(inp + cache_read + cache_creation);
+        }
+    }
+
+    raw_input
 }
 
 fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
@@ -1157,5 +1171,65 @@ mod tests {
             .expect("forwarder did not stop after receiver closed")
             .expect("forwarder task panicked");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_extract_tokens_anthropic() {
+        use serde_json::json;
+        let usage = json!({
+            "input_tokens": 1200,
+            "cache_read_input_tokens": 8800,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 150
+        });
+        assert_eq!(super::extract_input_tokens(&usage), Some(10000));
+        assert_eq!(super::extract_cached_tokens(&usage), Some(8800));
+        assert_eq!(super::extract_output_tokens(&usage), Some(150));
+    }
+
+    #[test]
+    fn test_extract_tokens_openai_chat() {
+        use serde_json::json;
+        let usage = json!({
+            "prompt_tokens": 10000,
+            "completion_tokens": 150,
+            "total_tokens": 10150,
+            "prompt_tokens_details": {
+                "cached_tokens": 8800
+            }
+        });
+        assert_eq!(super::extract_input_tokens(&usage), Some(10000));
+        assert_eq!(super::extract_cached_tokens(&usage), Some(8800));
+        assert_eq!(super::extract_output_tokens(&usage), Some(150));
+    }
+
+    #[test]
+    fn test_extract_tokens_openai_responses() {
+        use serde_json::json;
+        let usage = json!({
+            "input_tokens": 10000,
+            "output_tokens": 150,
+            "total_tokens": 10150,
+            "input_tokens_details": {
+                "cached_tokens": 8800
+            }
+        });
+        assert_eq!(super::extract_input_tokens(&usage), Some(10000));
+        assert_eq!(super::extract_cached_tokens(&usage), Some(8800));
+        assert_eq!(super::extract_output_tokens(&usage), Some(150));
+    }
+
+    #[test]
+    fn test_extract_tokens_gemini_raw() {
+        use serde_json::json;
+        let usage = json!({
+            "promptTokenCount": 10000,
+            "candidatesTokenCount": 150,
+            "totalTokenCount": 10150,
+            "cachedContentTokenCount": 8800
+        });
+        assert_eq!(super::extract_input_tokens(&usage), Some(10000));
+        assert_eq!(super::extract_cached_tokens(&usage), Some(8800));
+        assert_eq!(super::extract_output_tokens(&usage), Some(150));
     }
 }

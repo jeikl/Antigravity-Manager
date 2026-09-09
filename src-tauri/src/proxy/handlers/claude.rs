@@ -835,8 +835,11 @@ pub async fn handle_messages(
         // 使用 SessionManager 生成稳定的会话指纹
         let fallback_sid =
             crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
-        let session_scope =
-            crate::proxy::thinking_store::SessionScope::from_headers(&headers, fallback_sid);
+        let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+            &headers,
+            Some(&original_body),
+            fallback_sid,
+        );
         let session_id_str = session_scope.store_key.clone();
         let client_session_id = session_scope.client_id.clone();
         let session_id = Some(session_id_str.as_str());
@@ -1433,6 +1436,7 @@ pub async fn handle_messages(
                                 .header("X-Account-Email", &email)
                                 .header("X-Mapped-Model", &request_with_mapped.model)
                                 .header("X-Session-Id", &client_session_id)
+                                .header("X-Antigravity-Session-Id", &client_session_id)
                                 .header(
                                     "X-Context-Purified",
                                     if is_purified { "true" } else { "false" },
@@ -1454,6 +1458,8 @@ pub async fn handle_messages(
                                         .header(header::CONTENT_TYPE, "application/json")
                                         .header("X-Account-Email", &email)
                                         .header("X-Mapped-Model", &request_with_mapped.model)
+                                        .header("X-Session-Id", &client_session_id)
+                                        .header("X-Antigravity-Session-Id", &client_session_id)
                                         .header(
                                             "X-Context-Purified",
                                             if is_purified { "true" } else { "false" },

@@ -24,6 +24,9 @@ pub fn normalize_proxy_url(url: &str) -> String {
 // 全局 Thinking Budget 配置存储
 // 用于在 request transform 函数中访问配置（无需修改函数签名）
 // ============================================================================
+#[cfg(test)]
+pub static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
 /// 获取当前 Thinking Budget 配置

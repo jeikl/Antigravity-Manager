@@ -109,7 +109,21 @@ const LogTable: React.FC<LogTableProps> = ({
                             </td>
                             <td className="truncate" style={{ width: '180px', maxWidth: '180px' }}>{log.url}</td>
                             <td className="text-right text-[9px]" style={{ width: '90px' }}>
-                                {log.input_tokens != null && <div>{t('monitor.input')}: {formatCompactNumber(log.input_tokens)}</div>}
+                                {log.input_tokens != null && (() => {
+                                    const totalIn = (log.cached_tokens && log.cached_tokens > log.input_tokens)
+                                        ? log.input_tokens + log.cached_tokens
+                                        : log.input_tokens;
+                                    return (
+                                        <div>
+                                            <div>{t('monitor.input')}: {formatCompactNumber(totalIn)}</div>
+                                            {log.cached_tokens ? (
+                                                <div className="text-emerald-600 dark:text-emerald-400 font-medium text-[8.5px]">
+                                                    ({t('monitor.cached', '缓')}: {formatCompactNumber(log.cached_tokens)})
+                                                </div>
+                                            ) : null}
+                                        </div>
+                                    );
+                                })()}
                                 {log.output_tokens != null && <div>{t('monitor.output')}: {formatCompactNumber(log.output_tokens)}</div>}
                             </td>
                             <td className="text-right" style={{ width: '80px' }}>{log.duration}ms</td>
@@ -194,7 +208,7 @@ function extractConcisePayload(
         });
     };
 
-    // 简化工具调用 (保留 name, id, 省略具体 arguments / input)
+    // 简化工具调用 (保留 name, id, arguments / args)
     const simplifyToolCalls = (toolCalls: any): any => {
         if (!Array.isArray(toolCalls)) return undefined;
         return toolCalls.map((tc: any) => {
@@ -205,12 +219,12 @@ function extractConcisePayload(
             if (tc.function && typeof tc.function === 'object') {
                 res.function = {
                     name: tc.function.name,
-                    arguments: '[omitted]'
+                    arguments: tc.function.arguments !== undefined ? tc.function.arguments : {}
                 };
             } else {
                 if (tc.name) res.name = tc.name;
-                if (tc.input !== undefined) res.input = '[omitted]';
-                if (tc.args !== undefined) res.args = '[omitted]';
+                if (tc.input !== undefined) res.input = tc.input;
+                if (tc.args !== undefined) res.args = tc.args;
             }
             return res;
         });
@@ -229,7 +243,16 @@ function extractConcisePayload(
                         type: 'tool_use',
                         id: item.id,
                         name: item.name,
-                        input: '[omitted]'
+                        input: item.input !== undefined ? item.input : {}
+                    };
+                }
+                // Claude tool_result 块
+                if (item.type === 'tool_result') {
+                    return {
+                        type: 'tool_result',
+                        tool_use_id: item.tool_use_id,
+                        ...(item.content !== undefined ? { content: item.content } : {}),
+                        ...(item.is_error !== undefined ? { is_error: item.is_error } : {})
                     };
                 }
                 // Claude thinking 块与签名
@@ -237,9 +260,10 @@ function extractConcisePayload(
                     return {
                         type: 'thinking',
                         thinking: item.thinking,
-                        ...(item.signature ? { signature: item.signature } : {}),
-                        ...(item.thought_signature ? { thought_signature: item.thought_signature } : {}),
-                        ...(item.thinking_signature ? { thinking_signature: item.thinking_signature } : {})
+                        ...(item.signature !== undefined ? { signature: item.signature } : {}),
+                        ...(item.thought_signature !== undefined ? { thought_signature: item.thought_signature } : {}),
+                        ...(item.thoughtSignature !== undefined ? { thoughtSignature: item.thoughtSignature } : {}),
+                        ...(item.thinking_signature !== undefined ? { thinking_signature: item.thinking_signature } : {})
                     };
                 }
                 // Claude redacted_thinking 块
@@ -305,30 +329,55 @@ function extractConcisePayload(
             if (Array.isArray(c.parts)) {
                 res.parts = c.parts.map((p: any) => {
                     if (!p || typeof p !== 'object') return p;
-                    if (p.thought !== undefined || p.thought_signature !== undefined || p.signature !== undefined) {
+
+                    // 1. 优先识别工具调用 (functionCall) 并保留其名称、ID、参数与携带的加密思考签名
+                    if (p.functionCall) {
+                        const fcPart: any = {
+                            functionCall: {
+                                name: p.functionCall.name,
+                                ...(p.functionCall.id ? { id: p.functionCall.id } : {}),
+                                args: p.functionCall.args !== undefined ? p.functionCall.args : {}
+                            }
+                        };
+                        if (p.thought !== undefined) fcPart.thought = p.thought;
+                        if (p.thoughtSignature !== undefined) fcPart.thoughtSignature = p.thoughtSignature;
+                        if (p.thought_signature !== undefined) fcPart.thought_signature = p.thought_signature;
+                        if (p.signature !== undefined) fcPart.signature = p.signature;
+                        return fcPart;
+                    }
+
+                    // 2. 优先识别工具响应 (functionResponse) 并保留其名称、ID、返回值与携带的签名
+                    if (p.functionResponse) {
+                        const frPart: any = {
+                            functionResponse: {
+                                name: p.functionResponse.name,
+                                ...(p.functionResponse.id ? { id: p.functionResponse.id } : {}),
+                                response: p.functionResponse.response !== undefined ? p.functionResponse.response : {}
+                            }
+                        };
+                        if (p.thought !== undefined) frPart.thought = p.thought;
+                        if (p.thoughtSignature !== undefined) frPart.thoughtSignature = p.thoughtSignature;
+                        if (p.thought_signature !== undefined) frPart.thought_signature = p.thought_signature;
+                        if (p.signature !== undefined) frPart.signature = p.signature;
+                        return frPart;
+                    }
+
+                    // 3. 独立思考块 (纯思考过程，不带工具调用)
+                    if (p.thought !== undefined || p.thought_signature !== undefined || p.thoughtSignature !== undefined || p.signature !== undefined) {
                         const tPart: any = {};
                         if (p.thought !== undefined) tPart.thought = p.thought;
                         if (p.thought_signature !== undefined) tPart.thought_signature = p.thought_signature;
+                        if (p.thoughtSignature !== undefined) tPart.thoughtSignature = p.thoughtSignature;
                         if (p.signature !== undefined) tPart.signature = p.signature;
                         if (p.text !== undefined) tPart.text = p.text;
                         return tPart;
                     }
-                    if (p.functionCall) {
-                        return {
-                            functionCall: {
-                                name: p.functionCall.name,
-                                args: '[omitted]'
-                            }
-                        };
+
+                    // 4. 普通文本块
+                    if (p.text !== undefined) {
+                        return { text: p.text };
                     }
-                    if (p.functionResponse) {
-                        return {
-                            functionResponse: {
-                                name: p.functionResponse.name,
-                                response: typeof p.functionResponse.response === 'object' ? '[response data]' : p.functionResponse.response
-                            }
-                        };
-                    }
+
                     return p;
                 });
             }
@@ -355,9 +404,8 @@ function extractConcisePayload(
     const simplifyUsage = (usage: any): any => {
         if (!usage || typeof usage !== 'object') return undefined;
         const res: any = {};
-        const input = usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokenCount;
+        const rawInput = usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokenCount;
         const output = usage.completion_tokens ?? usage.output_tokens ?? usage.candidatesTokenCount;
-        const total = usage.total_tokens ?? usage.totalTokenCount ?? (input != null && output != null ? input + output : undefined);
 
         let cached = usage.cached_tokens ?? usage.cache_read_input_tokens ?? usage.cachedContentTokenCount;
         if (cached == null && usage.prompt_tokens_details?.cached_tokens != null) {
@@ -367,13 +415,26 @@ function extractConcisePayload(
             cached = usage.input_tokens_details.cached_tokens;
         }
 
-        if (input != null) res.input_tokens = input;
-        if (output != null) res.output_tokens = output;
-        if (total != null) res.total_tokens = total;
+        // 计算全量上下文输入 Token (Total Context Input)
+        // 1. Anthropic 官方协议: input_tokens 仅代表未缓存增量，总上下文 = input_tokens + cache_read_input_tokens
+        // 2. 兼容历史日志: 若 cached > rawInput，说明 rawInput 存的是未缓存差值，做自愈加和
+        let totalInput = rawInput != null ? Number(rawInput) : undefined;
+        if (cached != null && totalInput != null && cached > totalInput) {
+            totalInput = totalInput + Number(cached);
+        } else if (usage.cache_read_input_tokens != null && usage.prompt_tokens == null && usage.promptTokenCount == null) {
+            totalInput = Number(usage.input_tokens || 0) + Number(cached || 0);
+        }
+
+        const total = usage.total_tokens ?? usage.totalTokenCount ?? (totalInput != null && output != null ? totalInput + Number(output) : undefined);
+
+        if (totalInput != null) res.input_tokens = totalInput;
+        if (output != null) res.output_tokens = Number(output);
+        if (total != null) res.total_tokens = Number(total);
         if (cached != null) {
-            res.cached_tokens = cached;
-            if (input != null && input > 0) {
-                res.cache_hit_rate = `${((cached / input) * 100).toFixed(1)}%`;
+            res.cached_tokens = Number(cached);
+            if (totalInput != null && totalInput > 0) {
+                const rate = Math.min(100, Math.max(0, (Number(cached) / totalInput) * 100));
+                res.cache_hit_rate = `${rate.toFixed(1)}%`;
             }
         }
         if (usage.cache_creation_input_tokens != null) {
@@ -536,12 +597,16 @@ function extractConcisePayload(
     if (usage) {
         concise.usage = usage;
     } else if (kind === 'response' && (log?.input_tokens || log?.output_tokens)) {
+        const totalIn = (log.cached_tokens && log.cached_tokens > (log.input_tokens || 0))
+            ? (log.input_tokens || 0) + log.cached_tokens
+            : (log.input_tokens || 0);
         concise.usage = {
-            input_tokens: log.input_tokens,
+            input_tokens: totalIn,
             output_tokens: log.output_tokens,
+            total_tokens: totalIn + (log.output_tokens || 0),
             ...(log.cached_tokens != null ? {
                 cached_tokens: log.cached_tokens,
-                cache_hit_rate: log.input_tokens ? `${((log.cached_tokens / log.input_tokens) * 100).toFixed(1)}%` : undefined
+                cache_hit_rate: totalIn > 0 ? `${Math.min(100, Math.max(0, (log.cached_tokens / totalIn) * 100)).toFixed(1)}%` : undefined
             } : {})
         };
     }
@@ -691,8 +756,21 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
         }
     };
 
+    const searchInputRef = useRef<HTMLInputElement>(null);
+
     return (
-        <div className="flex flex-col h-full bg-gray-50/70 dark:bg-base-200/50 rounded-xl border border-gray-200 dark:border-base-300 overflow-hidden shadow-sm">
+        <div
+            className="payload-viewer-card flex flex-col h-full bg-gray-50/70 dark:bg-base-200/50 rounded-xl border border-gray-200 dark:border-base-300 overflow-hidden shadow-sm outline-none"
+            tabIndex={-1}
+            onKeyDown={(e) => {
+                if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    searchInputRef.current?.focus();
+                    searchInputRef.current?.select();
+                }
+            }}
+        >
             {/* Card Header */}
             <div className="px-3 py-2 border-b border-gray-200 dark:border-base-300 bg-white dark:bg-base-200 flex items-center justify-between gap-2 shrink-0">
                 <div className="flex items-center gap-2 min-w-0">
@@ -723,10 +801,25 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                 <div className="relative flex-1 min-w-0 flex items-center">
                     <Search size={12} className="absolute left-2 text-gray-400 pointer-events-none" />
                     <input
+                        ref={searchInputRef}
                         type="text"
-                        placeholder={t('monitor.details.search_placeholder', '搜索此报文...')}
+                        placeholder={t('monitor.details.search_placeholder', '搜索此报文... (Enter下个, Shift+Enter上个)')}
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                if (e.shiftKey) {
+                                    handlePrev();
+                                } else {
+                                    handleNext();
+                                }
+                            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                searchInputRef.current?.select();
+                            }
+                        }}
                         className="input input-xs input-bordered w-full pl-6 pr-6 text-[11px] h-7 bg-white dark:bg-base-200 rounded-md"
                     />
                     {searchTerm && (
@@ -753,7 +846,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                                 onClick={handlePrev}
                                 disabled={matchesCount <= 1}
                                 className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
-                                title="上一处"
+                                title="上一处 (Shift+Enter)"
                             >
                                 <ChevronUp size={12} />
                             </button>
@@ -762,7 +855,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                                 onClick={handleNext}
                                 disabled={matchesCount <= 1}
                                 className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
-                                title="下一处"
+                                title="下一处 (Enter)"
                             >
                                 <ChevronDown size={12} />
                             </button>
@@ -774,7 +867,8 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
             {/* Scrollable Content Body */}
             <div
                 ref={containerRef}
-                className="flex-1 overflow-y-auto overflow-x-auto p-3 bg-white dark:bg-base-300/60 font-mono text-[11px]"
+                tabIndex={0}
+                className="flex-1 overflow-y-auto overflow-x-auto p-3 bg-white dark:bg-base-300/60 font-mono text-[11px] outline-none focus:ring-1 focus:ring-blue-500/20"
             >
                 {renderBody()}
             </div>
@@ -792,12 +886,30 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const filterRef = useRef(filter);
     const accountFilterRef = useRef(accountFilter);
     const currentPageRef = useRef(1);
+    const globalFilterInputRef = useRef<HTMLInputElement>(null);
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
     const [payloadViewMode, setPayloadViewMode] = useState<'concise' | 'full'>('concise');
     const [showMetadata, setShowMetadata] = useState(true);
     const [copiedCard, setCopiedCard] = useState<string | null>(null);
+
+    // 全局快捷键 Ctrl+F：当焦点在报文卡片之外时，聚焦主界面的全局过滤搜索框
+    useEffect(() => {
+        const handleGlobalKeyDown = (e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+                const activeEl = document.activeElement;
+                if (activeEl && activeEl.closest('.payload-viewer-card')) {
+                    return;
+                }
+                e.preventDefault();
+                globalFilterInputRef.current?.focus();
+                globalFilterInputRef.current?.select();
+            }
+        };
+        window.addEventListener('keydown', handleGlobalKeyDown);
+        return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+    }, []);
 
     const conciseRequestBody = useMemo(() => {
         return selectedLog?.request_body
@@ -1070,10 +1182,13 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     const quickFilters = [
         { label: t('monitor.filters.all'), value: '' },
+        { label: 'claude', value: 'claude' },
+        { label: 'flash', value: 'flash' },
+        { label: 'pro', value: 'pro' },
+        { label: 'agent', value: 'agent' },
         { label: t('monitor.filters.error'), value: '__ERROR__' },
         { label: t('monitor.filters.chat'), value: 'completions' },
         { label: t('monitor.filters.gemini'), value: 'gemini' },
-        { label: t('monitor.filters.claude'), value: 'claude' },
         { label: t('monitor.filters.images'), value: 'images' }
     ];
 
@@ -1114,6 +1229,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     <div className="relative flex-1">
                         <Search className="absolute left-2.5 top-2 text-gray-400" size={14} />
                         <input
+                            ref={globalFilterInputRef}
                             type="text"
                             placeholder={t('monitor.filters.placeholder')}
                             className="input input-sm input-bordered w-full pl-9 text-xs"
@@ -1253,7 +1369,16 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                         <div>
                                             <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.tokens')}</span>
                                             <div className="font-mono text-[10px] flex items-center gap-1.5 mt-0.5">
-                                                <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded font-bold">In: {formatCompactNumber(selectedLog.input_tokens ?? 0)}</span>
+                                                {(() => {
+                                                    const totalIn = (selectedLog.cached_tokens && selectedLog.cached_tokens > (selectedLog.input_tokens ?? 0))
+                                                        ? (selectedLog.input_tokens ?? 0) + selectedLog.cached_tokens
+                                                        : (selectedLog.input_tokens ?? 0);
+                                                    return (
+                                                        <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded font-bold" title={`Total Input Tokens: ${totalIn}`}>
+                                                            In: {formatCompactNumber(totalIn)}
+                                                        </span>
+                                                    );
+                                                })()}
                                                 <span className="text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 px-1.5 py-0.5 rounded font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
                                                 {selectedLog.cached_tokens != null && selectedLog.cached_tokens > 0 && (
                                                     <span className="text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/40 px-1.5 py-0.5 rounded font-bold">Cache: {formatCompactNumber(selectedLog.cached_tokens)}</span>
