@@ -2058,11 +2058,15 @@ pub async fn handle_chat_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
-        let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
+        let (mut gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,
             &project_id,
             &mapped_model,
             proxy_token.as_ref(),
+        );
+        let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+            &mut gemini_body,
+            &mapped_model,
         );
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
@@ -3841,7 +3845,7 @@ pub async fn handle_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
-        let (gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
+        let (mut gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
             transform_openai_request_with_session(
                 &openai_req,
                 &project_id,
@@ -3858,6 +3862,10 @@ pub async fn handle_completions(
                 proxy_token.as_ref(),
             )
         };
+        let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+            &mut gemini_body,
+            &mapped_model,
+        );
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }

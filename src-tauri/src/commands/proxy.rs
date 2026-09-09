@@ -221,6 +221,17 @@ pub async fn ensure_admin_server(
         return Ok(());
     }
 
+    crate::proxy::config::update_global_audit_config(
+        config.experimental.payload_storage_mode.clone(),
+        config.experimental.log_retention_days,
+        config.experimental.thinking_store_enabled,
+        config.experimental.thinking_retention_days,
+    );
+    crate::proxy::config::update_global_compression_level(
+        config.experimental.compression_level.clone(),
+        config.experimental.enable_usage_scaling,
+    );
+
     // Ensure monitor exists
     let monitor = {
         let mut monitor_lock = state.monitor.write().await;
@@ -282,6 +293,12 @@ pub async fn ensure_admin_server(
     crate::proxy::config::update_global_compression_level(
         config.experimental.compression_level.clone(),
         config.experimental.enable_usage_scaling,
+    );
+    crate::proxy::config::update_global_audit_config(
+        config.experimental.payload_storage_mode.clone(),
+        config.experimental.log_retention_days,
+        config.experimental.thinking_store_enabled,
+        config.experimental.thinking_retention_days,
     );
 
     Ok(())

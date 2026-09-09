@@ -443,6 +443,12 @@ pub async fn save_config(
             config.proxy.experimental.compression_level.clone(),
             config.proxy.experimental.enable_usage_scaling,
         );
+        crate::proxy::config::update_global_audit_config(
+            config.proxy.experimental.payload_storage_mode.clone(),
+            config.proxy.experimental.log_retention_days,
+            config.proxy.experimental.thinking_store_enabled,
+            config.proxy.experimental.thinking_retention_days,
+        );
         crate::proxy::config::update_global_thresholds(
             config.proxy.experimental.context_compression_threshold_l1,
             config.proxy.experimental.context_compression_threshold_l2,

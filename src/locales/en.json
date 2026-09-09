@@ -835,7 +835,14 @@
         "context_compression_threshold_l2": "L2 Compression Threshold (Thinking Compression)",
         "context_compression_threshold_l2_tooltip": "Compresses early thinking blocks while preserving signatures. Recommended: 0.55 (55%)",
         "context_compression_threshold_l3": "L3 Compression Threshold (Summary Pivot)",
-        "context_compression_threshold_l3_tooltip": "Ultimate reset: generates an XML state summary and pivots to a fresh session. Most token-efficient. Recommended: 0.7 (70%)"
+        "context_compression_threshold_l3_tooltip": "Ultimate reset: generates an XML state summary and pivots to a fresh session. Most token-efficient. Recommended: 0.7 (70%)",
+        "payload_storage_mode_label": "Monitor payload storage",
+        "payload_storage_mode_tooltip": "Simple mode stores thinking, usage, session ids and slim conversation only. Full mode stores original bodies. API keys in request headers are always redacted; thinking session ids are kept for ops comparison.",
+        "payload_storage_mode_desc": "Default is simple storage to keep the SQLite log small.",
+        "payload_mode_simple": "Simple (default)",
+        "payload_mode_full": "Full original",
+        "log_retention_days_label": "Request log retention (days)",
+        "thinking_retention_days_label": "Thinking-store retention (days)"
       },
       "opencode_sync": {
         "card_title": "OpenCode",

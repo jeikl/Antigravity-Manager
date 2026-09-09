@@ -828,7 +828,14 @@
         "context_compression_threshold_l2": "L2 压缩阈值 (思维链压缩)",
         "context_compression_threshold_l2_tooltip": "压缩早期的思维链内容，保留签名。建议值: 0.55 (55%)",
         "context_compression_threshold_l3": "L3 压缩阈值 (摘要重置)",
-        "context_compression_threshold_l3_tooltip": "强制生成 XML 状态摘要并重置会话。这是最省 token 的手段。建议值: 0.7 (70%)"
+        "context_compression_threshold_l3_tooltip": "强制生成 XML 状态摘要并重置会话。这是最省 token 的手段。建议值: 0.7 (70%)",
+        "payload_storage_mode_label": "监控报文存储模式",
+        "payload_storage_mode_tooltip": "简要模式只把思考块、用量、会话标识和精简对话写入 SQLite；完整模式保存原文。请求头中的 API Key 始终脱敏，x-session-id 等思考回填标识会原样保留便于运维对比。",
+        "payload_storage_mode_desc": "默认简要存储，避免工具参数和图片把日志库撑爆。",
+        "payload_mode_simple": "简要 (默认)",
+        "payload_mode_full": "完整原文",
+        "log_retention_days_label": "请求日志保留天数",
+        "thinking_retention_days_label": "思考块保留天数"
       },
       "opencode_sync": {
         "card_title": "OpenCode",

@@ -403,6 +403,14 @@ impl UpstreamClient {
         // [DEBUG] Log headers for verification
         tracing::debug!(?headers, "Final Upstream Request Headers");
 
+        let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
+            let pairs: Vec<(&str, &str)> = headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                .collect();
+            holder.set_headers_json(crate::proxy::payload_audit::header_pairs_to_redacted_json(pairs));
+        });
+
         let mut has_triggered_downgrade = false;
 
         // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑

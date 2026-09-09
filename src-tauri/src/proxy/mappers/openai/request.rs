@@ -854,8 +854,7 @@ pub fn transform_openai_request_with_session(
         }
         merged_contents.push(msg);
     }
-    crate::proxy::thinking_store::ThinkingStore::global()
-        .restore_gemini_contents(&session_id, &mut merged_contents);
+    crate::proxy::thinking_store::hydrate_gemini_contents(&session_id, &mut merged_contents);
     let mut contents = merged_contents;
 
     crate::proxy::thinking_store::finalize_gemini_contents_thinking(

@@ -132,6 +132,81 @@ static GLOBAL_USAGE_SCALING: OnceLock<RwLock<bool>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L1: OnceLock<RwLock<f32>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L2: OnceLock<RwLock<f32>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L3: OnceLock<RwLock<f32>> = OnceLock::new();
+static GLOBAL_PAYLOAD_STORAGE_MODE: OnceLock<RwLock<String>> = OnceLock::new();
+static GLOBAL_LOG_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
+static GLOBAL_THINKING_STORE_ENABLED: OnceLock<RwLock<bool>> = OnceLock::new();
+static GLOBAL_THINKING_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
+
+fn write_or_init<T: Clone>(slot: &OnceLock<RwLock<T>>, value: T) {
+    if let Some(lock) = slot.get() {
+        if let Ok(mut cfg) = lock.write() {
+            *cfg = value;
+        }
+    } else {
+        let _ = slot.set(RwLock::new(value));
+    }
+}
+
+pub fn get_payload_storage_mode() -> String {
+    GLOBAL_PAYLOAD_STORAGE_MODE
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| v.clone())
+        .unwrap_or_else(|| "simple".to_string())
+}
+
+pub fn get_log_retention_days() -> u32 {
+    GLOBAL_LOG_RETENTION_DAYS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(30)
+        .clamp(1, 3650)
+}
+
+pub fn is_thinking_store_enabled() -> bool {
+    GLOBAL_THINKING_STORE_ENABLED
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(true)
+}
+
+pub fn get_thinking_retention_days() -> u32 {
+    GLOBAL_THINKING_RETENTION_DAYS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(7)
+        .clamp(1, 3650)
+}
+
+pub fn update_global_audit_config(
+    payload_storage_mode: String,
+    log_retention_days: u32,
+    thinking_store_enabled: bool,
+    thinking_retention_days: u32,
+) {
+    let mode = if payload_storage_mode == "full" {
+        "full"
+    } else {
+        "simple"
+    };
+    write_or_init(&GLOBAL_PAYLOAD_STORAGE_MODE, mode.to_string());
+    write_or_init(&GLOBAL_LOG_RETENTION_DAYS, log_retention_days.clamp(1, 3650));
+    write_or_init(&GLOBAL_THINKING_STORE_ENABLED, thinking_store_enabled);
+    write_or_init(
+        &GLOBAL_THINKING_RETENTION_DAYS,
+        thinking_retention_days.clamp(1, 3650),
+    );
+    tracing::info!(
+        "[Audit] storage_mode={}, log_retention_days={}, thinking_store={}, thinking_retention_days={}",
+        mode,
+        log_retention_days.clamp(1, 3650),
+        thinking_store_enabled,
+        thinking_retention_days.clamp(1, 3650)
+    );
+}
 
 pub fn get_global_threshold_l1() -> f32 {
     GLOBAL_THRESHOLD_L1
@@ -395,6 +470,22 @@ pub struct ExperimentalConfig {
     /// 上下文压缩阈值 L3 (Fork + Summary)
     #[serde(default = "default_threshold_l3")]
     pub context_compression_threshold_l3: f32,
+
+    /// 监控报文体存储模式: `simple`（默认，精简落库）或 `full`（原文）
+    #[serde(default = "default_payload_storage_mode")]
+    pub payload_storage_mode: String,
+
+    /// 请求日志保留天数
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+
+    /// 服务端思考块回填（默认开启，可关闭）
+    #[serde(default = "default_thinking_store_enabled")]
+    pub thinking_store_enabled: bool,
+
+    /// 思考块 SQLite 记录保留天数
+    #[serde(default = "default_thinking_retention_days")]
+    pub thinking_retention_days: u32,
 }
 
 impl Default for ExperimentalConfig {
@@ -408,6 +499,10 @@ impl Default for ExperimentalConfig {
             context_compression_threshold_l1: 0.4,
             context_compression_threshold_l2: 0.55,
             context_compression_threshold_l3: 0.7,
+            payload_storage_mode: default_payload_storage_mode(),
+            log_retention_days: default_log_retention_days(),
+            thinking_store_enabled: default_thinking_store_enabled(),
+            thinking_retention_days: default_thinking_retention_days(),
         }
     }
 }
@@ -423,6 +518,18 @@ fn default_threshold_l3() -> f32 {
 }
 fn default_compression_level() -> String {
     "disabled".to_string()
+}
+fn default_payload_storage_mode() -> String {
+    "simple".to_string()
+}
+fn default_log_retention_days() -> u32 {
+    30
+}
+fn default_thinking_store_enabled() -> bool {
+    true
+}
+fn default_thinking_retention_days() -> u32 {
+    7
 }
 
 /// Thinking Budget 模式

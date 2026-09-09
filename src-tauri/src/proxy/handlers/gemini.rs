@@ -256,7 +256,7 @@ pub async fn handle_generate(
         // [FIX #765] Pass session_id to wrap_request for signature injection
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let wrapped_body = wrap_request_v2(
+        let mut wrapped_body = wrap_request_v2(
             &body,
             &project_id,
             &mapped_model,
@@ -264,6 +264,10 @@ pub async fn handle_generate(
             Some(&session_id),
             token_obj.as_ref(),
             Some(&token_manager),
+        );
+        let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+            &mut wrapped_body,
+            &mapped_model,
         );
 
         if let Some(ref recorder) = upstream_recorder {

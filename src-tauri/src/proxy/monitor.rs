@@ -20,6 +20,12 @@ pub struct ProxyRequestLog {
     pub request_body: Option<String>,
     pub upstream_request_body: Option<String>, // 网关转出给上游(Antigravity)的报文
     pub response_body: Option<String>,
+    #[serde(default)]
+    pub request_headers: Option<String>,
+    #[serde(default)]
+    pub upstream_request_headers: Option<String>,
+    #[serde(default)]
+    pub response_headers: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
@@ -27,17 +33,33 @@ pub struct ProxyRequestLog {
     pub username: Option<String>, // User token username
 }
 
+#[derive(Default)]
+pub(crate) struct UpstreamCapture {
+    body: Option<String>,
+    headers: Option<String>,
+}
+
 #[derive(Clone, Default)]
-pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<Option<String>>>);
+pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
+
+tokio::task_local! {
+    pub static CURRENT_UPSTREAM_CAPTURE: UpstreamRequestBodyHolder;
+}
 
 impl UpstreamRequestBodyHolder {
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(None)))
+        Self(std::sync::Arc::new(std::sync::Mutex::new(UpstreamCapture::default())))
     }
 
     pub fn set(&self, body: String) {
         if let Ok(mut lock) = self.0.lock() {
-            *lock = Some(body);
+            lock.body = Some(body);
+        }
+    }
+
+    pub fn set_headers_json(&self, headers: String) {
+        if let Ok(mut lock) = self.0.lock() {
+            lock.headers = Some(headers);
         }
     }
 
@@ -49,7 +71,11 @@ impl UpstreamRequestBodyHolder {
     }
 
     pub fn take(&self) -> Option<String> {
-        self.0.lock().ok().and_then(|mut g| g.take())
+        self.0.lock().ok().and_then(|mut g| g.body.take())
+    }
+
+    pub fn take_headers(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut g| g.headers.take())
     }
 }
 
@@ -108,19 +134,38 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
+        let log_days = crate::proxy::config::get_log_retention_days() as i64;
+        let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
+        tokio::task::spawn_blocking(move || {
+            match crate::modules::proxy_db::cleanup_old_logs(log_days) {
                 Ok(deleted) => {
                     if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                        tracing::info!(
+                            "Auto cleanup: removed {} old logs (>{} days)",
+                            deleted,
+                            log_days
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to cleanup old logs: {}", e);
                 }
-            },
-        );
+            }
+            match crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Auto cleanup: removed {} old thinking/signature records (>{} days)",
+                            deleted,
+                            thinking_days
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cleanup thinking records: {}", e);
+                }
+            }
+        });
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
@@ -179,8 +224,21 @@ impl ProxyMonitor {
             logs.push_front(log.clone());
         }
 
-        // Save to DB
-        let log_to_save = log.clone();
+        // Save to DB (respect server-side simple/full storage mode)
+        let mut log_to_save = log.clone();
+        let storage_mode = crate::proxy::config::get_payload_storage_mode();
+        log_to_save.request_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.request_body,
+            &storage_mode,
+        );
+        log_to_save.upstream_request_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.upstream_request_body,
+            &storage_mode,
+        );
+        log_to_save.response_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.response_body,
+            &storage_mode,
+        );
         tokio::task::spawn_blocking(move || {
             if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
@@ -226,6 +284,9 @@ impl ProxyMonitor {
                 request_body: None,  // Don't send body in event
                 upstream_request_body: None,
                 response_body: None, // Don't send body in event
+                request_headers: None,
+                upstream_request_headers: None,
+                response_headers: None,
                 input_tokens: log.input_tokens,
                 output_tokens: log.output_tokens,
                 cached_tokens: log.cached_tokens,

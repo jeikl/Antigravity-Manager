@@ -424,6 +424,9 @@ pub async fn monitor_middleware(
         None
     };
 
+    let request_headers_json =
+        crate::proxy::payload_audit::headers_to_redacted_json(request.headers());
+
     let request_body_str;
 
     // [FIX] 从请求 extensions 提取 UserTokenIdentity (由 Auth 中间件注入)
@@ -476,8 +479,13 @@ pub async fn monitor_middleware(
     let mut request = request;
     request.extensions_mut().insert(upstream_holder.clone());
 
-    let response = next.run(request).await;
+    let response = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+        .scope(upstream_holder.clone(), next.run(request))
+        .await;
     let upstream_request_body = upstream_holder.take();
+    let upstream_request_headers = upstream_holder.take_headers();
+    let response_headers_json =
+        crate::proxy::payload_audit::headers_to_redacted_json(response.headers());
 
     // user_token_identity 已在上面从请求 extensions 中提取
 
@@ -540,6 +548,9 @@ pub async fn monitor_middleware(
         request_body: request_body_str,
         upstream_request_body,
         response_body: None,
+        request_headers: Some(request_headers_json),
+        upstream_request_headers,
+        response_headers: Some(response_headers_json),
         input_tokens: None,
         output_tokens: None,
         cached_tokens: None,
@@ -1024,13 +1035,18 @@ pub async fn monitor_middleware(
                 log.error = Some("Stream Error or Failed".to_string());
             }
 
-            // [FIX #3325] Fallback input token estimation for stream responses
+            // Fallback input token estimation prefers the transit (upstream) body
             if log.input_tokens.is_none() {
-                if let Some(ref req_body) = log.request_body {
-                    let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
-                    if estimated > 0 {
-                        log.input_tokens = Some(estimated);
-                    }
+                let estimated = log
+                    .upstream_request_body
+                    .as_ref()
+                    .or(log.request_body.as_ref())
+                    .map(|body| {
+                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(body)
+                    })
+                    .unwrap_or(0);
+                if estimated > 0 {
+                    log.input_tokens = Some(estimated);
                 }
             }
 
@@ -1087,13 +1103,18 @@ pub async fn monitor_middleware(
                     log.error = log.response_body.clone();
                 }
 
-                // [FIX #3325] Fallback input token estimation if upstream returned an error (no usage metadata)
+                // Fallback input token estimation prefers the transit (upstream) body
                 if log.input_tokens.is_none() {
-                    if let Some(ref req_body) = log.request_body {
-                        let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
-                        if estimated > 0 {
-                            log.input_tokens = Some(estimated);
-                        }
+                    let estimated = log
+                        .upstream_request_body
+                        .as_ref()
+                        .or(log.request_body.as_ref())
+                        .map(|body| {
+                            crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(body)
+                        })
+                        .unwrap_or(0);
+                    if estimated > 0 {
+                        log.input_tokens = Some(estimated);
                     }
                 }
 

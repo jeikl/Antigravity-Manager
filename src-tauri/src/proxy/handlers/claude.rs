@@ -1102,7 +1102,7 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let gemini_body = match transform_claude_request_in(
+        let mut gemini_body = match transform_claude_request_in(
             &request_with_mapped,
             &project_id,
             retried_without_thinking,
@@ -1137,6 +1137,11 @@ pub async fn handle_messages(
                     .into_response();
             }
         };
+
+        let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+            &mut gemini_body,
+            &mapped_model,
+        );
 
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);

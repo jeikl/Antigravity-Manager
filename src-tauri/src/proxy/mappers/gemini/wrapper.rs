@@ -337,8 +337,7 @@ pub fn wrap_request_v2(
             }
         }
         if let Some(s_id) = session_id {
-            crate::proxy::thinking_store::ThinkingStore::global()
-                .restore_gemini_contents(s_id, contents);
+            crate::proxy::thinking_store::hydrate_gemini_contents(s_id, contents);
         }
         crate::proxy::thinking_store::finalize_gemini_contents_thinking(
             contents,

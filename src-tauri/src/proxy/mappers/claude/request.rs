@@ -1712,8 +1712,7 @@ fn build_google_contents(
     let mut merged_contents = merge_adjacent_roles(contents);
 
     // Unconditionally restore full thinking blocks + signatures from ThinkingStore
-    crate::proxy::thinking_store::ThinkingStore::global()
-        .restore_gemini_contents(session_id, &mut merged_contents);
+    crate::proxy::thinking_store::hydrate_gemini_contents(session_id, &mut merged_contents);
 
     crate::proxy::thinking_store::finalize_gemini_contents_thinking(
         &mut merged_contents,

@@ -39,6 +39,9 @@ const PLACEHOLDER_THOUGHTS: &[&str] = &[
 /// (requested or mapped), the proxy enables thoughts + signature restore.
 /// Image / embed / lite are excluded to avoid 400s.
 pub fn model_forces_server_thinking(model: &str) -> bool {
+    if !crate::proxy::config::is_thinking_store_enabled() {
+        return false;
+    }
     let m = model.to_lowercase();
     if m.is_empty() {
         return false;
@@ -54,7 +57,7 @@ pub fn model_forces_server_thinking(model: &str) -> bool {
         || m.contains("thinking")
         || m.contains("o1")
         || m.contains("o3")
-        || m.contains("deepseek-r1")
+        || m.contains("deepseek")
 }
 
 pub fn any_model_forces_server_thinking(models: &[&str]) -> bool {
@@ -106,6 +109,9 @@ impl ThinkingStore {
     }
 
     pub fn record(&self, store_key: &str, rec: ThinkingRecord) {
+        if !crate::proxy::config::is_thinking_store_enabled() {
+            return;
+        }
         if rec.thought.trim().is_empty() && rec.signature.is_none() {
             return;
         }
@@ -180,6 +186,9 @@ impl ThinkingStore {
     }
 
     pub fn restore_gemini_contents(&self, store_key: &str, contents: &mut Vec<Value>) -> usize {
+        if !crate::proxy::config::is_thinking_store_enabled() {
+            return 0;
+        }
         if contents.is_empty() || store_key.is_empty() {
             return 0;
         }
@@ -446,6 +455,101 @@ impl ThinkingStore {
         }
     }
 
+    /// Drop thinking records that no longer appear in the (possibly compressed) history.
+    /// Always keeps the newest 2 turns so the latest unused response thinking is not lost.
+    pub fn prune_orphaned_records(&self, store_key: &str, contents: &[Value]) {
+        if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
+            return;
+        }
+
+        let mut live_tool_ids = std::collections::HashSet::new();
+        let mut live_fps = std::collections::HashSet::new();
+        let mut live_visibles: Vec<String> = Vec::new();
+        let mut live_turn_count = 0usize;
+
+        for content in contents {
+            let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "model" && role != "assistant" {
+                continue;
+            }
+            let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            live_turn_count += 1;
+            let (visible, tool_ids, tool_names, _) = inspect_parts(parts);
+            live_fps.insert(fingerprint(&visible, &tool_ids, &tool_names));
+            for id in tool_ids {
+                live_tool_ids.insert(id);
+            }
+            let norm: String = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !norm.is_empty() {
+                live_visibles.push(norm);
+            }
+        }
+
+        let keep = {
+            let Ok(mut map) = self.sessions.lock() else {
+                return;
+            };
+            let Some(entry) = map.get_mut(store_key) else {
+                return;
+            };
+            if entry.turns.len() <= live_turn_count.saturating_add(2) {
+                return;
+            }
+
+            let total = entry.turns.len();
+            let keep_tail_start = total.saturating_sub(2);
+            let mut keep: Vec<ThinkingRecord> = Vec::new();
+            for (i, rec) in entry.turns.iter().enumerate() {
+                let matched_tool = rec.tool_ids.iter().any(|id| live_tool_ids.contains(id));
+                let matched_fp = live_fps.contains(&rec.fingerprint);
+                let norm_rec: String = rec.visible.split_whitespace().collect::<Vec<_>>().join(" ");
+                let matched_text = !norm_rec.is_empty()
+                    && live_visibles.iter().any(|v| {
+                        v == &norm_rec || v.starts_with(&norm_rec) || norm_rec.starts_with(v)
+                    });
+                if matched_tool || matched_fp || matched_text || i >= keep_tail_start {
+                    keep.push(rec.clone());
+                }
+            }
+
+            if keep.len() == entry.turns.len() {
+                return;
+            }
+
+            let dropped = entry.turns.len() - keep.len();
+            entry.bytes = keep
+                .iter()
+                .map(|r| {
+                    r.thought.len()
+                        + r.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + r.visible.len()
+                })
+                .sum();
+            entry.turns = keep.clone();
+            tracing::info!(
+                "[ThinkingStore] Pruned {} orphaned thinking record(s) after context compression for session {}",
+                dropped,
+                store_key
+            );
+            keep
+        };
+
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(store_key);
+        for rec in &keep {
+            let _ = crate::modules::proxy_db::save_thinking_record(
+                store_key,
+                &rec.fingerprint,
+                &rec.thought,
+                rec.signature.as_deref(),
+                &rec.tool_ids,
+                &rec.tool_names,
+                &rec.visible,
+            );
+        }
+    }
+
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
         let Ok(map) = self.sessions.lock() else {
             return None;
@@ -600,6 +704,29 @@ impl TurnAccumulator {
             },
         );
     }
+}
+
+pub fn capture_gemini_contents(store_key: &str, contents: &[Value]) {
+    if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
+        return;
+    }
+    for content in contents {
+        let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "model" && role != "assistant" {
+            continue;
+        }
+        if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+            capture_gemini_parts(store_key, parts);
+        }
+    }
+}
+
+/// Capture client-supplied thinking, restore missing blocks, then prune compressed-away history.
+pub fn hydrate_gemini_contents(store_key: &str, contents: &mut Vec<Value>) -> usize {
+    capture_gemini_contents(store_key, contents);
+    let restored = ThinkingStore::global().restore_gemini_contents(store_key, contents);
+    ThinkingStore::global().prune_orphaned_records(store_key, contents);
+    restored
 }
 
 pub fn capture_gemini_parts(store_key: &str, parts: &[Value]) {
@@ -1232,6 +1359,34 @@ mod tests {
         let empty_headers = HeaderMap::new();
         let scope2 = SessionScope::from_headers_and_body(&empty_headers, Some(&body), "fallback_id");
         assert_eq!(scope2.client_id, "meta-conv-888");
+    }
+
+    #[test]
+    fn capture_from_client_history_and_prune_compressed_turns() {
+        let store = ThinkingStore::new();
+        let key = "t:compress-session";
+        store.record(key, rec("thought-old-1", "old visible one", Some("call_old_1")));
+        store.record(key, rec("thought-old-2", "old visible two", Some("call_old_2")));
+        store.record(key, rec("thought-old-3", "old visible three", Some("call_old_3")));
+        store.record(key, rec("thought-keep", "kept latest answer", Some("call_keep")));
+        store.record(key, rec("thought-tail", "newest unused", None));
+
+        // Client /compact dropped the first three turns; only the latest kept turn remains.
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "kept latest answer" },
+                { "functionCall": { "name": "shell", "id": "call_keep", "args": {} } }
+            ]
+        })];
+
+        let restored = store.restore_gemini_contents(key, &mut contents);
+        assert_eq!(restored, 1);
+        store.prune_orphaned_records(key, &contents);
+        let (turns, _) = store.session_stats(key).unwrap();
+        assert!(turns <= 3, "orphaned compressed turns should be pruned, got {turns}");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "thought-keep");
     }
 }
 

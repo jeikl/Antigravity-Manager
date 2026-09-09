@@ -25,6 +25,9 @@ interface ProxyRequestLog {
     request_body?: string;
     upstream_request_body?: string;
     response_body?: string;
+    request_headers?: string;
+    upstream_request_headers?: string;
+    response_headers?: string;
     input_tokens?: number;
     output_tokens?: number;
     cached_tokens?: number;
@@ -624,6 +627,7 @@ interface PayloadViewerCardProps {
     badgeStyle: string;
     rawPayload?: string;
     concisePayload?: string;
+    headersJson?: string;
     viewMode: 'concise' | 'full';
     emptyPlaceholder: string;
     onCopy: (content: string) => Promise<void>;
@@ -637,6 +641,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
     badgeStyle,
     rawPayload,
     concisePayload,
+    headersJson,
     viewMode,
     emptyPlaceholder,
     onCopy,
@@ -758,6 +763,19 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
 
     const searchInputRef = useRef<HTMLInputElement>(null);
 
+    const prettyHeaders = useMemo(() => {
+        if (!headersJson) return '';
+        try {
+            return JSON.stringify(JSON.parse(headersJson), null, 2);
+        } catch {
+            return headersJson;
+        }
+    }, [headersJson]);
+
+    const copyPayload = prettyHeaders
+        ? `/* headers */\n${prettyHeaders}\n\n/* body */\n${formattedContent}`
+        : formattedContent;
+
     return (
         <div
             className="payload-viewer-card flex flex-col h-full bg-gray-50/70 dark:bg-base-200/50 rounded-xl border border-gray-200 dark:border-base-300 overflow-hidden shadow-sm outline-none"
@@ -785,8 +803,8 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                 <div className="flex items-center gap-1 shrink-0">
                     <button
                         type="button"
-                        onClick={() => onCopy(formattedContent)}
-                        disabled={!formattedContent}
+                        onClick={() => onCopy(copyPayload)}
+                        disabled={!formattedContent && !prettyHeaders}
                         className="btn btn-ghost btn-xs gap-1 h-7 px-2 text-gray-600 dark:text-gray-300"
                         title={isCopied ? t('proxy.config.btn_copied', '已复制') : t('proxy.config.btn_copy', '复制')}
                     >
@@ -870,6 +888,16 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                 tabIndex={0}
                 className="flex-1 overflow-y-auto overflow-x-auto p-3 bg-white dark:bg-base-300/60 font-mono text-[11px] outline-none focus:ring-1 focus:ring-blue-500/20"
             >
+                {prettyHeaders && (
+                    <div className="mb-3 pb-3 border-b border-dashed border-gray-200 dark:border-base-300">
+                        <div className="text-[10px] font-black uppercase tracking-wider text-gray-400 mb-1">
+                            {t('monitor.details.headers', 'Headers')}
+                        </div>
+                        <pre className="text-[11px] font-mono whitespace-pre-wrap text-amber-800 dark:text-amber-200/90 select-text leading-relaxed">
+                            {prettyHeaders}
+                        </pre>
+                    </div>
+                )}
                 {renderBody()}
             </div>
         </div>
@@ -1469,6 +1497,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     badgeStyle="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 border-blue-200 dark:border-blue-800/50"
                                     rawPayload={selectedLog.request_body}
                                     concisePayload={conciseRequestBody}
+                                    headersJson={selectedLog.request_headers}
                                     viewMode={payloadViewMode}
                                     emptyPlaceholder={t('monitor.details.payload_empty', '无请求报文')}
                                     onCopy={async (text) => {
@@ -1487,6 +1516,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     badgeStyle="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200 dark:border-amber-800/50"
                                     rawPayload={selectedLog.upstream_request_body}
                                     concisePayload={conciseUpstreamBody}
+                                    headersJson={selectedLog.upstream_request_headers}
                                     viewMode={payloadViewMode}
                                     emptyPlaceholder={t('monitor.details.no_upstream_payload', '无中转报文 (直接转发或未记录)')}
                                     onCopy={async (text) => {
@@ -1505,6 +1535,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     badgeStyle="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/50"
                                     rawPayload={selectedLog.response_body}
                                     concisePayload={conciseResponseBody}
+                                    headersJson={selectedLog.response_headers}
                                     viewMode={payloadViewMode}
                                     emptyPlaceholder={t('monitor.details.payload_empty', '无响应报文')}
                                     onCopy={async (text) => {
