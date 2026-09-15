@@ -944,37 +944,8 @@ fn build_system_instruction(
 ) -> Option<Value> {
     let mut parts = Vec::new();
 
-    // [NEW] Antigravity 身份指令 (原始简化版，末尾换行隔离 Markdown)
-    let antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-    You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-    **Absolute paths only**\n\
-    **Proactiveness**\n\n";
-
-    // [HYBRID] 检查用户是否已提供 Antigravity 身份
-    let mut user_has_antigravity = false;
-    if let Some(sys) = system {
-        match sys {
-            SystemPrompt::String(text) => {
-                if text.contains("You are Antigravity") {
-                    user_has_antigravity = true;
-                }
-            }
-            SystemPrompt::Array(blocks) => {
-                for block in blocks {
-                    if block.block_type == "text" && block.text.contains("You are Antigravity") {
-                        user_has_antigravity = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if !user_has_antigravity {
-        parts.push(json!({"text": antigravity_identity}));
-    }
-
-    // 注入全局系统提示词（清洗 + 换行隔离，避免重复粘连）
+    // 不注入官方 Antigravity 身份：客户端自带 system prompt 时原样透传。
+    // 全局提示词仍做清洗 + 换行隔离，避免 Markdown 粘连；身份文本若混入则由 clean_system_prompt_text 剥掉。
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
     if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
         let cleaned = clean_system_prompt_text(&global_prompt_config.content);

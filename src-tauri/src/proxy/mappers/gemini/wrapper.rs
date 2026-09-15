@@ -734,14 +734,11 @@ pub fn wrap_request_v2(
             }
         }
     } else {
-        // WebSearch 专属身份仿真 / Antigravity 身份（末尾换行隔离 Markdown）
-        let antigravity_identity = if config.request_type == "web_search" {
-            "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
+        // 只在 web_search 时注入搜索身份；普通对话不注入官方 Antigravity 身份，保持客户端 system prompt 透传。
+        let web_search_identity = if config.request_type == "web_search" {
+            Some("You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.")
         } else {
-            "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-            You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-            **Absolute paths only**\n\
-            **Proactiveness**\n\n"
+            None
         };
 
         // 检查是否已有 systemInstruction
@@ -755,21 +752,13 @@ pub fn wrap_request_v2(
 
             if let Some(parts) = system_instruction.get_mut("parts") {
                 if let Some(parts_array) = parts.as_array_mut() {
-                    let has_identity = parts_array
-                        .get(0)
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(|s| {
-                            s.contains("You are Antigravity")
-                                || s.contains("search engine bot")
-                        })
-                        .unwrap_or(false);
-
-                    if !has_identity {
-                        parts_array.insert(0, json!({"text": antigravity_identity}));
+                    let mut insert_offset = 0;
+                    if let Some(ws_id) = web_search_identity {
+                        parts_array.insert(0, json!({"text": ws_id}));
+                        insert_offset += 1;
                     }
 
-                    // 注入全局系统提示词（去重 + 换行隔离）
+                    // 注入全局系统提示词（去重 + 换行隔离，不夹官方身份）
                     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
                     if global_prompt_config.enabled
                         && !global_prompt_config.content.trim().is_empty()
@@ -784,8 +773,8 @@ pub fn wrap_request_v2(
 
                         if !already_has_global {
                             let formatted = format!("{}\n\n", prompt_content);
-                            if 1 <= parts_array.len() {
-                                parts_array.insert(1, json!({"text": formatted}));
+                            if insert_offset <= parts_array.len() {
+                                parts_array.insert(insert_offset, json!({"text": formatted}));
                             } else {
                                 parts_array.push(json!({"text": formatted}));
                             }
@@ -794,16 +783,21 @@ pub fn wrap_request_v2(
                 }
             }
         } else {
-            // 没有 systemInstruction，创建身份 + 可选全局提示词
-            let mut parts = vec![json!({"text": antigravity_identity})];
+            // 没有 systemInstruction，仅在 web_search 或启用全局提示词时创建
+            let mut parts = Vec::new();
+            if let Some(ws_id) = web_search_identity {
+                parts.push(json!({"text": ws_id}));
+            }
             let global_prompt_config = crate::proxy::config::get_global_system_prompt();
             if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
                 parts.push(json!({"text": format!("{}\n\n", global_prompt_config.content.trim())}));
             }
-            inner_request["systemInstruction"] = json!({
-                "role": "user",
-                "parts": parts
-            });
+            if !parts.is_empty() {
+                inner_request["systemInstruction"] = json!({
+                    "role": "user",
+                    "parts": parts
+                });
+            }
         }
     }
 
