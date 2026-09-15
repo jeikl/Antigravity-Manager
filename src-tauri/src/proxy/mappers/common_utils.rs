@@ -425,30 +425,16 @@ fn calculate_aspect_ratio_from_size(size: &str) -> &'static str {
     image_aspect_ratio_from_size(size).unwrap_or("1:1")
 }
 
-/// Inject current googleSearch tool and ensure no duplicate legacy search tools
-pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
+/// Inject current googleSearch tool and ensure no duplicate legacy search tools.
+/// Stacks googleSearch alongside existing functionDeclarations/tools.
+pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) {
     if let Some(obj) = body.as_object_mut() {
         let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
         if let Some(tools_arr) = tools_entry.as_array_mut() {
-            let has_functions = tools_arr.iter().any(|t| {
-                t.as_object()
-                    .map_or(false, |o| o.contains_key("functionDeclarations"))
-            });
-
-            // [FIX] v1internal (cloudcode-pa) does NOT support mixing googleSearch
-            // with functionDeclarations — it lacks includeServerSideToolInvocations.
-            // Skip googleSearch injection entirely when function tools are present.
-            if has_functions {
-                tracing::debug!(
-                    "Skipping googleSearch injection: functionDeclarations present (v1internal incompatible)"
-                );
-                return;
-            }
-
             // 首先清理掉已存在的 googleSearch 或 googleSearchRetrieval，以防重复产生冲突
             tools_arr.retain(|t| {
                 if let Some(o) = t.as_object() {
-                    !(o.contains_key("googleSearch") || o.contains_key("googleSearchRetrieval"))
+                    !(o.contains_key("googleSearch") || o.contains_key("google_search") || o.contains_key("googleSearchRetrieval"))
                 } else {
                     true
                 }

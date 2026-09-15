@@ -661,13 +661,20 @@ pub fn wrap_request_v2(
         config.request_type
     );
 
-    // Inject googleSearch tool if needed
+    // Inject googleSearch tool if needed (stacking alongside existing tools)
     if config.inject_google_search {
-        // [NEW] 阶段 7.3: 如果是 WebSearch 类型，注入官方特定属性 (maxResultCount: 5)
         if config.request_type == "web_search" {
             if let Some(obj) = inner_request.as_object_mut() {
                 let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
                 if let Some(tools_arr) = tools_entry.as_array_mut() {
+                    // 清理已存在的 googleSearch
+                    tools_arr.retain(|t| {
+                        if let Some(o) = t.as_object() {
+                            !(o.contains_key("googleSearch") || o.contains_key("google_search") || o.contains_key("googleSearchRetrieval"))
+                        } else {
+                            true
+                        }
+                    });
                     tools_arr.push(json!({
                         "googleSearch": {
                             "enhancedContent": {
@@ -734,12 +741,9 @@ pub fn wrap_request_v2(
             }
         }
     } else {
-        // 只在 web_search 时注入搜索身份；普通对话不注入官方 Antigravity 身份，保持客户端 system prompt 透传。
-        let web_search_identity = if config.request_type == "web_search" {
-            Some("You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.")
-        } else {
-            None
-        };
+        // [FIX] 彻底移除 web_search 等任何预置搜索 Bot 提示词注入，保持客户端原始 prompt 完全纯净透传。
+        // 仅在配置了用户自定义全局系统提示词时进行追加注入。
+        let global_prompt_config = crate::proxy::config::get_global_system_prompt();
 
         // 检查是否已有 systemInstruction
         if let Some(system_instruction) = inner_request.get_mut("systemInstruction") {
@@ -752,14 +756,7 @@ pub fn wrap_request_v2(
 
             if let Some(parts) = system_instruction.get_mut("parts") {
                 if let Some(parts_array) = parts.as_array_mut() {
-                    let mut insert_offset = 0;
-                    if let Some(ws_id) = web_search_identity {
-                        parts_array.insert(0, json!({"text": ws_id}));
-                        insert_offset += 1;
-                    }
-
                     // 注入全局系统提示词（去重 + 换行隔离，不夹官方身份）
-                    let global_prompt_config = crate::proxy::config::get_global_system_prompt();
                     if global_prompt_config.enabled
                         && !global_prompt_config.content.trim().is_empty()
                     {
@@ -773,29 +770,17 @@ pub fn wrap_request_v2(
 
                         if !already_has_global {
                             let formatted = format!("{}\n\n", prompt_content);
-                            if insert_offset <= parts_array.len() {
-                                parts_array.insert(insert_offset, json!({"text": formatted}));
-                            } else {
-                                parts_array.push(json!({"text": formatted}));
-                            }
+                            parts_array.push(json!({"text": formatted}));
                         }
                     }
                 }
             }
         } else {
-            // 没有 systemInstruction，仅在 web_search 或启用全局提示词时创建
-            let mut parts = Vec::new();
-            if let Some(ws_id) = web_search_identity {
-                parts.push(json!({"text": ws_id}));
-            }
-            let global_prompt_config = crate::proxy::config::get_global_system_prompt();
+            // 没有 systemInstruction，仅在启用全局提示词时创建
             if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-                parts.push(json!({"text": format!("{}\n\n", global_prompt_config.content.trim())}));
-            }
-            if !parts.is_empty() {
                 inner_request["systemInstruction"] = json!({
                     "role": "user",
-                    "parts": parts
+                    "parts": [{"text": format!("{}\n\n", global_prompt_config.content.trim())}]
                 });
             }
         }
@@ -909,9 +894,12 @@ pub fn wrap_request_v2(
     if let Some(tools) = inner_request.get("tools") {
         reordered_inner["tools"] = tools.clone();
     }
-    // 3. toolConfig (稳定，与 tools 共生)
+    // 3. toolConfig & tool_config (稳定，与 tools 共生)
     if let Some(tc) = inner_request.get("toolConfig") {
         reordered_inner["toolConfig"] = tc.clone();
+    }
+    if let Some(tc_snake) = inner_request.get("tool_config") {
+        reordered_inner["tool_config"] = tc_snake.clone();
     }
     // 4. generationConfig (稳定)
     if let Some(gc) = inner_request.get("generationConfig") {
@@ -1786,8 +1774,8 @@ mod tests {
 
         assert!(has_functions, "Should contain functionDeclarations");
         assert!(
-            !has_google_search,
-            "Should NOT contain googleSearch due to functionDeclarations presence (v1internal limit)"
+            has_google_search,
+            "Should contain googleSearch stacked alongside functionDeclarations"
         );
     }
 

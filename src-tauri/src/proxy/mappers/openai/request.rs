@@ -1310,11 +1310,7 @@ pub fn transform_openai_request_with_session(
         });
     }
 
-    let fallback_identity = if config.request_type == "web_search" {
-        Some("You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.")
-    } else {
-        None
-    };
+    let fallback_identity: Option<&str> = None;
 
     // Gemini-style section tags, with Codex prompt text preserved.
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
@@ -1349,6 +1345,26 @@ pub fn transform_openai_request_with_session(
             &mut inner_request,
             Some(mapped_model),
         );
+        if let Some(tool_config) = inner_request.get_mut("toolConfig") {
+            if let Some(obj) = tool_config.as_object_mut() {
+                obj.insert("includeServerSideToolInvocations".to_string(), json!(true));
+            }
+        } else {
+            inner_request["toolConfig"] = json!({
+                "functionCallingConfig": { "mode": "VALIDATED" },
+                "includeServerSideToolInvocations": true
+            });
+        }
+        if let Some(tool_config_snake) = inner_request.get_mut("tool_config") {
+            if let Some(obj) = tool_config_snake.as_object_mut() {
+                obj.insert("include_server_side_tool_invocations".to_string(), json!(true));
+            }
+        } else {
+            inner_request["tool_config"] = json!({
+                "function_calling_config": { "mode": "VALIDATED" },
+                "include_server_side_tool_invocations": true
+            });
+        }
     }
 
     if let Some(image_config) = config.image_config {
@@ -1394,9 +1410,12 @@ pub fn transform_openai_request_with_session(
     if let Some(tools) = inner_request.get("tools") {
         reordered_request["tools"] = tools.clone();
     }
-    // 3. toolConfig (稳定，与 tools 同生)
+    // 3. toolConfig & tool_config (稳定，与 tools 同生)
     if let Some(tc) = inner_request.get("toolConfig") {
         reordered_request["toolConfig"] = tc.clone();
+    }
+    if let Some(tc_snake) = inner_request.get("tool_config") {
+        reordered_request["tool_config"] = tc_snake.clone();
     }
     // 4. generationConfig (稳定，sanitize 后一致)
     if let Some(gc) = inner_request.get("generationConfig") {

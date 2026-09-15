@@ -195,9 +195,7 @@ fn split_identity_and_communication(text: &str) -> (String, Option<String>) {
 }
 
 fn contains_identity(text: &str) -> bool {
-    text.contains("You are Codex")
-        || text.contains("You are Antigravity")
-        || text.contains("You are a search engine bot")
+    text.contains("You are Codex") || text.contains("You are Antigravity")
 }
 
 fn looks_like_customization(text: &str) -> bool {
