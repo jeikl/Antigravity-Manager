@@ -12,10 +12,11 @@
 //! - client_session_id prefers `X-Session-Id` / body `session_id`
 
 use axum::http::HeaderMap;
+use dashmap::DashMap;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_SIGNATURE_LENGTH: usize = 50;
@@ -81,7 +82,7 @@ pub struct ThinkingRecord {
 
 #[derive(Debug)]
 struct SessionEntry {
-    turns: Vec<ThinkingRecord>,
+    turns: Vec<Arc<ThinkingRecord>>,
     last_access: Instant,
     bytes: usize,
 }
@@ -97,19 +98,40 @@ impl SessionEntry {
 }
 
 pub struct ThinkingStore {
-    sessions: Mutex<HashMap<String, SessionEntry>>,
+    sessions: DashMap<String, SessionEntry>,
 }
 
 impl ThinkingStore {
     fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: DashMap::new(),
         }
     }
 
     pub fn global() -> &'static ThinkingStore {
         static INSTANCE: OnceLock<ThinkingStore> = OnceLock::new();
         INSTANCE.get_or_init(ThinkingStore::new)
+    }
+
+    fn maybe_evict(&self, keep_key: &str) {
+        if self.sessions.len() <= MAX_SESSIONS {
+            return;
+        }
+        self.sessions
+            .retain(|_, e| e.last_access.elapsed() < idle_ttl());
+        if self.sessions.len() <= MAX_SESSIONS {
+            return;
+        }
+        if let Some(oldest_key) = self
+            .sessions
+            .iter()
+            .min_by_key(|e| e.last_access)
+            .map(|e| e.key().clone())
+        {
+            if oldest_key != keep_key {
+                self.sessions.remove(&oldest_key);
+            }
+        }
     }
 
     pub fn record(&self, store_key: &str, rec: ThinkingRecord) {
@@ -120,72 +142,76 @@ impl ThinkingStore {
             return;
         }
 
-        // 1. 持久化到 SQLite L2 数据库 (支持代理重启、跨轮重试与崩溃恢复)
-        let _ = crate::modules::proxy_db::save_thinking_record(
-            store_key,
-            &rec.fingerprint,
-            &rec.thought,
-            rec.signature.as_deref(),
-            &rec.tool_ids,
-            &rec.tool_names,
-            &rec.visible,
-        );
-
-        // 2. 写入内存 L1 缓存
         let rec_bytes = rec.thought.len()
             + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
             + rec.visible.len();
 
-        let Ok(mut map) = self.sessions.lock() else {
-            return;
-        };
-        evict_idle_locked(&mut map);
+        self.maybe_evict(store_key);
 
-        let entry = map
-            .entry(store_key.to_string())
-            .or_insert_with(SessionEntry::new);
-        entry.last_access = Instant::now();
+        let persist = {
+            let mut entry = self
+                .sessions
+                .entry(store_key.to_string())
+                .or_insert_with(SessionEntry::new);
+            entry.last_access = Instant::now();
 
-        if let Some(last) = entry.turns.last_mut() {
-            if last.fingerprint == rec.fingerprint {
-                if rec.thought.len() >= last.thought.len()
-                    || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                        > last.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                {
-                    entry.bytes = entry.bytes.saturating_sub(last.thought.len() + last.visible.len());
-                    *last = rec;
+            let merge_last = entry
+                .turns
+                .last()
+                .is_some_and(|last| last.fingerprint == rec.fingerprint);
+
+            if merge_last {
+                let (stronger, old_text_bytes) = {
+                    let last = entry.turns.last().expect("merge_last");
+                    (
+                        rec.thought.len() >= last.thought.len()
+                            || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                                > last.signature.as_ref().map(|s| s.len()).unwrap_or(0),
+                        last.thought.len() + last.visible.len(),
+                    )
+                };
+                if stronger {
+                    entry.bytes = entry.bytes.saturating_sub(old_text_bytes);
+                    {
+                        let last_arc = entry.turns.last_mut().expect("merge_last");
+                        *Arc::make_mut(last_arc) = rec;
+                    }
                     entry.bytes = entry.bytes.saturating_add(rec_bytes);
+                    entry.turns.last().cloned()
+                } else {
+                    None
                 }
-                return;
-            }
-        }
-
-        entry.turns.push(rec);
-        entry.bytes = entry.bytes.saturating_add(rec_bytes);
-
-        while entry.turns.len() > MAX_TURNS_PER_SESSION || entry.bytes > MAX_BYTES_PER_SESSION {
-            if let Some(old) = entry.turns.first() {
-                let old_bytes = old.thought.len()
-                    + old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                    + old.visible.len();
-                entry.bytes = entry.bytes.saturating_sub(old_bytes);
-            }
-            if entry.turns.is_empty() {
-                break;
-            }
-            entry.turns.remove(0);
-        }
-
-        if map.len() > MAX_SESSIONS {
-            if let Some(oldest_key) = map
-                .iter()
-                .min_by_key(|(_, v)| v.last_access)
-                .map(|(k, _)| k.clone())
-            {
-                if oldest_key != store_key {
-                    map.remove(&oldest_key);
+            } else {
+                entry.turns.push(Arc::new(rec));
+                entry.bytes = entry.bytes.saturating_add(rec_bytes);
+                while entry.turns.len() > MAX_TURNS_PER_SESSION
+                    || entry.bytes > MAX_BYTES_PER_SESSION
+                {
+                    if let Some(old) = entry.turns.first() {
+                        let old_bytes = old.thought.len()
+                            + old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                            + old.visible.len();
+                        entry.bytes = entry.bytes.saturating_sub(old_bytes);
+                    }
+                    if entry.turns.is_empty() {
+                        break;
+                    }
+                    entry.turns.remove(0);
                 }
+                entry.turns.last().cloned()
             }
+        };
+
+        if let Some(saved) = persist {
+            let _ = crate::modules::proxy_db::save_thinking_record(
+                store_key,
+                &saved.fingerprint,
+                &saved.thought,
+                saved.signature.as_deref(),
+                &saved.tool_ids,
+                &saved.tool_names,
+                &saved.visible,
+            );
         }
     }
 
@@ -194,12 +220,10 @@ impl ThinkingStore {
         if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
             return;
         }
-        let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
-        if let Ok(mut map) = self.sessions.lock() {
-            if let Some(entry) = map.get_mut(store_key) {
-                entry.last_access = Instant::now();
-            }
+        if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            entry.last_access = Instant::now();
         }
+        let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
     }
 
     pub fn restore_gemini_contents(&self, store_key: &str, contents: &mut Vec<Value>) -> usize {
@@ -211,43 +235,49 @@ impl ThinkingStore {
         }
 
         let records = {
-            let Ok(mut map) = self.sessions.lock() else {
-                return 0;
-            };
-
-            // L1 内存检查；若内存为空（如代理刚重启过），自动从 SQLite L2 恢复历史轮次
-            if !map.contains_key(store_key) || map.get(store_key).map(|e| e.turns.is_empty()).unwrap_or(true) {
-                if let Ok(persisted) = crate::modules::proxy_db::load_thinking_records(store_key) {
-                    if !persisted.is_empty() {
-                        let entry = map.entry(store_key.to_string()).or_insert_with(SessionEntry::new);
-                        for p in persisted {
-                            let bytes = p.thought.len()
-                                + p.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                                + p.visible.len();
-                            entry.bytes += bytes;
-                            entry.turns.push(ThinkingRecord {
-                                fingerprint: p.fingerprint,
-                                thought: p.thought,
-                                signature: p.signature,
-                                tool_ids: p.tool_ids,
-                                tool_names: p.tool_names,
-                                visible: p.visible,
-                            });
-                        }
-                        tracing::info!(
-                            "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
-                            entry.turns.len(),
-                            store_key
-                        );
-                    }
+            let cached = self.sessions.get(store_key).and_then(|e| {
+                if e.turns.is_empty() {
+                    None
+                } else {
+                    Some(e.turns.clone())
                 }
+            });
+            if let Some(turns) = cached {
+                if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                    entry.last_access = Instant::now();
+                }
+                turns
+            } else {
+                let persisted = crate::modules::proxy_db::load_thinking_records(store_key)
+                    .unwrap_or_default();
+                let mut entry = self
+                    .sessions
+                    .entry(store_key.to_string())
+                    .or_insert_with(SessionEntry::new);
+                if entry.turns.is_empty() && !persisted.is_empty() {
+                    for p in persisted {
+                        let bytes = p.thought.len()
+                            + p.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+                            + p.visible.len();
+                        entry.bytes += bytes;
+                        entry.turns.push(Arc::new(ThinkingRecord {
+                            fingerprint: p.fingerprint,
+                            thought: p.thought,
+                            signature: p.signature,
+                            tool_ids: p.tool_ids,
+                            tool_names: p.tool_names,
+                            visible: p.visible,
+                        }));
+                    }
+                    tracing::info!(
+                        "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
+                        entry.turns.len(),
+                        store_key
+                    );
+                }
+                entry.last_access = Instant::now();
+                entry.turns.clone()
             }
-
-            let Some(entry) = map.get_mut(store_key) else {
-                return 0;
-            };
-            entry.last_access = Instant::now();
-            entry.turns.clone()
         };
         if records.is_empty() {
             return 0;
@@ -263,6 +293,7 @@ impl ThinkingStore {
             existing_thought: String,
             fp: String,
             matched_record_idx: Option<usize>,
+            already_complete: bool,
         }
 
         let mut model_turns: Vec<ModelTurnMeta> = Vec::new();
@@ -278,6 +309,7 @@ impl ThinkingStore {
                 continue;
             };
             let (visible, tool_ids, tool_names, existing_thought) = inspect_parts(parts);
+            let already_complete = !turn_needs_restore(parts, &existing_thought);
             let fp = fingerprint(&visible, &tool_ids, &tool_names);
             model_turns.push(ModelTurnMeta {
                 content_idx: c_idx,
@@ -287,6 +319,7 @@ impl ThinkingStore {
                 existing_thought,
                 fp,
                 matched_record_idx: None,
+                already_complete,
             });
         }
 
@@ -295,39 +328,28 @@ impl ThinkingStore {
         }
 
         let mut used = vec![false; records.len()];
-
-        // Phase 1: 工具调用 ID 精准锚定（最高优先级：tool_ids 具有全局唯一性）
-        for turn in model_turns.iter_mut() {
-            if !turn.tool_ids.is_empty() {
-                for (rec_idx, rec) in records.iter().enumerate() {
-                    if used[rec_idx] {
-                        continue;
-                    }
-                    if rec.tool_ids.iter().any(|id| turn.tool_ids.contains(id)) {
-                        turn.matched_record_idx = Some(rec_idx);
-                        used[rec_idx] = true;
-                        break;
-                    }
-                }
+        let mut by_tool: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_fp: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (rec_idx, rec) in records.iter().enumerate() {
+            for id in &rec.tool_ids {
+                by_tool.entry(id.as_str()).or_default().push(rec_idx);
             }
+            by_fp.entry(rec.fingerprint.as_str()).or_default().push(rec_idx);
         }
 
-        // Phase 2: 完整指纹匹配（硬性隔离：工具轮次与纯文本轮次严禁混用）
-        for turn in model_turns.iter_mut() {
-            if turn.matched_record_idx.is_some() {
+        // 从尾部往回匹配：最新 model 轮次优先吃最新记录，避免早期短回复抢走后轮思考。
+        // JSON 注入位置仍是该轮 parts 头部（Gemini 要求 thought 在 functionCall 之前）。
+
+        // Phase 1: 工具调用 ID 精准锚定（最高优先级：tool_ids 具有全局唯一性）
+        for turn in model_turns.iter_mut().rev() {
+            if turn.already_complete || turn.tool_ids.is_empty() {
                 continue;
             }
-            let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
-            for (rec_idx, rec) in records.iter().enumerate() {
-                if used[rec_idx] {
+            for id in &turn.tool_ids {
+                let Some(idxs) = by_tool.get(id.as_str()) else {
                     continue;
-                }
-                let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
-                // 工具状态必须一致（有工具的只能匹配有工具的，纯文本只能匹配纯文本）
-                if rec_has_tools != turn_has_tools {
-                    continue;
-                }
-                if rec.fingerprint == turn.fp {
+                };
+                if let Some(&rec_idx) = idxs.iter().rev().find(|&&i| !used[i]) {
                     turn.matched_record_idx = Some(rec_idx);
                     used[rec_idx] = true;
                     break;
@@ -335,15 +357,37 @@ impl ThinkingStore {
             }
         }
 
+        // Phase 2: 完整指纹匹配（硬性隔离：工具轮次与纯文本轮次严禁混用）
+        for turn in model_turns.iter_mut().rev() {
+            if turn.already_complete || turn.matched_record_idx.is_some() {
+                continue;
+            }
+            let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
+            let Some(idxs) = by_fp.get(turn.fp.as_str()) else {
+                continue;
+            };
+            if let Some(&rec_idx) = idxs.iter().rev().find(|&&i| {
+                if used[i] {
+                    return false;
+                }
+                let rec_has_tools =
+                    !records[i].tool_ids.is_empty() || !records[i].tool_names.is_empty();
+                rec_has_tools == turn_has_tools
+            }) {
+                turn.matched_record_idx = Some(rec_idx);
+                used[rec_idx] = true;
+            }
+        }
+
         // Phase 3: 纯文本前缀 / 正文相似匹配（仅限纯文本轮次）
-        for turn in model_turns.iter_mut() {
-            if turn.matched_record_idx.is_some() {
+        for turn in model_turns.iter_mut().rev() {
+            if turn.already_complete || turn.matched_record_idx.is_some() {
                 continue;
             }
             let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
             if !turn_has_tools && !turn.visible.trim().is_empty() {
                 let norm_vis: String = turn.visible.split_whitespace().collect::<Vec<_>>().join(" ");
-                for (rec_idx, rec) in records.iter().enumerate() {
+                for (rec_idx, rec) in records.iter().enumerate().rev() {
                     let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
                     if used[rec_idx] || rec_has_tools || rec.visible.trim().is_empty() {
                         continue;
@@ -361,9 +405,8 @@ impl ThinkingStore {
         // Phase 4: 尾部优先的逆向兜底匹配（对齐用户的“最新回答在尾部”思路）
         // 仅对对话中【最后一个 model 轮次】进行保底匹配，绝不污染历史早期轮次！
         if let Some(last_turn) = model_turns.last_mut() {
-            if last_turn.matched_record_idx.is_none() {
+            if !last_turn.already_complete && last_turn.matched_record_idx.is_none() {
                 let last_turn_has_tools = !last_turn.tool_ids.is_empty() || !last_turn.tool_names.is_empty();
-                // 从后往前找最新一条工具兼容的未使用记录
                 if let Some((last_unused_rec_idx, _)) = records
                     .iter()
                     .enumerate()
@@ -383,6 +426,9 @@ impl ThinkingStore {
 
         let mut restored = 0usize;
         for turn in model_turns {
+            if turn.already_complete {
+                continue;
+            }
             let Some(rec_idx) = turn.matched_record_idx else {
                 continue;
             };
@@ -453,16 +499,9 @@ impl ThinkingStore {
     }
 
     pub fn end_session(&self, store_key: &str) -> EndSessionResult {
-        let Ok(mut map) = self.sessions.lock() else {
-            return EndSessionResult {
-                session_id: client_id_from_store_key(store_key).to_string(),
-                deleted_turns: 0,
-                deleted_bytes: 0,
-            };
-        };
-        let removed = map.remove(store_key);
+        let removed = self.sessions.remove(store_key);
         let (deleted_turns, deleted_bytes) = removed
-            .map(|e| (e.turns.len(), e.bytes))
+            .map(|(_, e)| (e.turns.len(), e.bytes))
             .unwrap_or((0, 0));
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(store_key);
         EndSessionResult {
@@ -505,10 +544,7 @@ impl ThinkingStore {
         }
 
         let keep = {
-            let Ok(mut map) = self.sessions.lock() else {
-                return;
-            };
-            let Some(entry) = map.get_mut(store_key) else {
+            let Some(mut entry) = self.sessions.get_mut(store_key) else {
                 return;
             };
             if entry.turns.len() <= live_turn_count.saturating_add(2) {
@@ -517,7 +553,7 @@ impl ThinkingStore {
 
             let total = entry.turns.len();
             let keep_tail_start = total.saturating_sub(2);
-            let mut keep: Vec<ThinkingRecord> = Vec::new();
+            let mut keep: Vec<Arc<ThinkingRecord>> = Vec::new();
             for (i, rec) in entry.turns.iter().enumerate() {
                 let matched_tool = rec.tool_ids.iter().any(|id| live_tool_ids.contains(id));
                 let matched_fp = live_fps.contains(&rec.fingerprint);
@@ -568,17 +604,14 @@ impl ThinkingStore {
     }
 
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
-        let Ok(map) = self.sessions.lock() else {
-            return None;
-        };
-        map.get(store_key).map(|e| (e.turns.len(), e.bytes))
+        self.sessions
+            .get(store_key)
+            .map(|e| (e.turns.len(), e.bytes))
     }
 
     #[cfg(test)]
     pub fn clear(&self) {
-        if let Ok(mut map) = self.sessions.lock() {
-            map.clear();
-        }
+        self.sessions.clear();
     }
 }
 
@@ -935,24 +968,30 @@ pub fn explicit_session_id(headers: &HeaderMap, body: Option<&Value>) -> Option<
     explicit_session_id_with_query(headers, body, None)
 }
 
-const KNOWN_SESSION_HEADERS: &[&str] = &[
-    "x-session-id",
-    "x-antigravity-session-id",
+/// Product-specific `x-**-session-id` / `x-**-sessionid`. Checked before generic `x-session-id`.
+const PRODUCT_SESSION_HEADERS: &[&str] = &[
     "x-jeikcode-sessionid",
     "x-jeikcode-session-id",
     "x-atomcode-session-id",
     "x-atomcode-sessionid",
+    "x-antigravity-session-id",
+    "x-client-session-id",
+    "x-cursor-session-id",
+    "cursor-session-id",
+    "x-vscode-session-id",
+    "anthropic-session-id",
+];
+
+const GENERIC_SESSION_HEADER: &str = "x-session-id";
+
+/// Non-session-named aliases. Lowest header priority after `x-session-id`.
+const ALIAS_SESSION_HEADERS: &[&str] = &[
     "x-conversation-id",
     "conversation-id",
     "x-chat-id",
     "chat-id",
     "x-thread-id",
     "thread-id",
-    "x-client-session-id",
-    "x-cursor-session-id",
-    "cursor-session-id",
-    "x-vscode-session-id",
-    "anthropic-session-id",
 ];
 
 fn header_session_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -966,8 +1005,12 @@ fn header_session_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+fn is_generic_x_session_id(name: &str) -> bool {
+    name.eq_ignore_ascii_case(GENERIC_SESSION_HEADER)
+}
+
 /// 兼容 AtomCode / JeikCode / Cursor 等客户端自定义会话头：
-/// `x-session-id`、`x-atomcode-session-id`、`x-jeikcode-sessionid`，以及任意 `x-*-session-id` / `x-*-sessionid`。
+/// 优先 `x-*-session-id` / `x-*-sessionid`，其次通用 `x-session-id`。
 fn is_wildcard_session_header(name: &str) -> bool {
     let key = name.trim().to_ascii_lowercase().replace('_', "-");
     if key == "mcp-session-id" {
@@ -986,12 +1029,16 @@ fn is_wildcard_session_header(name: &str) -> bool {
 }
 
 fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    for name in KNOWN_SESSION_HEADERS {
+    // 1. Product-specific x-**-session-id / x-**-sessionid
+    for name in PRODUCT_SESSION_HEADERS {
         if let Some(sid) = header_session_value(headers, name) {
             return Some(sid);
         }
     }
     for (name, value) in headers.iter() {
+        if is_generic_x_session_id(name.as_str()) {
+            continue;
+        }
         if !is_wildcard_session_header(name.as_str()) {
             continue;
         }
@@ -1000,6 +1047,18 @@ fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
             if !v.is_empty() {
                 return Some(sanitize_session_id(v));
             }
+        }
+    }
+
+    // 2. Generic x-session-id
+    if let Some(sid) = header_session_value(headers, GENERIC_SESSION_HEADER) {
+        return Some(sid);
+    }
+
+    // 3. Other conversation/chat/thread aliases
+    for name in ALIAS_SESSION_HEADERS {
+        if let Some(sid) = header_session_value(headers, name) {
+            return Some(sid);
         }
     }
     None
@@ -1044,6 +1103,25 @@ pub fn is_placeholder_thought(s: &str) -> bool {
     t.is_empty()
         || PLACEHOLDER_THOUGHTS.contains(&t)
         || t.chars().all(|c| c == '.' || c == '·' || c == '…')
+}
+
+fn turn_needs_restore(parts: &[Value], existing_thought: &str) -> bool {
+    if is_placeholder_thought(existing_thought) {
+        return true;
+    }
+    let mut saw_function_call = false;
+    for part in parts {
+        if part.get("functionCall").is_some() {
+            saw_function_call = true;
+            if !part_has_signature(part) {
+                return true;
+            }
+        }
+    }
+    if saw_function_call {
+        return false;
+    }
+    !parts.iter().any(part_has_signature)
 }
 
 fn part_has_signature(part: &Value) -> bool {
@@ -1103,10 +1181,6 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
     }
     let hex = format!("{:x}", hasher.finalize());
     hex[..16].to_string()
-}
-
-fn evict_idle_locked(map: &mut HashMap<String, SessionEntry>) {
-    map.retain(|_, e| e.last_access.elapsed() < idle_ttl());
 }
 
 #[cfg(test)]
@@ -1405,6 +1479,43 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_merges_latest_chunk_but_keeps_older_same_fingerprint_turn() {
+        let store_key = "test_session_fp_hello_isolation";
+        if crate::modules::proxy_db::delete_thinking_records_for_session(store_key).is_err() {
+            return;
+        }
+
+        let sig = "sig_hello_12345678901234567890123456789012345678901234567890";
+        let fp_hello = fingerprint("你好", &[], &[]);
+        let fp_other = fingerprint("other", &["call_x".to_string()], &["bash".to_string()]);
+
+        let save = |fp: &str, thought: &str, visible: &str, ids: &[String], names: &[String]| {
+            crate::modules::proxy_db::save_thinking_record(
+                store_key, fp, thought, Some(sig), ids, names, visible,
+            )
+        };
+
+        assert!(save(&fp_hello, "thought-1", "你好", &[], &[]).is_ok());
+        assert!(save(&fp_hello, "thought-1-longer", "你好", &[], &[]).is_ok());
+        assert!(save(
+            &fp_other,
+            "thought-tool",
+            "other",
+            &["call_x".to_string()],
+            &["bash".to_string()]
+        )
+        .is_ok());
+        assert!(save(&fp_hello, "thought-3", "你好", &[], &[]).is_ok());
+
+        let rows = crate::modules::proxy_db::load_thinking_records(store_key).unwrap_or_default();
+        assert_eq!(rows.len(), 3, "older 你好 turn must not be overwritten: {rows:?}");
+        assert_eq!(rows[0].thought, "thought-1-longer");
+        assert_eq!(rows[1].thought, "thought-tool");
+        assert_eq!(rows[2].thought, "thought-3");
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(store_key);
+    }
+
+    #[test]
     fn test_explicit_session_id_and_query_extraction() {
         // 1. Query parameter extraction
         let sid = extract_session_from_query_str("model=gemini-2.5-pro&session_id=win_alpha_101&temp=0.7");
@@ -1463,6 +1574,100 @@ mod tests {
             SessionScope::from_headers(&ignored, "fallback_id").client_id,
             "fallback_id"
         );
+    }
+
+    #[test]
+    fn product_session_headers_win_over_generic_x_session_id() {
+        let mut jeik = HeaderMap::new();
+        jeik.insert("x-session-id", "generic-session".parse().unwrap());
+        jeik.insert("x-jeikcode-sessionid", "jeik-session".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&jeik, "fallback").client_id,
+            "jeik-session"
+        );
+
+        let mut atom = HeaderMap::new();
+        atom.insert("x-session-id", "generic-session".parse().unwrap());
+        atom.insert("x-atomcode-session-id", "atom-session".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&atom, "fallback").client_id,
+            "atom-session"
+        );
+
+        let mut wildcard = HeaderMap::new();
+        wildcard.insert("x-session-id", "generic-session".parse().unwrap());
+        wildcard.insert("x-windsurf-session-id", "wind-session".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&wildcard, "fallback").client_id,
+            "wind-session"
+        );
+
+        let mut only_generic = HeaderMap::new();
+        only_generic.insert("x-session-id", "generic-session".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&only_generic, "fallback").client_id,
+            "generic-session"
+        );
+    }
+
+    #[test]
+    fn tail_first_match_uses_latest_record_for_latest_incomplete_turn() {
+        let store = ThinkingStore::new();
+        let key = "t:tail-hello";
+        store.record(key, rec("think-turn1", "你好", None));
+        store.record(key, rec("think-turn2", "你好", None));
+
+        let sig = "s".repeat(60);
+        let mut contents = vec![
+            json!({
+                "role": "model",
+                "parts": [
+                    { "text": "think-turn1", "thought": true, "thoughtSignature": sig },
+                    { "text": "你好" }
+                ]
+            }),
+            json!({
+                "role": "model",
+                "parts": [{ "text": "你好" }]
+            }),
+        ];
+        let restored = store.restore_gemini_contents(key, &mut contents);
+        assert_eq!(restored, 1);
+        assert_eq!(contents[0]["parts"][0]["text"], "think-turn1");
+        assert_eq!(contents[1]["parts"][0]["thought"], true);
+        assert_eq!(
+            contents[1]["parts"][0]["text"],
+            "think-turn2",
+            "latest incomplete turn must take the latest matching record, not the first 你好"
+        );
+    }
+
+    #[test]
+    fn concurrent_sessions_do_not_mix_thinking() {
+        use std::thread;
+
+        let store = Arc::new(ThinkingStore::new());
+        let handles: Vec<_> = (0..48)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                thread::spawn(move || {
+                    let key = format!("t:conc-{i}");
+                    let thought = format!("thought-{i}");
+                    let visible = format!("hello-{i}");
+                    store.record(&key, rec(&thought, &visible, None));
+                    let mut contents = vec![json!({
+                        "role": "model",
+                        "parts": [{ "text": visible }]
+                    })];
+                    let n = store.restore_gemini_contents(&key, &mut contents);
+                    assert_eq!(n, 1);
+                    assert_eq!(contents[0]["parts"][0]["text"], thought);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("session thread panicked");
+        }
     }
 
     #[test]

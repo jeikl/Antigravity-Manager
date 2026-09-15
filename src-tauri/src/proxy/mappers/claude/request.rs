@@ -2110,17 +2110,6 @@ fn build_generation_config(
         }
     }
 
-    // [优化] 设置全局停止序列,防止模型幻觉出对话标记
-    // [FIX #2007] Opus 4.6 Thinking Alignment
-    // Successful OpenAI logs show NO stop sequences were sent for Opus 4.6 Thinking.
-    if !(model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled) {
-        config["stopSequences"] = json!(["<|user|>", "<|end_of_turn|>", "\n\nHuman:"]);
-    } else {
-        tracing::debug!(
-            "[Opus-Alignment] Skipping stopSequences for Opus 4.6 to match OpenAI protocol"
-        );
-    }
-
     config
 }
 
@@ -2254,6 +2243,24 @@ mod tests {
         assert!(system_texts.contains(&CLAUDE_CODE_CLI_IDENTITY));
         assert!(!system_texts.contains(&CLAUDE_AGENT_SDK_IDENTITY));
         assert!(system_texts.contains(&"x-anthropic-billing-header: cc_entrypoint=sdk-cli;"));
+    }
+
+    #[test]
+    fn claude_transform_does_not_inject_legacy_stop_sequences() {
+        let req: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Reply with ok"}]
+        }))
+        .expect("request should deserialize");
+
+        let body =
+            transform_claude_request_in(&req, "test-project", false, None, "test-session", None)
+                .expect("request should transform");
+        let gen_config = &body["request"]["generationConfig"];
+        assert!(
+            gen_config.get("stopSequences").is_none(),
+            "legacy stopSequences must not be injected: {gen_config}"
+        );
     }
 
     #[test]

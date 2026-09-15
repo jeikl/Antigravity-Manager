@@ -106,6 +106,43 @@ fn system_instruction_dedupe_key(text: &str) -> String {
         .join(" ")
 }
 
+/// Collect system/developer text without joining. A string content is one block;
+/// a content array contributes one block per text part.
+fn collect_system_instruction_blocks(request: &OpenAIRequest) -> Vec<String> {
+    let mut blocks = Vec::new();
+
+    if let Some(inst) = &request.instructions {
+        if !inst.trim().is_empty() {
+            blocks.push(inst.clone());
+        }
+    }
+
+    for msg in &request.messages {
+        if msg.role != "system" && msg.role != "developer" {
+            continue;
+        }
+        match &msg.content {
+            Some(OpenAIContent::String(text)) => {
+                if !text.trim().is_empty() {
+                    blocks.push(text.clone());
+                }
+            }
+            Some(OpenAIContent::Array(items)) => {
+                for item in items {
+                    if let OpenAIContentBlock::Text { text } = item {
+                        if !text.trim().is_empty() {
+                            blocks.push(text.clone());
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    blocks
+}
+
 fn is_apply_patch_tool_name(name: &str) -> bool {
     name == "apply_patch" || name == "apply_patch_v2"
 }
@@ -359,36 +396,9 @@ pub fn transform_openai_request_with_session(
         config.image_config.is_some()
     );
 
-    // 1. 提取所有 System Message 并注入补丁
-    let mut system_instructions: Vec<String> = request
-        .messages
-        .iter()
-        .filter(|msg| msg.role == "system" || msg.role == "developer")
-        .filter_map(|msg| {
-            msg.content.as_ref().map(|c| match c {
-                OpenAIContent::String(s) => s.clone(),
-                OpenAIContent::Array(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if let OpenAIContentBlock::Text { text } = b {
-                            Some(text.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            })
-        })
-        .collect();
-
-    // Codex Responses carries `instructions` separately from converted system messages.
-    // Insert it before sanitizing so cache-normalized text can be deduplicated once.
-    if let Some(inst) = &request.instructions {
-        if !inst.trim().is_empty() {
-            system_instructions.insert(0, inst.clone());
-        }
-    }
+    // 1. Extract system/developer blocks without joining. Each client string or
+    // text part becomes one Gemini systemInstruction part (Anthropic-style).
+    let mut system_instructions: Vec<String> = collect_system_instruction_blocks(request);
 
     // [CACHE:L1] 清洗 system instructions 中的动态内容（时间戳/UUID/随机ID）
     // 确保跨请求的前缀字节一致，触发 Gemini 隐式前缀缓存命中
@@ -1310,9 +1320,6 @@ pub fn transform_openai_request_with_session(
         });
     }
 
-    let fallback_identity: Option<&str> = None;
-
-    // Gemini-style section tags, with Codex prompt text preserved.
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
     let global_prompt =
         if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
@@ -1320,25 +1327,14 @@ pub fn transform_openai_request_with_session(
         } else {
             None
         };
-    let mut structured_system_instruction =
-        super::context_blocks::build_official_style_system_instruction(
-            &system_instructions,
-            fallback_identity,
-            global_prompt,
-            &config.request_type,
-            mapped_model,
-        );
-
-    // [FIX] Inject explicit tool mapping instructions for Gemini to read SKILL.md
-    structured_system_instruction =
-        crate::proxy::mappers::common_utils::enhance_gemini_skills_prompt(
-            &structured_system_instruction,
-        );
-
-    inner_request["systemInstruction"] = json!({
-        "role": "system",
-        "parts": [{ "text": structured_system_instruction }]
-    });
+    let system_parts =
+        super::context_blocks::build_system_instruction_parts(&system_instructions, global_prompt);
+    if !system_parts.is_empty() {
+        inner_request["systemInstruction"] = json!({
+            "role": "system",
+            "parts": system_parts
+        });
+    }
 
     if config.inject_google_search {
         crate::proxy::mappers::common_utils::inject_google_search_tool(
@@ -1655,13 +1651,56 @@ mod tests {
             "resp-routing-root",
             None,
         );
-        let system_instruction = body["request"]["systemInstruction"].to_string();
+        let system_instruction = body["request"].get("systemInstruction");
 
         assert_eq!(session_id, "resp-routing-root");
-        assert!(system_instruction.contains("Request type:"));
-        assert!(system_instruction.contains("Mapped model:"));
-        assert!(!system_instruction.contains("Session ID:"));
-        assert!(!system_instruction.contains("resp-routing-root"));
+        if let Some(sys) = system_instruction {
+            let sys_text = sys.to_string();
+            assert!(!sys_text.contains("Request type:"));
+            assert!(!sys_text.contains("Mapped model:"));
+            assert!(!sys_text.contains("user_information"));
+            assert!(!sys_text.contains("Session ID:"));
+            assert!(!sys_text.contains("resp-routing-root"));
+        }
+        assert!(!body["request"].to_string().contains("resp-routing-root"));
+    }
+
+    #[test]
+    fn openai_system_messages_are_forwarded_as_separate_parts() {
+        let req: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.7-flash-high",
+            "messages": [
+                {"role": "system", "content": "<environment>env</environment>"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "<workflow_and_execution_discipline>wf</workflow_and_execution_discipline>"},
+                    {"type": "text", "text": "=== AVAILABLE SKILLS ==="}
+                ]},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+
+        let (body, _, _, _) =
+            transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
+        let parts = body["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .expect("systemInstruction.parts");
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect();
+
+        assert_eq!(
+            texts,
+            vec![
+                "<environment>env</environment>",
+                "<workflow_and_execution_discipline>wf</workflow_and_execution_discipline>",
+                "=== AVAILABLE SKILLS ==="
+            ]
+        );
+        let joined = texts.join("\n");
+        assert!(!joined.contains("<user_information>"));
+        assert!(!joined.contains("Request type:"));
     }
 
     #[test]

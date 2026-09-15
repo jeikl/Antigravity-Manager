@@ -166,6 +166,12 @@ pub fn init_db() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_session ON thinking_records (session_key, created_at ASC)", []);
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_fp ON thinking_records (session_key, fingerprint)", []);
+    // Latest-turn lookup for consecutive-chunk merge: never UNIQUE(session_key, fingerprint),
+    // because two real turns in the same session can share visible text.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_latest ON thinking_records (session_key, id DESC)",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE thinking_records ADD COLUMN last_accessed INTEGER",
         [],
@@ -267,18 +273,22 @@ pub fn save_thinking_record(
     let tool_ids_json = serde_json::to_string(tool_ids).unwrap_or_else(|_| "[]".to_string());
     let tool_names_json = serde_json::to_string(tool_names).unwrap_or_else(|_| "[]".to_string());
 
-    // 检查是否已有相同 session_key 和 fingerprint 的记录
-    let existing_id: Option<i64> = conn
+    // Align with in-memory ThinkingStore: only merge consecutive chunks of the
+    // current (latest) turn. Never rewrite an older turn that happens to share
+    // a fingerprint (e.g. two "你好" replies in the same session).
+    let latest_id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM thinking_records WHERE session_key = ?1 AND fingerprint = ?2 LIMIT 1",
-            params![session_key, fingerprint],
+            "SELECT id FROM thinking_records WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+            params![session_key],
             |r| r.get(0),
         )
         .ok();
 
-    if let Some(id) = existing_id {
+    let updated = if let Some(id) = latest_id {
         conn.execute(
-            "UPDATE thinking_records SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6, last_accessed = ?6 WHERE id = ?7",
+            "UPDATE thinking_records
+             SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6, last_accessed = ?6
+             WHERE id = ?7 AND fingerprint = ?8",
             params![
                 thought,
                 signature,
@@ -287,10 +297,15 @@ pub fn save_thinking_record(
                 visible,
                 now,
                 id,
+                fingerprint,
             ],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
     } else {
+        0
+    };
+
+    if updated == 0 {
         conn.execute(
             "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
