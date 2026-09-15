@@ -426,11 +426,26 @@ fn calculate_aspect_ratio_from_size(size: &str) -> &'static str {
 }
 
 /// Inject current googleSearch tool and ensure no duplicate legacy search tools.
-/// Stacks googleSearch alongside existing functionDeclarations/tools.
+/// When client-defined function tools are present, skips googleSearch to avoid client-side empty/unknown tool dispatch errors.
 pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) {
     if let Some(obj) = body.as_object_mut() {
         let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
         if let Some(tools_arr) = tools_entry.as_array_mut() {
+            let has_functions = tools_arr.iter().any(|t| {
+                t.as_object().map_or(false, |o| {
+                    o.contains_key("functionDeclarations") || o.contains_key("function_declarations")
+                })
+            });
+
+            // [STABILITY GUARD] 如果客户端自身已经定义了函数工具 (functionDeclarations / function_declarations)，
+            // 不强行注入 googleSearch 工具。防止服务端接地调用导致客户端无法分发、空工具调用或报未知工具错误。
+            if has_functions {
+                tracing::debug!(
+                    "Skipping googleSearch injection: functionDeclarations present, avoiding client tool dispatch conflicts"
+                );
+                return;
+            }
+
             // 首先清理掉已存在的 googleSearch 或 googleSearchRetrieval，以防重复产生冲突
             tools_arr.retain(|t| {
                 if let Some(o) = t.as_object() {

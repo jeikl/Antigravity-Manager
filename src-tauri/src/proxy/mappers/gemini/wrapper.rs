@@ -667,23 +667,30 @@ pub fn wrap_request_v2(
             if let Some(obj) = inner_request.as_object_mut() {
                 let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
                 if let Some(tools_arr) = tools_entry.as_array_mut() {
-                    // 清理已存在的 googleSearch
-                    tools_arr.retain(|t| {
-                        if let Some(o) = t.as_object() {
-                            !(o.contains_key("googleSearch") || o.contains_key("google_search") || o.contains_key("googleSearchRetrieval"))
-                        } else {
-                            true
-                        }
+                    let has_functions = tools_arr.iter().any(|t| {
+                        t.as_object().map_or(false, |o| {
+                            o.contains_key("functionDeclarations") || o.contains_key("function_declarations")
+                        })
                     });
-                    tools_arr.push(json!({
-                        "googleSearch": {
-                            "enhancedContent": {
-                                "imageSearch": {
-                                    "maxResultCount": 5
+                    if !has_functions {
+                        // 清理已存在的 googleSearch
+                        tools_arr.retain(|t| {
+                            if let Some(o) = t.as_object() {
+                                !(o.contains_key("googleSearch") || o.contains_key("google_search") || o.contains_key("googleSearchRetrieval"))
+                            } else {
+                                true
+                            }
+                        });
+                        tools_arr.push(json!({
+                            "googleSearch": {
+                                "enhancedContent": {
+                                    "imageSearch": {
+                                        "maxResultCount": 5
+                                    }
                                 }
                             }
-                        }
-                    }));
+                        }));
+                    }
                 }
             }
         } else {
@@ -1774,8 +1781,8 @@ mod tests {
 
         assert!(has_functions, "Should contain functionDeclarations");
         assert!(
-            has_google_search,
-            "Should contain googleSearch stacked alongside functionDeclarations"
+            !has_google_search,
+            "Should NOT contain googleSearch due to functionDeclarations presence (preventing client tool dispatch conflicts)"
         );
     }
 
