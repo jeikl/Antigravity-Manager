@@ -176,39 +176,10 @@ function extractConcisePayload(
         return rawStr;
     }
 
-    // 简化工具声明 (保留 name, description，省略超长 parameters/input_schema)
+    // 工具声明 (完整保留 Schema，方便开发者查看工具拼接与入参定义)
     const simplifyTools = (tools: any): any => {
         if (!Array.isArray(tools)) return undefined;
-        return tools.map((tool: any) => {
-            if (!tool || typeof tool !== 'object') return tool;
-            // OpenAI 格式: { type: "function", function: { name, description, parameters } }
-            if (tool.function && typeof tool.function === 'object') {
-                return {
-                    type: tool.type || 'function',
-                    function: {
-                        name: tool.function.name,
-                        ...(tool.function.description ? { description: tool.function.description } : {}),
-                        parameters: '[omitted]'
-                    }
-                };
-            }
-            // Gemini 格式: { functionDeclarations: [...] }
-            if (Array.isArray(tool.functionDeclarations)) {
-                return {
-                    functionDeclarations: tool.functionDeclarations.map((decl: any) => ({
-                        name: decl.name,
-                        ...(decl.description ? { description: decl.description } : {}),
-                        parameters: '[omitted]'
-                    }))
-                };
-            }
-            // Claude 格式: { name, description, input_schema }
-            const res: any = {};
-            if (tool.name) res.name = tool.name;
-            if (tool.description) res.description = tool.description;
-            if (tool.input_schema) res.input_schema = '[omitted]';
-            return Object.keys(res).length > 0 ? res : tool;
-        });
+        return tools;
     };
 
     // 简化工具调用 (保留 name, id, arguments / args)
@@ -618,7 +589,7 @@ function extractConcisePayload(
 }
 
 // ==========================================
-// 单栏报文展示卡片（含独立搜索、高亮、跳转与复制）
+// 单栏报文展示卡片（含语法高亮、独立搜索、跳转与复制）
 // ==========================================
 interface PayloadViewerCardProps {
     cardId: string;
@@ -633,6 +604,110 @@ interface PayloadViewerCardProps {
     onCopy: (content: string) => Promise<void>;
     isCopied: boolean;
 }
+
+const renderHighlightedJson = (
+    content: string,
+    searchTerm: string,
+    currentMatchIndex: number,
+    cardId: string
+) => {
+    if (!content) return null;
+
+    // Tokenize JSON: keys, strings, booleans, null, numbers, punctuation, and whitespace
+    const tokenRegex = /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}[\],:]|[^\s"{}[\],:]+|\s+)/g;
+
+    const trimmedSearch = searchTerm.trim();
+    let searchRegex: RegExp | null = null;
+    if (trimmedSearch) {
+        try {
+            const escaped = trimmedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            searchRegex = new RegExp(`(${escaped})`, 'gi');
+        } catch {
+            searchRegex = null;
+        }
+    }
+
+    let globalMatchCounter = -1;
+
+    const renderTextWithSearch = (text: string, defaultClass: string, keyPrefix: string) => {
+        if (!searchRegex) {
+            return <span key={keyPrefix} className={defaultClass}>{text}</span>;
+        }
+
+        const parts = text.split(searchRegex);
+        return parts.map((part, pIdx) => {
+            if (!part) return null;
+            if (part.toLowerCase() === trimmedSearch.toLowerCase()) {
+                globalMatchCounter++;
+                const isActive = globalMatchCounter === currentMatchIndex;
+                return (
+                    <mark
+                        key={`${keyPrefix}-m-${pIdx}`}
+                        id={isActive ? `active-match-${cardId}` : undefined}
+                        className={`rounded-sm px-0.5 font-bold transition-all duration-150 ${
+                            isActive
+                                ? 'bg-amber-400 text-slate-950 ring-2 ring-amber-500 shadow-sm'
+                                : 'bg-amber-500/35 text-amber-900 dark:text-amber-100'
+                        }`}
+                    >
+                        {part}
+                    </mark>
+                );
+            }
+            return (
+                <span key={`${keyPrefix}-t-${pIdx}`} className={defaultClass}>
+                    {part}
+                </span>
+            );
+        });
+    };
+
+    const tokens: React.ReactNode[] = [];
+    let match;
+    let tokenIdx = 0;
+
+    while ((match = tokenRegex.exec(content)) !== null) {
+        const token = match[0];
+        const keyPrefix = `tok-${tokenIdx++}`;
+
+        if (/^"(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"\s*:$/.test(token)) {
+            // JSON Property Key (e.g. "model": or "messages":)
+            const colonIndex = token.lastIndexOf(':');
+            const keyStr = token.slice(0, colonIndex);
+            const colonStr = token.slice(colonIndex);
+            tokens.push(
+                <React.Fragment key={keyPrefix}>
+                    {renderTextWithSearch(keyStr, 'text-sky-600 dark:text-sky-300 font-medium', `${keyPrefix}-k`)}
+                    {renderTextWithSearch(colonStr, 'text-slate-400 dark:text-slate-500', `${keyPrefix}-c`)}
+                </React.Fragment>
+            );
+        } else if (/^"(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"$/.test(token)) {
+            // String Literal value
+            tokens.push(renderTextWithSearch(token, 'text-emerald-700 dark:text-emerald-300', keyPrefix));
+        } else if (/^(true|false)$/.test(token)) {
+            // Boolean value
+            tokens.push(renderTextWithSearch(token, 'text-purple-600 dark:text-purple-400 font-semibold', keyPrefix));
+        } else if (token === 'null') {
+            // Null value
+            tokens.push(renderTextWithSearch(token, 'text-rose-500 dark:text-rose-400 font-semibold italic', keyPrefix));
+        } else if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(token)) {
+            // Number value
+            tokens.push(renderTextWithSearch(token, 'text-amber-600 dark:text-amber-300 font-semibold', keyPrefix));
+        } else if (/^[{}[\],:]$/.test(token)) {
+            // Structural punctuation
+            tokens.push(renderTextWithSearch(token, 'text-slate-400 dark:text-slate-500', keyPrefix));
+        } else {
+            // Whitespace or plain fallback text
+            tokens.push(renderTextWithSearch(token, 'text-slate-700 dark:text-slate-300', keyPrefix));
+        }
+    }
+
+    return (
+        <pre className="text-[11px] font-mono whitespace-pre-wrap select-text leading-relaxed m-0 p-0 font-normal">
+            {tokens}
+        </pre>
+    );
+};
 
 const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
     cardId,
@@ -708,57 +783,13 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
     const renderBody = () => {
         if (!formattedContent) {
             return (
-                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-gray-400 select-none">
+                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-400 dark:text-slate-500 select-none">
                     <span className="text-xs italic">{emptyPlaceholder}</span>
                 </div>
             );
         }
 
-        if (!searchTerm.trim()) {
-            return (
-                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
-                    {formattedContent}
-                </pre>
-            );
-        }
-
-        try {
-            const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const regex = new RegExp(`(${escaped})`, 'gi');
-            const parts = formattedContent.split(regex);
-            let matchCounter = -1;
-
-            return (
-                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
-                    {parts.map((part, idx) => {
-                        if (part.toLowerCase() === searchTerm.toLowerCase()) {
-                            matchCounter++;
-                            const isActive = matchCounter === currentMatchIndex;
-                            return (
-                                <mark
-                                    key={idx}
-                                    id={isActive ? `active-match-${cardId}` : undefined}
-                                    className={`rounded px-0.5 transition-all duration-150 ${
-                                        isActive
-                                            ? 'bg-amber-400 dark:bg-amber-500 text-black font-extrabold ring-2 ring-amber-600 shadow-sm'
-                                            : 'bg-yellow-200 dark:bg-yellow-700/80 text-gray-900 dark:text-gray-100 font-semibold'
-                                    }`}
-                                >
-                                    {part}
-                                </mark>
-                            );
-                        }
-                        return <span key={idx}>{part}</span>;
-                    })}
-                </pre>
-            );
-        } catch {
-            return (
-                <pre className="text-[11px] font-mono whitespace-pre-wrap text-gray-800 dark:text-gray-200 select-text leading-relaxed">
-                    {formattedContent}
-                </pre>
-            );
-        }
+        return renderHighlightedJson(formattedContent, searchTerm, currentMatchIndex, cardId);
     };
 
     const searchInputRef = useRef<HTMLInputElement>(null);
@@ -778,7 +809,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
 
     return (
         <div
-            className="payload-viewer-card flex flex-col h-full bg-gray-50/70 dark:bg-base-200/50 rounded-xl border border-gray-200 dark:border-base-300 overflow-hidden shadow-sm outline-none"
+            className="payload-viewer-card flex flex-col h-full bg-slate-50/50 dark:bg-[#0d1117] rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm outline-none"
             tabIndex={-1}
             onKeyDown={(e) => {
                 if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
@@ -790,12 +821,12 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
             }}
         >
             {/* Card Header */}
-            <div className="px-3 py-2 border-b border-gray-200 dark:border-base-300 bg-white dark:bg-base-200 flex items-center justify-between gap-2 shrink-0">
+            <div className="px-3.5 py-2 border-b border-slate-200 dark:border-slate-800/80 bg-white/95 dark:bg-[#161b22] flex items-center justify-between gap-2 shrink-0">
                 <div className="flex items-center gap-2 min-w-0">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider border shrink-0 ${badgeStyle}`}>
                         {badge}
                     </span>
-                    <h3 className="text-xs font-bold text-gray-800 dark:text-gray-200 truncate" title={title}>
+                    <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate" title={title}>
                         {title}
                     </h3>
                 </div>
@@ -805,19 +836,19 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                         type="button"
                         onClick={() => onCopy(copyPayload)}
                         disabled={!formattedContent && !prettyHeaders}
-                        className="btn btn-ghost btn-xs gap-1 h-7 px-2 text-gray-600 dark:text-gray-300"
+                        className="btn btn-ghost btn-xs gap-1 h-7 px-2 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
                         title={isCopied ? t('proxy.config.btn_copied', '已复制') : t('proxy.config.btn_copy', '复制')}
                     >
-                        {isCopied ? <CheckCircle size={12} className="text-green-500" /> : <Copy size={12} />}
+                        {isCopied ? <CheckCircle size={12} className="text-emerald-500" /> : <Copy size={12} />}
                         <span className="text-[10px] font-medium">{isCopied ? t('proxy.config.btn_copied', '已复制') : t('proxy.config.btn_copy', '复制')}</span>
                     </button>
                 </div>
             </div>
 
             {/* In-block Search Bar */}
-            <div className="px-2.5 py-1.5 bg-gray-100/70 dark:bg-base-300/40 border-b border-gray-200 dark:border-base-300 flex items-center gap-1.5 shrink-0">
+            <div className="px-2.5 py-1.5 bg-slate-100/70 dark:bg-[#161b22]/80 border-b border-slate-200 dark:border-slate-800/80 flex items-center gap-1.5 shrink-0">
                 <div className="relative flex-1 min-w-0 flex items-center">
-                    <Search size={12} className="absolute left-2 text-gray-400 pointer-events-none" />
+                    <Search size={12} className="absolute left-2 text-slate-400 pointer-events-none" />
                     <input
                         ref={searchInputRef}
                         type="text"
@@ -838,13 +869,13 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                                 searchInputRef.current?.select();
                             }
                         }}
-                        className="input input-xs input-bordered w-full pl-6 pr-6 text-[11px] h-7 bg-white dark:bg-base-200 rounded-md"
+                        className="input input-xs input-bordered w-full pl-6 pr-6 text-[11px] h-7 bg-white dark:bg-[#0d1117] border-slate-200 dark:border-slate-700/80 text-slate-800 dark:text-slate-200 rounded-md focus:border-blue-500"
                     />
                     {searchTerm && (
                         <button
                             type="button"
                             onClick={() => setSearchTerm('')}
-                            className="absolute right-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-0.5"
+                            className="absolute right-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-0.5"
                             title="清除搜索"
                         >
                             <X size={12} />
@@ -854,8 +885,8 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
 
                 {/* Match Counter and Next/Prev Navigation */}
                 {searchTerm.trim() && (
-                    <div className="flex items-center gap-1 shrink-0 bg-white dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-md px-1.5 py-0.5 h-7">
-                        <span className="text-[10px] font-mono font-semibold text-gray-600 dark:text-gray-300">
+                    <div className="flex items-center gap-1 shrink-0 bg-white dark:bg-[#0d1117] border border-slate-200 dark:border-slate-700/80 rounded-md px-1.5 py-0.5 h-7">
+                        <span className="text-[10px] font-mono font-semibold text-slate-600 dark:text-slate-300">
                             {matchesCount > 0 ? `${currentMatchIndex + 1}/${matchesCount}` : '0 匹配'}
                         </span>
                         <div className="flex items-center">
@@ -863,7 +894,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                                 type="button"
                                 onClick={handlePrev}
                                 disabled={matchesCount <= 1}
-                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
+                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-slate-500 dark:text-slate-400 disabled:opacity-30"
                                 title="上一处 (Shift+Enter)"
                             >
                                 <ChevronUp size={12} />
@@ -872,7 +903,7 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                                 type="button"
                                 onClick={handleNext}
                                 disabled={matchesCount <= 1}
-                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-gray-500 disabled:opacity-30"
+                                className="btn btn-ghost btn-xs p-0.5 h-5 min-h-0 text-slate-500 dark:text-slate-400 disabled:opacity-30"
                                 title="下一处 (Enter)"
                             >
                                 <ChevronDown size={12} />
@@ -886,16 +917,19 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
             <div
                 ref={containerRef}
                 tabIndex={0}
-                className="flex-1 overflow-y-auto overflow-x-auto p-3 bg-white dark:bg-base-300/60 font-mono text-[11px] outline-none focus:ring-1 focus:ring-blue-500/20"
+                className="flex-1 overflow-y-auto overflow-x-auto p-3.5 bg-slate-50/40 dark:bg-[#0d1117] font-mono text-[11px] outline-none focus:ring-1 focus:ring-blue-500/20"
             >
                 {prettyHeaders && (
-                    <div className="mb-3 pb-3 border-b border-dashed border-gray-200 dark:border-base-300">
-                        <div className="text-[10px] font-black uppercase tracking-wider text-gray-400 mb-1">
-                            {t('monitor.details.headers', 'Headers')}
+                    <div className="mb-3 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800/80 bg-slate-100/50 dark:bg-slate-900/40">
+                        <div className="px-2.5 py-1 bg-slate-200/60 dark:bg-[#161b22] border-b border-slate-200 dark:border-slate-800/80 flex items-center justify-between">
+                            <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                                {t('monitor.details.headers', 'Headers')}
+                            </span>
+                            <span className="text-[9px] font-mono text-slate-400 dark:text-slate-500">HTTP Headers</span>
                         </div>
-                        <pre className="text-[11px] font-mono whitespace-pre-wrap text-amber-800 dark:text-amber-200/90 select-text leading-relaxed">
-                            {prettyHeaders}
-                        </pre>
+                        <div className="p-2.5 font-mono text-[11px] leading-relaxed">
+                            {renderHighlightedJson(prettyHeaders, '', 0, `${cardId}-hdr`)}
+                        </div>
                     </div>
                 )}
                 {renderBody()}
@@ -1367,73 +1401,73 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             </div>
 
             {selectedLog && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-2 sm:p-3 md:p-4" onClick={() => setSelectedLog(null)}>
-                    <div className="bg-white dark:bg-base-100 rounded-2xl shadow-2xl w-full max-w-[98vw] xl:max-w-[1720px] h-[94vh] max-h-[94vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-2 sm:p-3 md:p-4" onClick={() => setSelectedLog(null)}>
+                    <div className="bg-white dark:bg-[#161b22] rounded-2xl shadow-2xl w-full max-w-[98vw] xl:max-w-[1720px] h-[94vh] max-h-[94vh] flex flex-col overflow-hidden border border-slate-200 dark:border-slate-800" onClick={e => e.stopPropagation()}>
                         {/* Modal Header */}
-                        <div className="px-4 py-2.5 border-b border-gray-200 dark:border-base-300 flex items-center justify-between bg-gray-50 dark:bg-base-200 shrink-0">
+                        <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-[#161b22] shrink-0">
                             <div className="flex items-center gap-3 min-w-0">
                                 {loadingDetail && <div className="loading loading-spinner loading-sm shrink-0"></div>}
                                 <span className={`badge badge-sm text-white border-none font-bold shrink-0 ${selectedLog.status >= 200 && selectedLog.status < 400 ? 'badge-success' : 'badge-error'}`}>{selectedLog.status}</span>
-                                <span className="font-mono font-bold text-gray-900 dark:text-base-content text-sm shrink-0">{selectedLog.method}</span>
-                                <span className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate max-w-lg hidden sm:inline" title={selectedLog.url}>{selectedLog.url}</span>
+                                <span className="font-mono font-bold text-slate-900 dark:text-slate-100 text-sm shrink-0">{selectedLog.method}</span>
+                                <span className="text-xs text-slate-500 dark:text-slate-400 font-mono truncate max-w-lg hidden sm:inline" title={selectedLog.url}>{selectedLog.url}</span>
                             </div>
-                            <button onClick={() => setSelectedLog(null)} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300" aria-label="关闭"><X size={18} /></button>
+                            <button onClick={() => setSelectedLog(null)} className="btn btn-ghost btn-sm btn-circle text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800" aria-label="关闭"><X size={18} /></button>
                         </div>
 
                         {/* Modal Content */}
-                        <div className="flex-1 min-h-0 flex flex-col p-3 sm:p-4 space-y-2.5 bg-white dark:bg-base-100 overflow-hidden">
+                        <div className="flex-1 min-h-0 flex flex-col p-3 sm:p-4 space-y-2.5 bg-slate-100/50 dark:bg-[#0a0e17] overflow-hidden">
                             {/* Metadata Section (Collapsible) */}
                             {showMetadata && (
-                                <div className="bg-gray-50/80 dark:bg-base-200/70 p-3 sm:p-3.5 rounded-xl border border-gray-200 dark:border-base-300 shadow-inner shrink-0 text-xs transition-all duration-200">
+                                <div className="bg-white dark:bg-[#161b22] p-3 sm:p-3.5 rounded-xl border border-slate-200 dark:border-slate-800/90 shadow-sm shrink-0 text-xs transition-all duration-200">
                                     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.time')}</span>
-                                            <span className="font-mono font-semibold text-gray-800 dark:text-base-content text-[11px] truncate block" title={new Date(selectedLog.timestamp).toLocaleString()}>{new Date(selectedLog.timestamp).toLocaleString()}</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.time')}</span>
+                                            <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 text-[11px] truncate block" title={new Date(selectedLog.timestamp).toLocaleString()}>{new Date(selectedLog.timestamp).toLocaleString()}</span>
                                         </div>
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.duration')}</span>
-                                            <span className="font-mono font-semibold text-gray-800 dark:text-base-content text-[11px]">{selectedLog.duration}ms</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.duration')}</span>
+                                            <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 text-[11px]">{selectedLog.duration}ms</span>
                                         </div>
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.tokens')}</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.tokens')}</span>
                                             <div className="font-mono text-[10px] flex items-center gap-1.5 mt-0.5">
                                                 {(() => {
                                                     const totalIn = (selectedLog.cached_tokens && selectedLog.cached_tokens > (selectedLog.input_tokens ?? 0))
                                                         ? (selectedLog.input_tokens ?? 0) + selectedLog.cached_tokens
                                                         : (selectedLog.input_tokens ?? 0);
                                                     return (
-                                                        <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded font-bold" title={`Total Input Tokens: ${totalIn}`}>
+                                                        <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-950/60 px-1.5 py-0.5 rounded font-bold" title={`Total Input Tokens: ${totalIn}`}>
                                                             In: {formatCompactNumber(totalIn)}
                                                         </span>
                                                     );
                                                 })()}
-                                                <span className="text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 px-1.5 py-0.5 rounded font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
+                                                <span className="text-emerald-700 dark:text-emerald-300 bg-emerald-100 dark:bg-emerald-950/60 px-1.5 py-0.5 rounded font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
                                                 {selectedLog.cached_tokens != null && selectedLog.cached_tokens > 0 && (
-                                                    <span className="text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/40 px-1.5 py-0.5 rounded font-bold">Cache: {formatCompactNumber(selectedLog.cached_tokens)}</span>
+                                                    <span className="text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-950/60 px-1.5 py-0.5 rounded font-bold">Cache: {formatCompactNumber(selectedLog.cached_tokens)}</span>
                                                 )}
                                             </div>
                                         </div>
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.protocol')}</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.protocol')}</span>
                                             <span className={`inline-block px-1.5 py-0.5 rounded font-mono font-black text-[10px] uppercase mt-0.5 ${
-                                                selectedLog.protocol === 'openai' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50' :
-                                                selectedLog.protocol === 'anthropic' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400 border border-orange-200 dark:border-orange-800/50' :
-                                                selectedLog.protocol === 'gemini' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50' :
-                                                'bg-gray-100 text-gray-700 dark:bg-gray-900/40 dark:text-gray-400'
+                                                selectedLog.protocol === 'openai' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/60' :
+                                                selectedLog.protocol === 'anthropic' ? 'bg-orange-100 text-orange-700 dark:bg-orange-950/70 dark:text-orange-300 border border-orange-200 dark:border-orange-800/60' :
+                                                selectedLog.protocol === 'gemini' ? 'bg-blue-100 text-blue-700 dark:bg-blue-950/70 dark:text-blue-300 border border-blue-200 dark:border-blue-800/60' :
+                                                'bg-slate-100 text-slate-700 dark:bg-slate-900/60 dark:text-slate-300'
                                             }`}>
                                                 {selectedLog.protocol || '-'}
                                             </span>
                                         </div>
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.model')}</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.model')}</span>
                                             <span className="font-mono font-bold text-blue-600 dark:text-blue-400 truncate block text-[11px]" title={selectedLog.model}>{selectedLog.model || '-'}</span>
                                             {selectedLog.mapped_model && selectedLog.model !== selectedLog.mapped_model && (
-                                                <span className="font-mono text-green-600 dark:text-green-400 truncate block text-[10px]" title={selectedLog.mapped_model}>➔ {selectedLog.mapped_model}</span>
+                                                <span className="font-mono text-emerald-600 dark:text-emerald-400 truncate block text-[10px]" title={selectedLog.mapped_model}>➔ {selectedLog.mapped_model}</span>
                                             )}
                                         </div>
                                         <div>
-                                            <span className="block text-gray-400 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.account_used')}</span>
-                                            <span className="font-mono text-gray-800 dark:text-base-content truncate block text-[11px]" title={selectedLog.account_email || '-'}>{selectedLog.account_email || '-'}</span>
+                                            <span className="block text-slate-400 dark:text-slate-500 uppercase font-black text-[9px] tracking-wider">{t('monitor.details.account_used')}</span>
+                                            <span className="font-mono text-slate-800 dark:text-slate-200 truncate block text-[11px]" title={selectedLog.account_email || '-'}>{selectedLog.account_email || '-'}</span>
                                         </div>
                                     </div>
                                 </div>
@@ -1442,17 +1476,17 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             {/* Mode & Toolbar Bar */}
                             <div className="flex flex-wrap items-center justify-between gap-2 px-1 shrink-0">
                                 <div className="flex items-center gap-2">
-                                    <div className="inline-flex items-center p-1 bg-gray-100 dark:bg-base-200/90 rounded-xl border border-gray-200/90 dark:border-base-300 gap-1 shadow-inner">
+                                    <div className="inline-flex items-center p-1 bg-slate-200/70 dark:bg-[#161b22] rounded-xl border border-slate-300/70 dark:border-slate-800 gap-1 shadow-inner">
                                         <button
                                             type="button"
                                             onClick={() => setPayloadViewMode('concise')}
                                             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer select-none ${
                                                 payloadViewMode === 'concise'
-                                                    ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm border border-gray-200/80 dark:border-base-300'
-                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-base-content hover:bg-black/[0.03] dark:hover:bg-white/[0.04]'
+                                                    ? 'bg-white dark:bg-[#21262d] text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
+                                                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                                             }`}
                                         >
-                                            <Sparkles size={13} className={payloadViewMode === 'concise' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
+                                            <Sparkles size={13} className={payloadViewMode === 'concise' ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400'} />
                                             <span>{t('monitor.details.concise_mode', '简要模式')}</span>
                                         </button>
                                         <button
@@ -1460,15 +1494,15 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                             onClick={() => setPayloadViewMode('full')}
                                             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer select-none ${
                                                 payloadViewMode === 'full'
-                                                    ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm border border-gray-200/80 dark:border-base-300'
-                                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-base-content hover:bg-black/[0.03] dark:hover:bg-white/[0.04]'
+                                                    ? 'bg-white dark:bg-[#21262d] text-blue-600 dark:text-blue-400 shadow-sm border border-slate-200 dark:border-slate-700'
+                                                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
                                             }`}
                                         >
-                                            <FileCode2 size={13} className={payloadViewMode === 'full' ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400'} />
+                                            <FileCode2 size={13} className={payloadViewMode === 'full' ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400'} />
                                             <span>{t('monitor.details.full_mode', '完整模式')}</span>
                                         </button>
                                     </div>
-                                    <span className="hidden sm:inline-block text-[11px] text-gray-500 dark:text-gray-400">
+                                    <span className="hidden sm:inline-block text-[11px] text-slate-500 dark:text-slate-400">
                                         {payloadViewMode === 'concise'
                                             ? t('monitor.details.concise_desc', '已为您精简工具参数与冗余字段，突出思考块、用量与对话主体')
                                             : '显示原始完整未修剪报文'}
@@ -1479,7 +1513,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     <button
                                         type="button"
                                         onClick={() => setShowMetadata((prev) => !prev)}
-                                        className="btn btn-xs btn-ghost text-gray-500 dark:text-gray-400 gap-1 text-[11px]"
+                                        className="btn btn-xs btn-ghost text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800 gap-1 text-[11px]"
                                         title={showMetadata ? '折叠元数据以增大报文视野' : '展开元数据信息'}
                                     >
                                         {showMetadata ? <EyeOff size={13} /> : <Eye size={13} />}
@@ -1494,7 +1528,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     cardId="req"
                                     title={t('monitor.details.request_payload', '请求报文 (Request)')}
                                     badge="REQUEST"
-                                    badgeStyle="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 border-blue-200 dark:border-blue-800/50"
+                                    badgeStyle="bg-blue-50 text-blue-700 dark:bg-blue-950/70 dark:text-blue-300 border-blue-200 dark:border-blue-800/60"
                                     rawPayload={selectedLog.request_body}
                                     concisePayload={conciseRequestBody}
                                     headersJson={selectedLog.request_headers}
@@ -1513,7 +1547,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     cardId="upstream"
                                     title={t('monitor.details.upstream_request_payload', '中转报文 (Forwarded)')}
                                     badge="FORWARDED"
-                                    badgeStyle="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border-amber-200 dark:border-amber-800/50"
+                                    badgeStyle="bg-amber-50 text-amber-700 dark:bg-amber-950/70 dark:text-amber-300 border-amber-200 dark:border-amber-800/60"
                                     rawPayload={selectedLog.upstream_request_body}
                                     concisePayload={conciseUpstreamBody}
                                     headersJson={selectedLog.upstream_request_headers}
@@ -1532,7 +1566,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     cardId="resp"
                                     title={t('monitor.details.response_payload', '响应报文 (Response)')}
                                     badge="RESPONSE"
-                                    badgeStyle="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/50"
+                                    badgeStyle="bg-emerald-50 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60"
                                     rawPayload={selectedLog.response_body}
                                     concisePayload={conciseResponseBody}
                                     headersJson={selectedLog.response_headers}
