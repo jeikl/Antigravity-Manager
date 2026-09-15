@@ -96,6 +96,9 @@ pub async fn handle_generate(
         debug!("[{}] Client Adapter detected", trace_id);
     }
 
+    // [DEFENSE] 净化 Gemini 原生请求体中的所有 inlineData (过滤或降级空数据/损坏图片)
+    crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
+
     // 1. 验证方法
     // [NEW] :countTokens 冒号语法，直接代理到上游 v1internal:countTokens
     if method == "countTokens" {
@@ -992,8 +995,11 @@ pub async fn handle_count_tokens(
 pub async fn execute_count_tokens(
     state: AppState,
     model_name: String,
-    body: Value,
+    mut body: Value,
 ) -> Result<Response, (StatusCode, String)> {
+    // [DEFENSE] 净化 Gemini 原生请求体中的所有 inlineData (过滤或降级空数据/损坏图片)
+    crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
+
     // 1. 模型路由解析
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,

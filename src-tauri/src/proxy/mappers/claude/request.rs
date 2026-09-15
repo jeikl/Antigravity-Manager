@@ -723,6 +723,11 @@ pub fn transform_claude_request_in(
     deep_clean_cache_control(&mut body);
     tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
 
+    // [DEFENSE] 净化所有 contents 中的 inlineData，过滤或降级空数据/损坏数据
+    if let Some(inner) = body.get_mut("request") {
+        crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
+    }
+
     Ok(body)
 }
 
@@ -1233,23 +1238,23 @@ fn build_contents(
                     }
                     ContentBlock::Image { source, .. } => {
                         if source.source_type == "base64" {
-                            parts.push(json!({
-                                "inlineData": {
-                                    "mimeType": source.media_type,
-                                    "data": source.data
-                                }
-                            }));
+                            let part = crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                source.media_type.as_deref(),
+                                source.data.as_deref().unwrap_or_default(),
+                                "Image",
+                            );
+                            parts.push(part);
                             saw_non_thinking = true;
                         }
                     }
                     ContentBlock::Document { source, .. } => {
                         if source.source_type == "base64" {
-                            parts.push(json!({
-                                "inlineData": {
-                                    "mimeType": source.media_type,
-                                    "data": source.data
-                                }
-                            }));
+                            let part = crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                source.media_type.as_deref(),
+                                source.data.as_deref().unwrap_or_default(),
+                                "Document",
+                            );
+                            parts.push(part);
                             saw_non_thinking = true;
                         }
                     }
@@ -1393,17 +1398,13 @@ fn build_contents(
                                             == Some("image")
                                         {
                                             let source = block.get("source").unwrap();
-                                            if let (Some(media_type), Some(data)) = (
-                                                source.get("media_type").and_then(|v| v.as_str()),
-                                                source.get("data").and_then(|v| v.as_str()),
-                                            ) {
-                                                extra_parts.push(json!({
-                                                    "inlineData": {
-                                                        "mimeType": media_type,
-                                                        "data": data
-                                                    }
-                                                }));
-                                            }
+                                            let media_type = source.get("media_type").and_then(|v| v.as_str());
+                                            let data = source.get("data").and_then(|v| v.as_str()).unwrap_or_default();
+                                            extra_parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                                media_type,
+                                                data,
+                                                "Tool Result Image",
+                                            ));
                                         }
                                     }
                                 }
@@ -2453,8 +2454,8 @@ mod tests {
                     content: MessageContent::Array(vec![ContentBlock::Image {
                         source: ImageSource {
                             source_type: "base64".to_string(),
-                            media_type: "image/png".to_string(),
-                            data: "iVBORw0KGgo=".to_string(),
+                            media_type: Some("image/png".to_string()),
+                            data: Some("iVBORw0KGgo=".to_string()),
                         },
                         cache_control: Some(json!({"type": "ephemeral"})), // 这个也应该被清理
                     }]),
@@ -3477,5 +3478,73 @@ mod tests {
         assert_eq!(assistant_parts[0]["thoughtSignature"], real_sig);
         assert_eq!(assistant_parts[1]["functionCall"]["name"], "list_directory");
         assert_eq!(assistant_parts[1]["thoughtSignature"], real_sig, "functionCall must inherit thoughtSignature!");
+    }
+
+    #[test]
+    fn test_claude_request_with_corrupt_and_empty_images_defense() {
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let req = ClaudeRequest {
+            model: "claude-3-7-sonnet-20250219".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Array(vec![
+                        ContentBlock::Text { text: "Look at these images".to_string() },
+                        // Corrupt image block 1 (empty data)
+                        ContentBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: None,
+                                data: None,
+                            },
+                            cache_control: None,
+                        },
+                        // Corrupt image block 2 (invalid short base64 +A==)
+                        ContentBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: Some("image/png".to_string()),
+                                data: Some("+A==".to_string()),
+                            },
+                            cache_control: None,
+                        },
+                        // Valid image block
+                        ContentBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: Some("image/png".to_string()),
+                                data: Some(valid_png_b64.to_string()),
+                            },
+                            cache_control: None,
+                        },
+                    ]),
+                },
+            ],
+            system: None,
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result = transform_claude_request_in(&req, "test-proj", false, None, "test-session", None)
+            .expect("Transform must not fail on corrupt images");
+
+        let contents = result["request"]["contents"].as_array().unwrap();
+        let user_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(user_parts.len(), 4);
+        assert_eq!(user_parts[0]["text"], "Look at these images");
+        assert_eq!(user_parts[1]["text"], "[Image: invalid or corrupted data omitted]");
+        assert_eq!(user_parts[2]["text"], "[Image: invalid or corrupted data omitted]");
+        assert!(user_parts[3].get("inlineData").is_some());
+        assert_eq!(user_parts[3]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(user_parts[3]["inlineData"]["data"], valid_png_b64);
     }
 }

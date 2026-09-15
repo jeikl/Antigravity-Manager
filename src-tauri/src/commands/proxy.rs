@@ -27,8 +27,18 @@ pub struct ProxyServiceState {
 
 pub struct AdminServerInstance {
     pub axum_server: crate::proxy::AxumServer,
-    #[allow(dead_code)] // 保留句柄以便未来支持显式停服/诊断
     pub server_handle: tokio::task::JoinHandle<()>,
+}
+
+impl AdminServerInstance {
+    /// 优雅停止管理服务器并等待监听任务退出释放端口
+    pub async fn stop(mut self) {
+        self.axum_server.stop();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1000), &mut self.server_handle).await;
+        if !self.server_handle.is_finished() {
+            self.server_handle.abort();
+        }
+    }
 }
 
 /// 反代服务实例

@@ -397,6 +397,10 @@ impl CloudflaredManager {
 
     /// 停止隧道
     pub async fn stop(&self) -> Result<CloudflaredStatus, String> {
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
+
         let mut proc_lock = self.process.write().await;
         if let Some(mut child) = proc_lock.take() {
             let _ = child.kill().await;

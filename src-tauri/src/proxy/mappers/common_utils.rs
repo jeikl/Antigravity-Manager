@@ -1018,6 +1018,84 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn test_detect_mime_from_bytes() {
+        assert_eq!(detect_mime_from_bytes(b"\x89PNG\r\n\x1a\n\0\0\0"), Some("image/png"));
+        assert_eq!(detect_mime_from_bytes(b"\xff\xd8\xff\xe0\0\x10JFIF"), Some("image/jpeg"));
+        assert_eq!(detect_mime_from_bytes(b"GIF89a\x01\0\x01\0"), Some("image/gif"));
+        assert_eq!(detect_mime_from_bytes(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(detect_mime_from_bytes(b"%PDF-1.7\n%"), Some("application/pdf"));
+        assert_eq!(detect_mime_from_bytes(b"invalid"), None);
+    }
+
+    #[test]
+    fn test_validate_and_sanitize_inline_data() {
+        // 1. Empty data
+        assert_eq!(validate_and_sanitize_inline_data(Some("image/png"), ""), None);
+        assert_eq!(validate_and_sanitize_inline_data(None, "   "), None);
+
+        // 2. Corrupted short data (like the +A== in the incident)
+        assert_eq!(validate_and_sanitize_inline_data(Some("image/png"), "+A=="), None);
+        assert_eq!(validate_and_sanitize_inline_data(None, "AQ=="), None);
+
+        // 3. Invalid base64 characters
+        assert_eq!(validate_and_sanitize_inline_data(Some("image/png"), "not-valid-base64!@#$"), None);
+
+        // 4. Valid PNG base64 (8 bytes magic header)
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let res = validate_and_sanitize_inline_data(Some("image/png"), valid_png_b64);
+        assert!(res.is_some());
+        let (mime, data) = res.unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, valid_png_b64);
+
+        // 5. Valid PNG with omitted mime type (should auto-detect from magic bytes)
+        let res_no_mime = validate_and_sanitize_inline_data(None, valid_png_b64);
+        assert!(res_no_mime.is_some());
+        assert_eq!(res_no_mime.unwrap().0, "image/png");
+    }
+
+    #[test]
+    fn test_create_gemini_inline_part() {
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let valid_part = create_gemini_inline_part(Some("image/png"), valid_png_b64, "Image");
+        assert!(valid_part.get("inlineData").is_some());
+        assert_eq!(valid_part["inlineData"]["mimeType"], "image/png");
+
+        let bad_part = create_gemini_inline_part(Some("image/png"), "+A==", "Image");
+        assert!(bad_part.get("inlineData").is_none());
+        assert_eq!(bad_part["text"], "[Image: invalid or corrupted data omitted]");
+    }
+
+    #[test]
+    fn test_sanitize_gemini_payload_inline_data() {
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let mut payload = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Hello" },
+                        { "inlineData": { "mimeType": "image/png", "data": "+A==" } }, // corrupt
+                        { "inlineData": { "mimeType": "image/png", "data": "" } },     // empty
+                        { "inlineData": { "mimeType": "image/png", "data": valid_png_b64 } } // valid
+                    ]
+                }
+            ]
+        });
+
+        let sanitized_count = sanitize_gemini_payload_inline_data(&mut payload);
+        assert_eq!(sanitized_count, 2);
+
+        let parts = payload["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["text"], "Hello");
+        assert_eq!(parts[1]["text"], "[Image/Data: invalid or corrupted inline payload omitted]");
+        assert_eq!(parts[2]["text"], "[Image/Data: invalid or corrupted inline payload omitted]");
+        assert!(parts[3].get("inlineData").is_some());
+        assert_eq!(parts[3]["inlineData"]["data"], valid_png_b64);
+    }
 }
 
 pub fn sanitize_system_prompt_for_tokens(text: &str) -> String {
@@ -1093,9 +1171,8 @@ pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
             // Add inlineData image
             let mime = cap.get(1).unwrap().as_str();
             let b64 = cap.get(2).unwrap().as_str();
-            parts.push(json!({
-                "inlineData": { "mimeType": mime, "data": b64 }
-            }));
+            let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
+            parts.push(part);
 
             last_match = m.end();
         }
@@ -1138,4 +1215,186 @@ pub fn enhance_gemini_skills_prompt(text: &str) -> String {
     }
 
     enhanced
+}
+
+/// Detect common MIME types from magic bytes
+pub fn detect_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.len() >= 12
+        && (&bytes[4..12] == b"ftypheic"
+            || &bytes[4..12] == b"ftypmif1"
+            || &bytes[4..12] == b"ftypheix")
+    {
+        Some("image/heic")
+    } else {
+        None
+    }
+}
+
+/// Validates and sanitizes inline base64 data (images/documents) for Gemini upstream.
+/// Returns `Some((mime_type, sanitized_b64))` if valid, or `None` if corrupt/empty/too small.
+pub fn validate_and_sanitize_inline_data(
+    mime_type: Option<&str>,
+    b64_data: &str,
+) -> Option<(String, String)> {
+    let clean_b64 = b64_data.trim();
+    if clean_b64.is_empty() {
+        return None;
+    }
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    // Try decoding base64 to check validity and magic bytes
+    let decoded_bytes = match STANDARD.decode(clean_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            use base64::engine::general_purpose::URL_SAFE;
+            match URL_SAFE.decode(clean_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => return None,
+            }
+        }
+    };
+
+    if decoded_bytes.is_empty() {
+        return None;
+    }
+
+    let declared_mime = mime_type.map(str::trim).filter(|m| !m.is_empty());
+
+    let is_audio_or_video = declared_mime
+        .map(|m| m.starts_with("video/") || m.starts_with("audio/"))
+        .unwrap_or(false);
+
+    if !is_audio_or_video {
+        // For images/documents, require at least 5 decoded bytes and 8 base64 chars
+        if clean_b64.len() < 8 || decoded_bytes.len() < 5 {
+            return None;
+        }
+    }
+
+    // Detect MIME from magic bytes if possible
+    let inferred_mime = detect_mime_from_bytes(&decoded_bytes);
+
+    let final_mime = match (mime_type.map(str::trim), inferred_mime) {
+        (Some(m), _)
+            if !m.is_empty()
+                && (m.starts_with("image/")
+                    || m.starts_with("application/")
+                    || m.starts_with("audio/")
+                    || m.starts_with("video/")) =>
+        {
+            m.to_string()
+        }
+        (_, Some(inferred)) => inferred.to_string(),
+        (Some(m), _) if !m.is_empty() => m.to_string(),
+        _ => "image/jpeg".to_string(), // fallback default
+    };
+
+    Some((final_mime, clean_b64.to_string()))
+}
+
+/// Helper to create a Gemini inlineData part or fallback text if invalid
+pub fn create_gemini_inline_part(
+    mime_type: Option<&str>,
+    b64_data: &str,
+    fallback_label: &str,
+) -> Value {
+    if let Some((valid_mime, valid_data)) = validate_and_sanitize_inline_data(mime_type, b64_data) {
+        json!({
+            "inlineData": {
+                "mimeType": valid_mime,
+                "data": valid_data
+            }
+        })
+    } else {
+        tracing::warn!(
+            "[Image-Defense] Omitted invalid or corrupt base64 data (len: {}, mime: {:?})",
+            b64_data.len(),
+            mime_type
+        );
+        json!({
+            "text": format!("[{}: invalid or corrupted data omitted]", fallback_label)
+        })
+    }
+}
+
+/// Sanitizes any inlineData in an entire Gemini JSON request payload in-place.
+/// Replaces invalid inlineData / inline_data parts with placeholder text parts.
+pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
+    let mut total_sanitized = 0;
+
+    let mut sanitize_parts = |parts: &mut Vec<Value>| {
+        for part in parts.iter_mut() {
+            if let Some(obj) = part.as_object_mut() {
+                let inline_key = if obj.contains_key("inlineData") {
+                    Some("inlineData")
+                } else if obj.contains_key("inline_data") {
+                    Some("inline_data")
+                } else {
+                    None
+                };
+
+                if let Some(key) = inline_key {
+                    let inline_obj = obj.get(key).and_then(Value::as_object);
+                    let mime = inline_obj
+                        .and_then(|o| o.get("mimeType").or_else(|| o.get("mime_type")))
+                        .and_then(Value::as_str);
+                    let data = inline_obj
+                        .and_then(|o| o.get("data"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+
+                    if let Some((valid_mime, valid_data)) = validate_and_sanitize_inline_data(mime, data) {
+                        // Ensure mimeType and data are normalized
+                        obj.insert(
+                            "inlineData".to_string(),
+                            json!({
+                                "mimeType": valid_mime,
+                                "data": valid_data
+                            }),
+                        );
+                        if key == "inline_data" {
+                            obj.remove("inline_data");
+                        }
+                    } else {
+                        total_sanitized += 1;
+                        tracing::warn!(
+                            "[Payload-Defense] Sanitized invalid inlineData part (len: {}, mime: {:?}) into text placeholder",
+                            data.len(),
+                            mime
+                        );
+                        *part = json!({
+                            "text": "[Image/Data: invalid or corrupted inline payload omitted]"
+                        });
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) {
+        for content in contents.iter_mut() {
+            if let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) {
+                sanitize_parts(parts);
+            }
+        }
+    }
+
+    if let Some(sys) = body.get_mut("systemInstruction").and_then(Value::as_object_mut) {
+        if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
+            sanitize_parts(parts);
+        }
+    }
+
+    total_sanitized
 }

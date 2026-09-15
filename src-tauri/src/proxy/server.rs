@@ -407,7 +407,7 @@ fn to_account_response(
 /// Axum 服务器实例
 #[derive(Clone)]
 pub struct AxumServer {
-    shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
@@ -988,19 +988,15 @@ impl AxumServer {
             app
         };
 
-        // 绑定地址
-        let addr = format!("{}:{}", host, port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("地址 {} 绑定失败: {}", addr, e))?;
+        // 绑定地址（使用 socket2 开启 SO_REUSEADDR，防止端口残留和 TIME_WAIT 占用）
+        let listener = bind_tcp_listener(&host, port)?;
+        tracing::info!("反代服务器启动在 http://{}:{}", host, port);
 
-        tracing::info!("反代服务器启动在 http://{}", addr);
-
-        // 创建关闭通道
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // 创建统一取消令牌
+        let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let server_instance = Self {
-            shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
+            cancel_token: cancel_token.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
             upstream: state.upstream.clone(),
@@ -1016,6 +1012,7 @@ impl AxumServer {
             only_raw_quota_models: only_raw_quota_models_state,
         };
 
+        let server_cancel_token = cancel_token.clone();
         // 在新任务中启动服务器
         let handle = tokio::spawn(async move {
             use hyper::server::conn::http1;
@@ -1024,6 +1021,10 @@ impl AxumServer {
 
             loop {
                 tokio::select! {
+                    _ = server_cancel_token.cancelled() => {
+                        tracing::info!("反代服务器收到终止信号，停止监听并释放端口");
+                        break;
+                    }
                     res = listener.accept() => {
                         match res {
                             Ok((stream, remote_addr)) => {
@@ -1038,25 +1039,36 @@ impl AxumServer {
                                 });
 
                                 let service = TowerToHyperService::new(app_with_info);
+                                let conn_cancel_token = server_cancel_token.clone();
 
                                 tokio::task::spawn(async move {
-                                    if let Err(err) = http1::Builder::new()
+                                    let conn = http1::Builder::new()
                                         .serve_connection(io, service)
-                                        .with_upgrades() // 支持 WebSocket (如果以后需要)
-                                        .await
-                                    {
-                                        debug!("连接处理结束或出错: {:?}", err);
+                                        .with_upgrades();
+                                    tokio::pin!(conn);
+
+                                    tokio::select! {
+                                        res = conn.as_mut() => {
+                                            if let Err(err) = res {
+                                                debug!("连接处理结束或出错: {:?}", err);
+                                            }
+                                        }
+                                        _ = conn_cancel_token.cancelled() => {
+                                            // 收到全局关闭通知，通知 Hyper 优雅终止连接
+                                            conn.as_mut().graceful_shutdown();
+                                            // 给予请求最多 500ms 缓冲，超时后自动强行断开并关闭底层套接字
+                                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), conn).await;
+                                        }
                                     }
                                 });
                             }
                             Err(e) => {
+                                if server_cancel_token.is_cancelled() {
+                                    break;
+                                }
                                 error!("接收连接失败: {:?}", e);
                             }
                         }
-                    }
-                    _ = &mut shutdown_rx => {
-                        tracing::info!("反代服务器停止监听");
-                        break;
                     }
                 }
             }
@@ -1067,15 +1079,56 @@ impl AxumServer {
 
     /// 停止服务器
     pub fn stop(&self) {
-        let tx_mutex = self.shutdown_tx.clone();
-        tokio::spawn(async move {
-            let mut lock = tx_mutex.lock().await;
-            if let Some(tx) = lock.take() {
-                let _ = tx.send(());
-                tracing::info!("Axum server 停止信号已发送");
-            }
-        });
+        self.cancel_token.cancel();
+        tracing::info!("Axum server 停止信号已发送");
     }
+
+    /// 检查服务器是否已被停止
+    pub fn is_stopped(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+}
+
+/// 绑定 TCP 监听器（启用地址复用，防止 Windows 下端口残留及 TIME_WAIT 导致的占用报错）
+fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{}:{}", host, port);
+    let socket_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("无法解析地址 {}: {}", addr_str, e))?
+        .next()
+        .ok_or_else(|| format!("无法解析地址: {}", addr_str))?;
+
+    let domain = if socket_addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(|e| format!("创建套接字失败 ({}): {}", addr_str, e))?;
+
+    // 在 Windows 和 Unix 上开启地址复用，避免在服务重启或连接处于 TIME_WAIT 状态时报 10048 端口占用
+    let _ = socket.set_reuse_address(true);
+
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败 ({}): {}", addr_str, e))?;
+
+    socket
+        .bind(&socket_addr.into())
+        .map_err(|e| format!("地址 {} 绑定失败: {}", addr_str, e))?;
+
+    socket
+        .listen(1024)
+        .map_err(|e| format!("监听地址 {} 失败: {}", addr_str, e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("转换为 Tokio TcpListener 失败 ({}): {}", addr_str, e))
 }
 
 // ===== API 处理器 (旧代码已移除，由 src/proxy/handlers/* 接管) =====
@@ -4207,5 +4260,14 @@ mod image_scheduler_tests {
         let without_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_2"}"#).unwrap();
         assert_eq!(without_ide.account_id, "acc_2");
         assert_eq!(without_ide.target_ide, None);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_and_reuse() {
+        let port = 18099;
+        let listener1 = super::bind_tcp_listener("127.0.0.1", port).expect("first bind should succeed");
+        drop(listener1);
+        let listener2 = super::bind_tcp_listener("127.0.0.1", port).expect("immediate re-bind must succeed with SO_REUSEADDR");
+        drop(listener2);
     }
 }

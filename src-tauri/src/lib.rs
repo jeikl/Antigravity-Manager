@@ -745,33 +745,35 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
-                // Handle app exit - cleanup background tasks
+                // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
-                    tracing::info!("Application exiting, cleaning up background tasks...");
+                    tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
                     if let Some(state) =
                         app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
                     {
+                        let cf_state = app_handle.try_state::<crate::commands::cloudflared::CloudflaredState>();
                         tauri::async_runtime::block_on(async {
-                            // Use timeout-based read() instead of try_read() to handle lock contention
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                state.instance.read(),
-                            )
-                            .await
-                            {
-                                Ok(guard) => {
-                                    if let Some(instance) = guard.as_ref() {
-                                        // Use graceful_shutdown with 2s timeout for task cleanup
-                                        instance
-                                            .token_manager
-                                            .graceful_shutdown(std::time::Duration::from_secs(2))
-                                            .await;
-                                    }
+                            // 1. 停止 cloudflared 隧道
+                            if let Some(cf) = cf_state {
+                                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cf.stop()).await;
+                            }
+
+                            // 2. 停止 Admin Server（释放 TCP 监听器和 Socket）
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.admin_server.write()).await {
+                                if let Some(admin) = lock.take() {
+                                    admin.stop().await;
                                 }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        "Lock acquisition timed out after 3s, forcing exit"
-                                    );
+                            }
+
+                            // 3. 停止业务代理实例及后台任务
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.instance.write()).await {
+                                if let Some(instance) = lock.take() {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        instance.token_manager.graceful_shutdown(std::time::Duration::from_millis(400)),
+                                    ).await;
+                                    instance.axum_server.set_running(false).await;
+                                    instance.axum_server.stop();
                                 }
                             }
                         });

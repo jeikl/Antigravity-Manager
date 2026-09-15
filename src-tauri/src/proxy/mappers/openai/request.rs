@@ -571,9 +571,13 @@ pub fn transform_openai_request_with_session(
                                             let mime_type = mime_part.split(';').next().unwrap_or("image/jpeg");
                                             let data = &image_url.url[pos + 1..];
 
-                                            parts.push(json!({
-                                                "inlineData": { "mimeType": mime_type, "data": data }
-                                            }));
+                                            parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                                Some(mime_type),
+                                                data,
+                                                "Image",
+                                            ));
+                                        } else {
+                                            parts.push(json!({"text": "[Image: invalid data URL omitted]"}));
                                         }
                                     } else if image_url.url.starts_with("http") {
                                         parts.push(json!({
@@ -609,9 +613,11 @@ pub fn transform_openai_request_with_session(
                                                 "image/jpeg"
                                             };
 
-                                            parts.push(json!({
-                                                "inlineData": { "mimeType": mime_type, "data": b64 }
-                                            }));
+                                            parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                                Some(mime_type),
+                                                &b64,
+                                                "Image",
+                                            ));
                                             tracing::debug!("[OpenAI-Request] Successfully loaded image: {} ({} bytes)", file_path, file_bytes.len());
                                         } else {
                                             tracing::debug!("[OpenAI-Request] Failed to read local image: {}", file_path);
@@ -766,9 +772,11 @@ pub fn transform_openai_request_with_session(
                                             let mime_type = mime_part.split(';').next().unwrap_or("image/jpeg");
                                             let data = &image_url.url[pos + 1..];
 
-                                            extra_parts.push(json!({
-                                                "inlineData": { "mimeType": mime_type, "data": data }
-                                            }));
+                                            extra_parts.push(crate::proxy::mappers::common_utils::create_gemini_inline_part(
+                                                Some(mime_type),
+                                                data,
+                                                "Tool Result Image",
+                                            ));
                                         }
                                     } else {
                                         texts.push("[image link]".to_string());
@@ -1461,6 +1469,11 @@ pub fn transform_openai_request_with_session(
             );
             cache_manager.record_explicit_hit(&prefix_hash);
         }
+    }
+
+    // [DEFENSE] 净化所有 contents 中的 inlineData，过滤或降级空数据/损坏数据
+    if let Some(inner) = final_body.get_mut("request") {
+        crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
     }
 
     (final_body, session_id, message_count, prefix_hash)

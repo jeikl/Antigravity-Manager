@@ -322,11 +322,18 @@ impl UpstreamClient {
         &self,
         method: &str,
         access_token: &str,
-        body: Value,
+        mut body: Value,
         query_string: Option<&str>,
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        // [DEFENSE] 全局终极防御拦截：净化所有发往上游报文中的损坏/空 inlineData
+        if let Some(inner) = body.get_mut("request") {
+            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
+        } else {
+            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
+        }
+
         // [NEW] Get client based on account (cached in proxy pool manager)
         let client = self.get_client(account_id).await;
 
