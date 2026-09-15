@@ -1451,7 +1451,8 @@
       "quickConfig": "원클릭 로컬 개발 설정",
       "syncDesc": "공식 표준 설정으로 동기화",
       "codexTooltip": "API Key와 BaseURL을 Antigravity Codex에 동기화",
-      "claudeTooltip": "API Key와 BaseURL을 Claude Code에 동기화"
+      "claudeTooltip": "API Key와 BaseURL을 Claude Code에 동기화",
+      "opencodeTooltip": "API Key, BaseURL, 모델을 OpenCode에 동기화"
     },
     "models": {
       "title": "사용 가능한 모델",

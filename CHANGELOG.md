@@ -3,6 +3,65 @@
 > 完整版本历史记录。返回项目主页请查看 [README.md](README.md) | [English Changelog](CHANGELOG_EN.md)。
 
 *   **版本演进**:
+    *   **v4.7.2 (2026-09-15)**:
+        -   **[OpenAI / Codex 适配] 修复 Codex 客户端中 Gemini 模型思考过程未作为 reasoning summary 显示的问题 (PR #3439, Issue #3438)**:
+            -   **标准化 Reasoning Summary 事件**: 使用流式 `POST /v1/responses` 时，将 Gemini 的 `thought: true` 思考分片调整为标准 `rs_...` 项（`type: reasoning`），并通过 `response.reasoning_summary_part.*` 与 `response.reasoning_summary_text.*` 规范事件流输出，使 Codex 可以在合适位置正规渲染思考摘要。
+            -   **生命周期隔离与流结束闭合**: 在普通文本或工具调用开始前以及流结束时及时闭合 reasoning summary，确保与普通输出项的生命周期互不重叠，并保证会话持久化及 `response.completed` 输出一致性。
+        -   **[Prompt 格式规范与内存同步] 全局系统提示词换行隔离、Gemini 包装防重与配置即时生效 (PR #3433)**:
+            -   **Markdown 格式安全隔离**: 在 Antigravity 预置身份末尾及全局提示词后添加规范换行分隔符（`\n\n`），防止用户填写的 Markdown 标题紧贴前置粗体词造成渲染解析异常，并避免后续 HTTP 头部紧挨 Prompt 尾部。
+            -   **Gemini Wrapper 提示词去重**: 在 `wrap_request_v2` 中增加去重检测，防止请求在多次包装或重试时反复注入全局系统提示词。
+            -   **配置保存即时同步全局内存**: 在 `save_config` 中将全局内存配置（Thinking Budget、全局系统提示词、图片思考模式、上下文压缩参数等）更新提取至代理实例检查之外，确保反代服务未启动或处于停止状态时，保存的配置也能立即同步到内存中。
+        -   **[存储与数据管理] 支持自定义数据存储目录并一键平滑全量迁移 (Issue #3441)**:
+            -   **自定义数据目录与自举寻址机制**: 针对默认存储在 C 盘（`~/.antigravity_tools`）导致系统盘容易爆满的问题，新增持久化指针文件寻址。支持在高级设置中自由选择任意磁盘目录（如 `D:\AntigravityData`），应用启动时自动识别并重定向。
+            -   **全量平滑迁移与空间安全释放**: 在高级设置中提供「更改并迁移」功能，一键将现有账号、全局配置、请求日志及 SQLite 数据库无损复制到新目录，支持迁移成功后自动清理原目录以释放 C 盘空间，并自动重启应用无缝加载新目录。
+    *   **v4.7.1 (2026-09-12)**:
+        -   **[上游协议优化 & 原生对齐] 原生语言服务逆向对齐：按需切换 Agent 模式、细粒度 429 熔断分类与空响应异常自愈**:
+            -   **动态按需切换 `requestType: "agent"`**: 逆向分析原生 Antigravity 语言服务客户端行为，消除以往所有请求盲目携带 `requestType: "agent"` 挤占 Google 专用 Agent 资源池导致的频繁 429 限流。仅在请求携带 `tools` 函数定义或包含历史工具交互轮次时才激活 Agent 通道；常规文本对话、代码补全均走标准 Chat 资源池，显著降低限流概率。
+            -   **细粒度 429 熔断分类**: 优化 `parse_rate_limit_reason`，将缺乏明确配额重置时间戳（`quotaResetTimeStamp`）的突发并发拥堵及通用 `RESOURCE_EXHAUSTED` 错误归类为短时并发超限（`RateLimitExceeded`），实施秒级宽限退避，杜绝因临时拥塞将正常账号误判为硬性配额耗尽并锁定 30 分钟。
+            -   **规范化 `finish_reason` 与 `MALFORMED_FUNCTION_CALL` 优雅兜底**: 针对 Gemini 在处理实时查询（如天气）时因模型格式异常或工具缺失中断返回 `MALFORMED_FUNCTION_CALL` 的情况，将其规范化收敛至标准 `"stop"`，并在生成正文为空时自动注入友好引导说明，避免下游客户端（NextChat、LobeChat、Cherry Studio 等）聊天气泡出现空白或解析崩溃。
+        -   **[生态集成] 支持一键将 APIKEY.FUN 凭据与模型列表同步至 OpenCode (PR #3427)**:
+            -   **OpenCode 一键同步按钮**: 在 APIKEY.FUN 页面新增同步至 OpenCode 功能，将当前配置的 API Key、BaseURL 及已探测出的可用模型列表同步配置为 OpenCode 的 `apikey-fun` 独立 Provider（基于 `@ai-sdk/openai-compatible`）。
+            -   **安全与边缘容错保障**: 支持 Tauri 原生命令与 Web API；写入前自动安全备份既有配置并保留用户既有 Providers 与自定义模型参数；BaseURL 尾部斜杠规范化防止端点重复；多语言 13 国本地化完整支持。
+        -   **[存储与数据安全] 核心账号与配置文件原子写入与崩溃防坏 (PR #3420)**:
+            -   **原子写入机制 (`write_atomic`)**: 重构账号索引与应用配置的持久化写入流程，统一采用「同目录临时文件写入 -> 内存冲刷 `write_all` -> 强制物理磁盘刷盘 `sync_all` (fsync) -> 跨平台原子重命名替换」机制，杜绝断电、系统崩溃或磁盘突发耗尽时可能导致的 `account.json` / `gui_config.json` 损坏或 0 字节丢失问题。
+            -   **解析告警提升**: 将账号配置解析异常日志提升至 `warn!` 级别，便于及时捕获损坏异常。
+        -   **[配额熔断与时间修复] 修复 reset_time NaN 倒计时并隔离单模型零配额熔断 (PR #3417)**:
+            -   **消除前端倒计时 `NaNh NaNm`**: 后端统一将速率限制重置时间 `reset_time` 格式化为标准 RFC3339 / ISO-8601 字符串；前端引入 `parseFlexibleDate` 弹性解析，兼顾纯数字时间戳与标准时间格式，修复倒计时显示为 NaN 的缺陷。
+            -   **零配额熔断单模型分组隔离**: 当某个配额桶（如 Claude `3p-5h`）归零触发熔断锁定（`lock_on_zero_quota`）时，精确锁定对应模型类别（`claude` 或 `gemini-3-flash`），不再误杀同账号下其他配额充足的健康模型，仅在全部模型组均耗尽时才锁定整账号。
+        -   **[代理日志策略] 代理请求日志自动保留清理策略与空间回收 (PR #3423)**:
+            -   **细粒度保留清理机制**: 新增代理日志生命周期管理，默认请求/响应 Body 保留 24 小时、元数据保留 30 天、总记录上限 10 万行。启动与每小时自动巡检清理超期与超量数据。
+            -   **SQLite 增量回收碎片**: 自动引入增量清理，避免长时间运行请求日志库无节制膨胀占满磁盘，并提供前端设置与多语言界面。
+        -   **[代理健壮性与解密回退] 代理密码解密失败安全告警与 URL 凭据优雅降级 (PR #3424)**:
+            -   **容器迁移密钥漂移告警**: 当在 Docker 等容器环境因机器码 (`machine-id`) 变动导致旧代理密码解密失败时，在 `deserialize_password` 抛出结构化警告，杜绝将加密密文直接发送给上游代理引发静默无法连接。
+            -   **URL 嵌入凭据自动回退**: 在代理池构建时，若检测到独立密码解密失败，自动检测并优雅回退至代理 URL 中自带的认证凭据。
+        -   **[日志降噪与容器运维] Claude 签名日志降噪与 Docker Compose 日志轮转 (PR #3421, PR #3422)**:
+            -   **日志等级优化**: 将 Claude Code 循环调用中高频产生的签名缓存恢复与数据清洗日志由 `info!` 降为 `debug!`，避免海量日志淹没控制台与磁盘。
+            -   **Compose 默认日志轮转**: 为所有 Docker Compose 模板统一增加 `max-size: "100m"` 与 `max-file: "3"` 轮转策略，控制容器单实例日志上限约 300MB。
+        -   **[Linux & CLI 鉴权修复] 解决 Linux Secret Service 集合分裂导致切换 agy 账号不生效 (Issue #3418, Issue #3428)**:
+            -   **强制同步 'login' 与 'default' 凭据集合**: 针对 GNOME Keyring / Ubuntu / Debian 等 Linux 环境中系统别名分裂问题（`login` 集合与 `default` 集合指向不同 Keyring 文件，而 `agy` 优先从 `login` 集合读取凭据），在写入 `secret-tool` 时显式指定 `--collection=login` 并与默认集合双向同步，彻底消除切换 CLI 账号后新启动的 `agy` 依然沿用旧账号的缺陷。
+        -   **[Agent 兼容与工具调用防御] 修复 Gemini 函数调用偶发漏参导致下游客户端崩溃与死锁 (Issue #3430)**:
+            -   **必填 command 字段防空守卫**: 针对 OpenAI 兼容接口下的 `PowerShell`、`powershell`、`pwsh`、`bash`、`shell`、`terminal`、`run_command` 等命令执行类工具，解决长上下文或复杂提示词下 Gemini 偶发仅输出 `description` 漏掉 `command` 导致下游（如 WorkBuddy、LangChain 等）抛出 `TypeError: Cannot read properties of undefined (reading 'split')` 致命崩溃的问题。
+            -   **智能 [OK] 语义兜底与死锁消除**: 扩展别名匹配（兼容 `input`/`shell_command` 等），当模型仍未提供命令时，自动根据 `description` 构造安全的 `echo "[OK: Action logged - <description>]"` 占位指令，既防止下游执行器报错，又通过 Exit 0 与明确的完成标识避免模型陷入「漏参 ➔ 失败 ➔ 反复重试漏参」的高频死循环。
+        -   **[UI 与打包优化] 暗黑模式开关样式高亮与 Homebrew Cask 脚本更新 (PR #3431, PR #3432)**:
+            -   **暗黑模式开关高亮**: 修复暗黑模式下开关开启时灰色背景覆盖高亮状态的问题，开启态采用醒目蓝底白钮设计。
+            -   **Homebrew 规范升级**: 迁移 Homebrew Cask 配方中的废弃 flight hooks 至最新的 `postflight_steps` 与 `preflight_steps` DSL API。
+        -   **[配额显示与负载均衡修复] 修复配额假 100% 显示、多端点回退及桶余量动态融合 (Issue #3426)**:
+            -   **端点连续容灾降级**: 移除 `retrieveUserQuotaSummary` 在遇到 4xx（如 Sandbox 沙盒环境 403）时过早退出 `return None` 的缺陷，确保按 Sandbox ➔ Daily ➔ Prod 顺序完整尝试所有候选端点；同时为 `loadCodeAssist` (`fetch_project_id`) 补齐三级端点回退机制。
+            -   **复用已缓存 Project ID**: 在账号配额轮询与重试链路中，优先透传已有的 `project_id` 缓存，大幅降低因高频额外请求 `loadCodeAssist` 触发限流或 403 的概率。
+            -   **真实配额桶数据深度融合**: 将 `retrieveUserQuotaSummary` 返回的实时分桶百分比（Claude/3P 及 Gemini 对应窗口剩余比例）精准回填至 `quota_data.models` 对应模型项中，彻底解决 UI 配额永远显示假 100% 的问题。
+    *   **v4.7.0 (2026-09-10)**:
+        -   **[会话与代理修复] 修复会话级累计 Token 突破 100 万上限导致账号瘫痪与 400 报错 (PR #3415, Issue #3411, refs #3325)**:
+            -   **对话级隔离与作用域 Session ID**: 改变此前上游 `sessionId` 纯由账号 ID/邮箱哈希生成的机制（导致同账号下所有对话在服务端共享单一 Session 并在长工具调用中累计输入 Token 突破 1,048,576 限制报 400）。现将 `account_id`、对话指纹（`fingerprint`）与代数计数器（`generation`）组合派生，同一对话内保持稳定（保留上游 Prompt Cache 缓存命中收益），不同对话间相互隔离。
+            -   **1M 上限溢出自动升代无感自愈**: 在 OpenAI 重试循环中捕获 `400 "The input token count exceeds the maximum number of tokens allowed"` 错误时，自动递增该会话的生成代数并以全新 `sessionId` 立即重试，在上游透明开启全新会话，客户端彻底无感恢复。
+        -   **[自适应熔断器] 新增零配额持续熔断锁定与动态退避上限 (PR #3413)**:
+            -   **零配额持续熔断开关 (`lock_on_zero_quota`)**: 在自适应熔断器中新增可选开关。开启后，当检测到账号的 5 小时滚动窗口配额或周配额耗尽（0%）时，直接将该账号锁定至上游官方准确的刷新时间点 `reset_time`，跳过短阶梯退避，彻底杜绝死账号无效调用；配额恢复后自动清除熔断记录。
+            -   **解除 300s 退避硬上限截断**: 限流重试锁定时长动态尊重配置中的最大退避等级（`backoff_steps` 最大值，如 1800s / 7200s），使高级别退避真正生效。
+            -   **全局关闭配额保护时清理残留保护锁**: 当用户在设置中全局停用配额保护时，自动清除账号中残留的受保护模型列表，避免遗留锁定阻断调度。
+        -   **[代理协议标准] 临时限流 503 响应暴露标准 Retry-After 标头 (Issue #3414)**:
+            -   **暴露重试等待秒数**: 当所有可用账号因临时并发速率限制（`All accounts limited. Wait Ns.`）导致代理抛出 503 Service Unavailable 时，解析等待秒数并在响应头中返回标准的 `Retry-After: <seconds>` 标头（覆盖 OpenAI、Claude、Gemini 各协议处理器）。
+            -   **提升客户端退避友好度**: 方便下游客户端（如 Cursor、Cline、Aider、OpenCode 等）直接按照官方标准间隔精确退避重试，避免盲目重试加剧拥塞。
+        -   **[国际化体验] 新建配置自动识别操作系统语言 (PR #3412)**:
+            -   **系统语言自适应**: 引入轻量级系统区域感知依赖，首次运行与新建配置时自动探测操作系统语言并适配为支持的语言（精准区分 `zh` 简体与 `zh-TW` / `zh-HK` 繁体，支持 `en`、`ja`、`ru`、`pt` 等，未知语言回退至 `en`），不再一律硬编码为中文。已有配置在读取时保持用户原有选择。
     *   **v4.6.9 (2026-09-08)**:
         -   **[核心修复] 遵循 store:false 抑制 HTTP 会话持久化与全局工具调用缓存驻留 (PR #3408)**:
             -   **严格响应 store:false 参数**: 在 HTTP Responses 代理路径中，当全量重放（full-replay）请求显式传入 `store:false` 时，不再创建多余的会话快照与后台保存任务，大幅抑制大长文本重放时内存持续攀升。

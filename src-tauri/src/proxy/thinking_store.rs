@@ -888,28 +888,9 @@ pub fn explicit_session_id_with_query(
         }
     }
 
-    // 4. 全生态主流 HTTP Headers（涵盖各大知名客户端/插件规范）
-    for name in [
-        "x-session-id",
-        "x-antigravity-session-id",
-        "x-conversation-id",
-        "conversation-id",
-        "x-chat-id",
-        "chat-id",
-        "x-thread-id",
-        "thread-id",
-        "x-client-session-id",
-        "x-cursor-session-id",
-        "cursor-session-id",
-        "x-vscode-session-id",
-        "anthropic-session-id",
-    ] {
-        if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(sanitize_session_id(v));
-            }
-        }
+    // 4. 全生态 HTTP Headers：先精确名单，再通配 x-*-session-id / x-*-sessionid
+    if let Some(sid) = session_id_from_headers(headers) {
+        return Some(sid);
     }
 
     // 5. JSON Body 及 Metadata 深度提取
@@ -952,6 +933,76 @@ pub fn explicit_session_id_with_query(
 
 pub fn explicit_session_id(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
     explicit_session_id_with_query(headers, body, None)
+}
+
+const KNOWN_SESSION_HEADERS: &[&str] = &[
+    "x-session-id",
+    "x-antigravity-session-id",
+    "x-jeikcode-sessionid",
+    "x-jeikcode-session-id",
+    "x-atomcode-session-id",
+    "x-atomcode-sessionid",
+    "x-conversation-id",
+    "conversation-id",
+    "x-chat-id",
+    "chat-id",
+    "x-thread-id",
+    "thread-id",
+    "x-client-session-id",
+    "x-cursor-session-id",
+    "cursor-session-id",
+    "x-vscode-session-id",
+    "anthropic-session-id",
+];
+
+fn header_session_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).and_then(|h| h.to_str().ok()).and_then(|v| {
+        let v = v.trim();
+        if v.is_empty() {
+            None
+        } else {
+            Some(sanitize_session_id(v))
+        }
+    })
+}
+
+/// 兼容 AtomCode / JeikCode / Cursor 等客户端自定义会话头：
+/// `x-session-id`、`x-atomcode-session-id`、`x-jeikcode-sessionid`，以及任意 `x-*-session-id` / `x-*-sessionid`。
+fn is_wildcard_session_header(name: &str) -> bool {
+    let key = name.trim().to_ascii_lowercase().replace('_', "-");
+    if key == "mcp-session-id" {
+        return false;
+    }
+    if key.ends_with("-request-id")
+        || key.ends_with("-trace-id")
+        || key.ends_with("-correlation-id")
+        || key == "x-request-id"
+        || key == "request-id"
+    {
+        return false;
+    }
+    let compact = key.replace('-', "");
+    compact.contains("session") && compact.ends_with("id")
+}
+
+fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    for name in KNOWN_SESSION_HEADERS {
+        if let Some(sid) = header_session_value(headers, name) {
+            return Some(sid);
+        }
+    }
+    for (name, value) in headers.iter() {
+        if !is_wildcard_session_header(name.as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(sanitize_session_id(v));
+            }
+        }
+    }
+    None
 }
 
 fn tenant_from_headers(headers: &HeaderMap) -> String {
@@ -1377,6 +1428,41 @@ mod tests {
         let empty_headers = HeaderMap::new();
         let scope2 = SessionScope::from_headers_and_body(&empty_headers, Some(&body), "fallback_id");
         assert_eq!(scope2.client_id, "meta-conv-888");
+    }
+
+    #[test]
+    fn test_wildcard_client_session_headers() {
+        let uuid = "c17b6d3c-e808-4874-8f16-b5dd4b6a2179";
+
+        let mut atom = HeaderMap::new();
+        atom.insert("x-atomcode-session-id", uuid.parse().unwrap());
+        assert_eq!(SessionScope::from_headers(&atom, "fallback").client_id, uuid);
+
+        let mut jeik = HeaderMap::new();
+        jeik.insert("x-jeikcode-sessionid", uuid.parse().unwrap());
+        assert_eq!(SessionScope::from_headers(&jeik, "fallback").client_id, uuid);
+
+        let mut multi = HeaderMap::new();
+        multi.insert("x-api-key", "secret".parse().unwrap());
+        multi.insert("x-atomcode-session-id", uuid.parse().unwrap());
+        multi.insert("x-jeikcode-sessionid", uuid.parse().unwrap());
+        multi.insert("x-session-id", uuid.parse().unwrap());
+        assert_eq!(SessionScope::from_headers(&multi, "fallback").client_id, uuid);
+
+        let mut custom = HeaderMap::new();
+        custom.insert("x-windsurf-session-id", "wind-tab-1".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&custom, "fallback").client_id,
+            "wind-tab-1"
+        );
+
+        let mut ignored = HeaderMap::new();
+        ignored.insert("x-request-id", "req-should-not-win".parse().unwrap());
+        ignored.insert("x-api-key", "secret".parse().unwrap());
+        assert_eq!(
+            SessionScope::from_headers(&ignored, "fallback_id").client_id,
+            "fallback_id"
+        );
     }
 
     #[test]

@@ -1451,7 +1451,8 @@
       "quickConfig": "Configuración local en un clic",
       "syncDesc": "Sincronizar con la configuración estándar oficial",
       "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sincronizar API Key y BaseURL con Claude Code"
+      "claudeTooltip": "Sincronizar API Key y BaseURL con Claude Code",
+      "opencodeTooltip": "Sincronizar API Key, BaseURL y modelos con OpenCode"
     },
     "models": {
       "title": "Modelos disponibles",

@@ -467,6 +467,7 @@
       "default_export_path_desc": "Files will be saved directly to this folder without asking",
       "select_btn": "Select",
       "open_btn": "Open",
+      "migrate_btn": "Change & Migrate",
       "data_dir": "Data Directory",
       "data_dir_desc": "Where accounts, config, logs and the thinking store live. Choosing a new folder migrates data and deletes the old folder (or renames it when they share a parent).",
       "data_dir_select": "Select data directory",
@@ -474,6 +475,15 @@
       "data_dir_migrate_msg": "All data will be moved to: {{path}}\nThe old folder will be deleted (or renamed if they share a parent). Stop the API proxy and tunnel first.",
       "data_dir_migrated": "Data directory migrated",
       "data_dir_restart_hint": "Restart the app so log files that were in use fully switch to the new folder",
+      "migrate_title": "Migrate Data Directory",
+      "migrate_desc": "Migrate all current data (including accounts, configs, request logs, and databases) to a new location.",
+      "migrate_source": "Source Directory",
+      "migrate_target": "Target Directory",
+      "migrate_clean_source": "Clean source directory after migration (Free up disk space)",
+      "migrate_restart_notice": "The app will automatically restart after migration to load the new data directory.",
+      "migrate_confirm_btn": "Start Migration & Restart",
+      "migrating_text": "Migrating data and preparing restart...",
+      "migrate_success": "Data migrated successfully, restarting app...",
       "antigravity_path": "Antigravity Path",
       "antigravity_path_placeholder": "Not set (Will use auto-detection)",
       "antigravity_path_desc": "If you installed Antigravity in a non-standard location, you can manually specify the executable path here (Points to .app on MacOS).",
@@ -779,6 +789,10 @@
       "request_timeout_hint": "Default 120s, range 30-7200s. Restart service to apply changes.",
       "enable_logging": "Enable Request Logging",
       "enable_logging_hint": "Record history for debugging (Minor perf cost)",
+      "log_retention_title": "Request log retention",
+      "log_retention_body_hours": "Request body age (hours)",
+      "log_retention_age_days": "Log age (days)",
+      "log_retention_rows": "Maximum log rows",
       "upstream_proxy": {
         "title": "Global Upstream Proxy (Global Proxy)",
         "desc": "When enabled, all external requests (API Proxy, Token Refresh, Quota Check, Update Check) will be routed through this proxy.",
@@ -817,6 +831,8 @@
       "circuit_breaker": {
         "title": "Adaptive Circuit Breaker",
         "tooltip": "Automatically increases lockout duration for accounts that repeatedly fail with quota exhaustion. This prevents wasting API calls on dead accounts while allowing transient errors to recover quickly.",
+        "lock_on_zero_quota": "Lock on Zero Quota (5h / Weekly)",
+        "lock_on_zero_quota_desc": "Automatically locks the account until its exact quota reset time whenever 5-hour rolling or weekly quota hits 0%, skipping short backoffs. Note: Quota state discovery and automatic recovery depend on 'Auto Refresh Quotas' in General Settings.",
         "backoff_levels": "Backoff Levels (Seconds)",
         "input_placeholder": "Enter backoff durations in seconds, separated by commas",
         "level": "Lv {{level}}",
@@ -1470,7 +1486,8 @@
       "quickConfig": "One-Click Local Dev Setup",
       "syncDesc": "Sync to official standard configuration",
       "codexTooltip": "Sync API Key & BaseURL to Codex / ChatGPT CLI",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
+      "claudeTooltip": "Sync API Key & BaseURL to Claude Code",
+      "opencodeTooltip": "Sync API Key, BaseURL and models to OpenCode"
     },
     "models": {
       "title": "Available Models",

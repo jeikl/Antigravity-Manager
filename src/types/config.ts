@@ -14,6 +14,7 @@ export interface ProxyConfig {
     custom_mapping?: Record<string, string>;
     request_timeout: number;
     enable_logging: boolean;
+    log_retention?: LogRetentionConfig;
     debug_logging?: DebugLoggingConfig;
     upstream_proxy: UpstreamProxyConfig;
     zai?: ZaiConfig;
@@ -26,6 +27,18 @@ export interface ProxyConfig {
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     only_raw_quota_models?: boolean; // [NEW] 是否只暴露真实配额模型
     proxy_pool?: ProxyPoolConfig;
+}
+
+export interface LogRetentionConfig {
+    max_body_age_hours: number;
+    max_age_days: number;
+    max_rows: number;
+}
+
+export interface LogRetentionConfig {
+    max_body_age_hours: number;
+    max_age_days: number;
+    max_rows: number;
 }
 
 // ============================================================================
@@ -127,6 +140,7 @@ export interface ExperimentalConfig {
 export interface CircuitBreakerConfig {
     enabled: boolean;
     backoff_steps: number[];
+    lock_on_zero_quota?: boolean;
 }
 
 export interface AppConfig {

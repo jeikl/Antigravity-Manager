@@ -1367,9 +1367,17 @@ pub fn transform_openai_request_with_session(
     }
 
     // [ADDED v4.1.24] 注入稳定 sessionId 对齐官方规范
+    // [FIX session-1M] sessionId 混入对话指纹与代数:
+    //   - 同一对话内保持稳定(保留上游服务端会话缓存收益)
+    //   - 不同对话使用不同 sessionId,避免共享同一服务端累计会话
+    //   - 检测到上游 1M 累计报错后 bump 代数,新 sessionId = 全新上游会话,对话无感恢复
     if let Some(t) = token {
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
-            &t.account_id
+        let generation =
+            crate::proxy::common::session::current_bump(&t.account_id, &session_id);
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+            &t.account_id,
+            &session_id,
+            generation
         ));
     }
 
@@ -1421,17 +1429,34 @@ pub fn transform_openai_request_with_session(
     let random_hex = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let request_id = format!("agent/{}/{}", timestamp_ms, random_hex);
 
+    // [NEW] 动态检测是否需要标记为 agent 请求
+    // 只有在请求携带 tools，或上下文包含工具调用交互时才打上 agent 标签
+    let has_tools = reordered_request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    let has_tool_interactions = reordered_request
+        .get("contents")
+        .map(super::super::common_utils::contents_has_tool_interactions)
+        .unwrap_or(false);
+    let is_agent_request = config.request_type != "image_gen" && (has_tools || has_tool_interactions);
+
     let mut final_body = json!({
         "project": project_id,
         // [CACHE] 使用重排后的字段顺序，稳定前缀在前
         "request": reordered_request,
         "model": config.final_model,
         "userAgent": "antigravity",
-        // [CHANGED v4.1.24] Use "agent" for all non-image requests (matches official client)
-        "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
         // [CACHE] requestId stays last so its per-attempt value does not disturb the stable prefix.
         "requestId": request_id,
     });
+
+    if config.request_type == "image_gen" {
+        final_body["requestType"] = json!("image_gen");
+    } else if is_agent_request {
+        final_body["requestType"] = json!("agent");
+    }
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -2395,6 +2420,26 @@ mod tests {
         assert_eq!(contents[2]["role"], "user");
         let has_func_resp = contents[2]["parts"].as_array().unwrap().iter().any(|p| p.get("functionResponse").is_some());
         assert!(has_func_resp);
+
+        // Since it has tool_calls / functionCall, it should have requestType: "agent"
+        assert_eq!(res_val.get("requestType"), Some(&json!("agent")));
+    }
+
+    #[test]
+    fn test_plain_chat_omits_agent_request_type() {
+        let raw_json = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello world!"
+                }
+            ]
+        });
+
+        let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
+        let (res_val, _, _, _) = transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
+        assert!(res_val.get("requestType").is_none(), "Plain text request should not have requestType: 'agent'");
     }
 }
 

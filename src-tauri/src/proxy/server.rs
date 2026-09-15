@@ -763,6 +763,10 @@ impl AxumServer {
             )
             .route("/proxy/opencode/sync", post(admin_execute_opencode_sync))
             .route(
+                "/proxy/opencode/openai-sync",
+                post(admin_execute_opencode_openai_sync),
+            )
+            .route(
                 "/proxy/opencode/restore",
                 post(admin_execute_opencode_restore),
             )
@@ -3983,6 +3987,38 @@ async fn admin_execute_opencode_sync(
         payload.proxy_url,
         payload.api_key,
         Some(payload.sync_accounts),
+        payload.models,
+    )
+    .await
+    .map(|_| StatusCode::OK)
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpencodeOpenaiSyncRequest {
+    proxy_url: String,
+    api_key: String,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    provider_name: Option<String>,
+    models: Option<Vec<crate::proxy::opencode_sync::ModelInput>>,
+}
+
+async fn admin_execute_opencode_openai_sync(
+    Json(payload): Json<OpencodeOpenaiSyncRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::execute_opencode_openai_sync(
+        payload.proxy_url,
+        payload.api_key,
+        payload.provider_id,
+        payload.provider_name,
         payload.models,
     )
     .await

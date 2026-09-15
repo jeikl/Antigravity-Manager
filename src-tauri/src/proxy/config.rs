@@ -736,6 +736,9 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub enable_logging: bool,
 
+    #[serde(default)]
+    pub log_retention: LogRetentionConfig,
+
     /// 调试日志配置 (保存完整链路)
     #[serde(default)]
     pub debug_logging: DebugLoggingConfig,
@@ -803,6 +806,37 @@ pub struct ProxyConfig {
     pub proxy_pool: ProxyPoolConfig,
 }
 
+/// Request log retention policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRetentionConfig {
+    #[serde(default = "default_max_body_age_hours")]
+    pub max_body_age_hours: u64,
+    #[serde(default = "default_max_age_days")]
+    pub max_age_days: u64,
+    #[serde(default = "default_max_rows")]
+    pub max_rows: u64,
+}
+
+fn default_max_body_age_hours() -> u64 {
+    24
+}
+fn default_max_age_days() -> u64 {
+    30
+}
+fn default_max_rows() -> u64 {
+    100_000
+}
+
+impl Default for LogRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_body_age_hours: 24,
+            max_age_days: 30,
+            max_rows: 100_000,
+        }
+    }
+}
+
 /// 上游代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamProxyConfig {
@@ -825,6 +859,7 @@ impl Default for ProxyConfig {
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),
             enable_logging: true, // 默认开启，支持 token 统计功能
+            log_retention: LogRetentionConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,

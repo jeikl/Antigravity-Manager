@@ -1451,7 +1451,8 @@
       "quickConfig": "ワンクリック開発環境設定",
       "syncDesc": "公式標準設定に同期",
       "codexTooltip": "Codexに同期",
-      "claudeTooltip": "Claude Codeに同期"
+      "claudeTooltip": "Claude Codeに同期",
+      "opencodeTooltip": "API Key、BaseURL、モデルを OpenCode に同期"
     },
     "models": {
       "title": "利用可能なモデル",

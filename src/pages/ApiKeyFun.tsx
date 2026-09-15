@@ -21,6 +21,7 @@ import {
     TrendingUp,
     Zap,
     Code,
+    CodeXml,
     Wand2
 } from 'lucide-react';
 import { motion } from 'framer-motion';
@@ -51,7 +52,7 @@ interface UsageSummary {
 }
 
 const STORAGE_KEY = 'apikey_fun_managed_keys_local';
-const DEFAULT_ENDPOINT = 'https://api.apikey.fun/v1';
+const DEFAULT_ENDPOINT = 'https://api.apikey.fan/v1';
 
 function maskKey(value: string): string {
     const trimmed = value.trim();
@@ -77,6 +78,8 @@ export const ApiKeyFun: React.FC = () => {
     const [querying, setQuerying] = useState(false);
     const [usage, setUsage] = useState<UsageSummary | null>(null);
     const [models, setModels] = useState<string[]>([]);
+    const [modelsSource, setModelsSource] = useState<{ key: string; endpoint: string } | null>(null);
+    const [syncingOpenCode, setSyncingOpenCode] = useState(false);
     const [queryError, setQueryError] = useState<string | null>(null);
     const [modelsError, setModelsError] = useState<string | null>(null);
     
@@ -119,6 +122,7 @@ export const ApiKeyFun: React.FC = () => {
         setQueryError(null);
         setUsage(null);
         setModels([]);
+        setModelsSource(null);
 
         try {
             // 1. Fetch available models
@@ -143,6 +147,7 @@ export const ApiKeyFun: React.FC = () => {
                 setModelsError(t('apiKeyFun.errors.fetchFailed', { defaultValue: '获取失败: {{err}}', err: err.message || String(err) }));
             }
             setModels(fetchedModels);
+            setModelsSource({ key, endpoint });
 
             // 2. Fetch balance (Try sub2api /usage first, then New API billing)
             let usageSummary: UsageSummary | null = null;
@@ -321,6 +326,37 @@ export const ApiKeyFun: React.FC = () => {
         }
     };
 
+    const handleSyncOpenCode = async () => {
+        if (!apiKey.trim() || !baseUrl.trim() || syncingOpenCode || querying) return;
+        const rawKey = apiKey.trim();
+        // The backend normalizes /v1; appending it here duplicates it for /v1/ URLs.
+        const proxyUrl = baseUrl.trim().replace(/\/+$/, '');
+        // Inputs can change before their model query finishes. Never export models
+        // obtained with another key or endpoint (including late query responses).
+        const currentModels = modelsSource?.key === rawKey && modelsSource.endpoint === proxyUrl
+            ? models : [];
+        const modelInputs = currentModels
+            .map((id) => id.trim())
+            .filter(Boolean)
+            .map((id) => ({ id }));
+
+        setSyncingOpenCode(true);
+        try {
+            await request('execute_opencode_openai_sync', {
+                proxyUrl,
+                apiKey: rawKey,
+                providerId: 'apikey-fun',
+                providerName: 'APIKEY.FUN',
+                models: modelInputs.length > 0 ? modelInputs : undefined
+            });
+            showToast(t('apiKeyFun.syncSuccess', { defaultValue: 'Successfully synced to {{app}}', app: 'OpenCode' }), 'success');
+        } catch (error: any) {
+            showToast(t('apiKeyFun.syncError', { defaultValue: 'Failed to sync: {{error}}', error: error.toString() }), 'error');
+        } finally {
+            setSyncingOpenCode(false);
+        }
+    };
+
     const handleDeleteKey = (id: string, e: React.MouseEvent) => {
         e.stopPropagation();
         setManagedKeys(prev => prev.filter(item => item.id !== id));
@@ -385,7 +421,7 @@ export const ApiKeyFun: React.FC = () => {
                 </div>
 
                 <a
-                    href="https://apikey.fun/register?aff=AntManager"
+                    href="https://apikey.fan/register?aff=AntManager"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="bg-white hover:bg-blue-50 dark:bg-base-200 dark:hover:bg-base-300 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50 px-6 py-3 rounded-xl font-bold text-sm flex items-center gap-2 transition-all shadow-md shadow-blue-500/10 dark:shadow-none flex-shrink-0 hover:scale-[1.02] active:scale-[0.98] duration-200 z-10"
@@ -714,6 +750,7 @@ export const ApiKeyFun: React.FC = () => {
                                                     onClick={() => handleSyncCli('Codex')}
                                                     className="flex-1 sm:flex-none btn btn-sm px-5 font-medium rounded-full bg-blue-500 hover:bg-blue-600 text-white border-none shadow-md shadow-blue-500/20 transition-all group"
                                                     disabled={!apiKey}
+                                                    title={t('apiKeyFun.cli.codexTooltip', { defaultValue: 'Sync API Key & BaseURL to Codex / ChatGPT CLI' })}
                                                 >
                                                     <Code size={14} className="mr-1.5 opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
                                                     Codex
@@ -724,11 +761,21 @@ export const ApiKeyFun: React.FC = () => {
                                                     onClick={() => handleSyncCli('Claude')}
                                                     className="flex-1 sm:flex-none btn btn-sm px-5 font-medium rounded-full bg-purple-500 hover:bg-purple-600 text-white border-none shadow-md shadow-purple-500/20 transition-all group"
                                                     disabled={!apiKey}
+                                                    title={t('apiKeyFun.cli.claudeTooltip', { defaultValue: 'Sync API Key & BaseURL to Claude Code' })}
                                                 >
                                                     <Cpu size={14} className="mr-1.5 opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
                                                     Claude
                                                 </button>
                                             )}
+                                            <button
+                                                onClick={handleSyncOpenCode}
+                                                className="flex-1 sm:flex-none btn btn-sm px-5 font-medium rounded-full bg-teal-500 hover:bg-teal-600 text-white border-none shadow-md shadow-teal-500/20 transition-all group"
+                                                disabled={!apiKey.trim() || !baseUrl.trim() || querying || syncingOpenCode}
+                                                title={t('apiKeyFun.cli.opencodeTooltip', { defaultValue: 'Sync API Key, BaseURL and models to OpenCode' })}
+                                            >
+                                                <CodeXml size={14} className="mr-1.5 opacity-90 group-hover:scale-110 group-hover:opacity-100 transition-all" />
+                                                OpenCode
+                                            </button>
                                         </div>
                                     );
                                 })()}

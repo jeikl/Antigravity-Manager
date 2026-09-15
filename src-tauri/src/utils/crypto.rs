@@ -43,12 +43,22 @@ where
     if raw.starts_with(ENCRYPTED_V2_PREFIX) {
         match decrypt_string_v2(&raw[ENCRYPTED_V2_PREFIX.len()..]) {
             Ok(plaintext) => Ok(plaintext),
-            Err(_) => Ok(raw),
+            Err(_) => {
+                tracing::warn!(
+                    "password decryption failed, key likely changed (machine-id differs from when it was encrypted)"
+                );
+                Ok(raw)
+            }
         }
     } else if raw.starts_with(ENCRYPTED_PREFIX) {
         match decrypt_legacy(&raw[ENCRYPTED_PREFIX.len()..]) {
             Ok(plaintext) => Ok(plaintext),
-            Err(_) => Ok(raw),
+            Err(_) => {
+                tracing::warn!(
+                    "password decryption failed, key likely changed (machine-id differs from when it was encrypted)"
+                );
+                Ok(raw)
+            }
         }
     } else {
         match decrypt_legacy(&raw) {
@@ -169,5 +179,41 @@ mod tests {
 
         let decrypted = decrypt_string(&legacy_encrypted).unwrap();
         assert_eq!(password, decrypted);
+    }
+
+    #[derive(Deserialize)]
+    struct PasswordContainer {
+        #[serde(deserialize_with = "deserialize_password")]
+        password: String,
+    }
+
+    #[test]
+    fn test_deserialize_password_plaintext() {
+        let json = r#"{"password": "plain_password_123"}"#;
+        let parsed: PasswordContainer = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.password, "plain_password_123");
+    }
+
+    #[test]
+    fn test_deserialize_password_valid_encrypted() {
+        let encrypted = encrypt_string("secret_pass_456").unwrap();
+        let json = format!(r#"{{"password": "{}"}}"#, encrypted);
+        let parsed: PasswordContainer = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.password, "secret_pass_456");
+    }
+
+    #[test]
+    fn test_deserialize_password_failed_decryption_returns_raw() {
+        // Corrupted v2 payload: should return raw string as fallback
+        let corrupted_v2 = "ag_enc_v2_invalidnonce.invalidciphertext";
+        let json_v2 = format!(r#"{{"password": "{}"}}"#, corrupted_v2);
+        let parsed_v2: PasswordContainer = serde_json::from_str(&json_v2).unwrap();
+        assert_eq!(parsed_v2.password, corrupted_v2);
+
+        // Corrupted legacy payload with ag_enc_ prefix: should return raw string as fallback
+        let corrupted_legacy = "ag_enc_invalidbase64content==";
+        let json_legacy = format!(r#"{{"password": "{}"}}"#, corrupted_legacy);
+        let parsed_legacy: PasswordContainer = serde_json::from_str(&json_legacy).unwrap();
+        assert_eq!(parsed_legacy.password, corrupted_legacy);
     }
 }

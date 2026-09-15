@@ -300,7 +300,7 @@ impl TokenManager {
                     // 跳过无效账号
                 }
                 Err(e) => {
-                    tracing::debug!("加载账号失败 {:?}: {}", path, e);
+                    tracing::warn!("加载账号失败 {:?}: {}", path, e);
                 }
             }
         }
@@ -321,6 +321,12 @@ impl TokenManager {
 
         match self.load_single_account(&path).await {
             Ok(Some(token)) => {
+                // 如果账号配额恢复（存在 >0% 的配额），自动清除此前的限流与熔断记录
+                if let Some(quota) = token.remaining_quota {
+                    if quota > 0 {
+                        self.rate_limit_tracker.clear(account_id);
+                    }
+                }
                 self.tokens.insert(account_id.to_string(), token);
                 self.sync_image_scheduler_accounts();
                 Ok(())
@@ -721,6 +727,9 @@ impl TokenManager {
             }
         }
 
+        // [NEW] 同步零配额持续熔断状态（若开启 lock_on_zero_quota 且 5h/周配额为 0，持续熔断至 reset_time）
+        self.sync_zero_quota_circuit_breaker(&account_id, &account);
+
         Ok(Some(ProxyToken {
             account_id,
             access_token,
@@ -766,6 +775,15 @@ impl TokenManager {
         };
 
         if !config.enabled {
+            // [FIX] 当配额保护在全局关闭时，清空受保护模型列表，避免遗留锁定显示与调度过滤
+            if let Some(arr) = account_json.get_mut("protected_models").and_then(|v| v.as_array_mut()) {
+                if !arr.is_empty() {
+                    arr.clear();
+                    let _ = update_account_json(account_path, |latest| {
+                        latest["protected_models"] = serde_json::Value::Array(Vec::new());
+                    }).await;
+                }
+            }
             return false; // 配额保护未启用
         }
 
@@ -2855,13 +2873,20 @@ impl TokenManager {
             .and_then(|m| crate::proxy::common::model_mapping::normalize_to_standard_id(m));
         let model_to_lock = normalized_model.or(model);
 
+        let cap = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
+            !cfg.lock_on_zero_quota
+        } else {
+            true
+        };
+
         if let Some(reset_time_str) = self.get_quota_reset_time(account_id) {
-            tracing::info!("找到账号 {} 的配额刷新时间: {}", account_id, reset_time_str);
-            self.rate_limit_tracker.set_lockout_until_iso(
+            tracing::info!("找到账号 {} 的配额刷新时间: {} (cap_to_max: {})", account_id, reset_time_str, cap);
+            self.rate_limit_tracker.set_lockout_until_iso_with_cap(
                 account_id,
                 &reset_time_str,
                 reason,
                 model_to_lock,
+                cap,
             )
         } else {
             tracing::debug!(
@@ -2942,12 +2967,19 @@ impl TokenManager {
                     });
                     let model_to_lock = normalized_model.or(model);
 
+                    let cap = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
+                        !cfg.lock_on_zero_quota
+                    } else {
+                        true
+                    };
+
                     // [FIX] 使用 account_id 作为 key，与 is_rate_limited 检查一致
-                    self.rate_limit_tracker.set_lockout_until_iso(
+                    self.rate_limit_tracker.set_lockout_until_iso_with_cap(
                         &account_id,
                         reset_time_str,
                         reason,
                         model_to_lock,
+                        cap,
                     )
                 } else {
                     tracing::warn!("账号 {} 配额刷新成功但未找到 reset_time", email);
@@ -3567,6 +3599,107 @@ impl TokenManager {
         }
 
         earliest_ts
+    }
+
+    /// [NEW] 检查并同步零配额持续熔断（5小时窗口或周配额用光直接持续熔断至重置时间）
+    fn sync_zero_quota_circuit_breaker(&self, account_id: &str, account: &serde_json::Value) {
+        let lock_on_zero = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
+            cfg.enabled && cfg.lock_on_zero_quota
+        } else {
+            false
+        };
+
+        if !lock_on_zero {
+            return;
+        }
+
+        let quota = match account.get("quota") {
+            Some(q) => q,
+            None => return,
+        };
+
+        // 1. 优先检查 quota_groups 中的 5h 和 weekly buckets，按模型组精准隔离，杜绝全账号误杀
+        if let Some(groups) = quota.get("quota_groups").and_then(|g| g.as_array()) {
+            for group in groups {
+                let group_name = group.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+                let is_claude_group = group_name.to_lowercase().contains("claude") || group_name.to_lowercase().contains("gpt");
+                let is_gemini_group = group_name.to_lowercase().contains("gemini");
+
+                if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                    for bucket in buckets {
+                        let remaining_fraction = bucket
+                            .get("remaining_fraction")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0);
+
+                        let reset_time = bucket
+                            .get("reset_time")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        // 如果 5h 或 weekly 配额耗尽 (<= 0.001)
+                        if remaining_fraction <= 0.001 && !reset_time.is_empty() {
+                            let bucket_id = bucket
+                                .get("bucket_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+
+                            // 精确划分模型组 Key，避免连坐同一个账号下额度充沛的其它模型
+                            let target_model = if is_claude_group || bucket_id.contains("3p") {
+                                Some("claude".to_string())
+                            } else if is_gemini_group || bucket_id.contains("gemini") {
+                                Some("gemini-3-flash".to_string())
+                            } else {
+                                None
+                            };
+
+                            tracing::warn!(
+                                "[CircuitBreaker] 账号 {} 的配额桶 {} 已耗尽 (0%), 针对模型 {:?} 持续锁定至 {}",
+                                account_id,
+                                bucket_id,
+                                target_model,
+                                reset_time
+                            );
+
+                            self.rate_limit_tracker.set_lockout_until_iso_with_cap(
+                                account_id,
+                                reset_time,
+                                crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+                                target_model,
+                                false, // 不截断为 300s，持续锁定到真实 reset_time
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 回退到 models 配额检查
+        if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
+            // 只要受监控核心模型或全部模型为 0%，且有有效 reset_time
+            let all_zero = models.iter().all(|m| {
+                m.get("percentage")
+                    .and_then(|p| p.as_i64())
+                    .unwrap_or(100) == 0
+            });
+
+            if all_zero && !models.is_empty() {
+                if let Some(reset_time_str) = self.get_quota_reset_time(account_id) {
+                    tracing::warn!(
+                        "[CircuitBreaker] 账号 {} 的模型配额已全部为 0%, 持续锁定至 {}",
+                        account_id,
+                        reset_time_str
+                    );
+                    self.rate_limit_tracker.set_lockout_until_iso_with_cap(
+                        account_id,
+                        &reset_time_str,
+                        crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+                        None,
+                        false,
+                    );
+                }
+            }
+        }
     }
 
     /// 获取当前所有可用账号中收集到的官方下发的所有动态模型集合

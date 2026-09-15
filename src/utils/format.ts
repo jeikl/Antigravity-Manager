@@ -32,8 +32,22 @@ export function getQuotaColor(percentage: number): string {
     return 'error';
 }
 
+export function parseFlexibleDate(dateStr: string | undefined | null): Date | null {
+    if (!dateStr || dateStr.trim() === '') return null;
+    const trimmed = dateStr.trim();
+    // 兼容纯数字 Unix 时间戳（秒或毫秒）
+    if (/^\d+$/.test(trimmed)) {
+        const num = parseInt(trimmed, 10);
+        return new Date(trimmed.length <= 10 ? num * 1000 : num);
+    }
+    const parsed = new Date(trimmed);
+    return isNaN(parsed.getTime()) ? null : parsed;
+}
+
 export function formatTimeRemaining(dateStr: string): string {
-    const targetDate = new Date(dateStr);
+    const targetDate = parseFlexibleDate(dateStr);
+    if (!targetDate) return '0h 0m';
+
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 
@@ -53,7 +67,9 @@ export function formatTimeRemaining(dateStr: string): string {
 
 export function getTimeRemainingColor(dateStr: string | undefined): string {
     if (!dateStr) return 'gray';
-    const targetDate = new Date(dateStr);
+    const targetDate = parseFlexibleDate(dateStr);
+    if (!targetDate) return 'gray';
+
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 

@@ -2036,8 +2036,12 @@ pub async fn handle_chat_completions(
                 {
                     Ok(t) => t,
                     Err(e) => {
-                        // [FIX] Attach headers to error response for logging visibility
-                        let headers = [("X-Mapped-Model", mapped_model.as_str())];
+                        // [Issue #3414] Attach headers with Retry-After if temporary cooldown exists
+                        let headers = crate::proxy::handlers::common::build_token_error_headers(
+                            Some(mapped_model.as_str()),
+                            None,
+                            &e,
+                        );
                         return Ok((
                             StatusCode::SERVICE_UNAVAILABLE,
                             headers,
@@ -2094,6 +2098,14 @@ pub async fn handle_chat_completions(
             .await;
         }
 
+        let actual_request_type = gemini_body
+            .get("requestType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none (standard)");
+        info!(
+            "[{}] Upstream request ready -> model: {}, requestType: {}",
+            trace_id, mapped_model, actual_request_type
+        );
         debug!(
             "[OpenAI-Request] Transformed Gemini body: {} bytes",
             serialized_json_len(&gemini_body)
@@ -2740,6 +2752,19 @@ pub async fn handle_chat_completions(
             continue; // 重试
         }
 
+        // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入,长工具循环会把累计推过 1M,
+        // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
+        // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
+        if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
+            let fingerprint = SessionManager::extract_openai_session_id(&openai_req);
+            let generation = crate::proxy::common::session::bump_session(&account_id, &fingerprint);
+            tracing::warn!(
+                "[OpenAI] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
+                email, generation
+            );
+            continue; // 重试:下一轮 transform 时读取新代数,派生全新 sessionId
+        }
+
         // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
         error!(
             "OpenAI Upstream non-retryable error {} on account {}: {}",
@@ -2765,22 +2790,18 @@ pub async fn handle_chat_completions(
 
     // 所有尝试均失败：仅当全部结构化失败状态均为 429 时返回 429
     let final_status = failure_statuses.final_status();
+    let headers = crate::proxy::handlers::common::build_token_error_headers(
+        Some(mapped_model.as_str()),
+        last_email.as_deref(),
+        &last_error,
+    );
 
-    if let Some(email) = last_email {
-        Ok((
-            final_status,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    } else {
-        Ok((
-            final_status,
-            [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    }
+    Ok((
+        final_status,
+        headers,
+        format!("All accounts exhausted. Last error: {}", last_error),
+    )
+        .into_response())
 }
 
 // --- Codex GUIDANCE PROMPTS ---
@@ -3826,9 +3847,14 @@ pub async fn handle_completions(
                 {
                     Ok(t) => t,
                     Err(e) => {
+                        let headers = crate::proxy::handlers::common::build_token_error_headers(
+                            Some(mapped_model.as_str()),
+                            None,
+                            &e,
+                        );
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
-                            [("X-Mapped-Model", mapped_model)],
+                            headers,
                             format!("Token error: {}", e),
                         )
                             .into_response()
@@ -4559,21 +4585,17 @@ pub async fn handle_completions(
 
     // 所有尝试均失败
     let final_status = failure_statuses.final_status();
-    if let Some(email) = last_email {
-        (
-            final_status,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response()
-    } else {
-        (
-            final_status,
-            [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response()
-    }
+    let headers = crate::proxy::handlers::common::build_token_error_headers(
+        Some(mapped_model.as_str()),
+        last_email.as_deref(),
+        &last_error,
+    );
+    (
+        final_status,
+        headers,
+        format!("All accounts exhausted. Last error: {}", last_error),
+    )
+        .into_response()
 }
 
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {

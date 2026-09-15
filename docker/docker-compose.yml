@@ -16,3 +16,8 @@ services:
       - ABV_BIND_LOCAL_ONLY=${ABV_BIND_LOCAL_ONLY:-true}  # 僅綁定 127.0.0.1
       - ABV_DATA_DIR=${ABV_DATA_DIR:-/root/.antigravity_tools}  # 容器内数据目录，需与上方 volume 目标路径一致
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"

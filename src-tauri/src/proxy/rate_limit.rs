@@ -151,19 +151,19 @@ impl RateLimitTracker {
         // 或者我们可以引入索引，但为了简单，暂时只清除 Account 级锁。
     }
 
-    /// 精确锁定账号到指定时间点
-    ///
-    /// 使用账号配额中的 reset_time 来精确锁定账号,
-    /// 这比指数退避更加精准。
+    /// 精确锁定账号到指定时间点 (支持是否遵循 MAX_LOCKOUT_SECONDS 上限)
     ///
     /// # 参数
     /// - `model`: 可选的模型名称,用于模型级别限流。None 表示账号级别限流
-    pub fn set_lockout_until(
+    /// - `cap_to_max`: 是否将锁定时长限制在 MAX_LOCKOUT_SECONDS (300s) 以内。
+    ///   如果为 false，则直接锁定到真实的 reset_time（用于零配额持续熔断）。
+    pub fn set_lockout_until_with_cap(
         &self,
         account_id: &str,
         reset_time: SystemTime,
         reason: RateLimitReason,
         model: Option<String>,
+        cap_to_max: bool,
     ) {
         let now = SystemTime::now();
         let (mut retry_sec, mut effective_reset_time) = reset_time
@@ -171,7 +171,7 @@ impl RateLimitTracker {
             .map(|duration| (duration.as_secs(), reset_time))
             .unwrap_or((60, now + Duration::from_secs(60)));
 
-        if retry_sec > MAX_LOCKOUT_SECONDS {
+        if cap_to_max && retry_sec > MAX_LOCKOUT_SECONDS {
             tracing::info!(
                 "Capping lockout time for {} from {}s to 300s (5 minutes)",
                 account_id,
@@ -194,18 +194,31 @@ impl RateLimitTracker {
 
         if let Some(m) = &model {
             tracing::info!(
-                "账号 {} 的模型 {} 已精确锁定到配额刷新时间,剩余 {} 秒",
+                "账号 {} 的模型 {} 已精确锁定到配额刷新时间,剩余 {} 秒 (cap_to_max: {})",
                 account_id,
                 m,
-                retry_sec
+                retry_sec,
+                cap_to_max
             );
         } else {
             tracing::info!(
-                "账号 {} 已精确锁定到配额刷新时间,剩余 {} 秒",
+                "账号 {} 已精确锁定到配额刷新时间,剩余 {} 秒 (cap_to_max: {})",
                 account_id,
-                retry_sec
+                retry_sec,
+                cap_to_max
             );
         }
+    }
+
+    /// 精确锁定账号到指定时间点 (默认限制在 300s 内)
+    pub fn set_lockout_until(
+        &self,
+        account_id: &str,
+        reset_time: SystemTime,
+        reason: RateLimitReason,
+        model: Option<String>,
+    ) {
+        self.set_lockout_until_with_cap(account_id, reset_time, reason, model, true);
     }
 
     pub fn restore_persisted_long_image_limit(
@@ -241,6 +254,33 @@ impl RateLimitTracker {
         true
     }
 
+    pub fn set_lockout_until_iso_with_cap(
+        &self,
+        account_id: &str,
+        reset_time_str: &str,
+        reason: RateLimitReason,
+        model: Option<String>,
+        cap_to_max: bool,
+    ) -> bool {
+        // 尝试解析 ISO 8601 格式
+        match chrono::DateTime::parse_from_rfc3339(reset_time_str) {
+            Ok(dt) => {
+                let reset_time =
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64);
+                self.set_lockout_until_with_cap(account_id, reset_time, reason, model, cap_to_max);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "无法解析配额刷新时间 '{}': {},将使用默认退避策略",
+                    reset_time_str,
+                    e
+                );
+                false
+            }
+        }
+    }
+
     /// 使用 ISO 8601 时间字符串精确锁定账号
     ///
     /// 解析类似 "2026-01-08T17:00:00Z" 格式的时间字符串
@@ -254,23 +294,7 @@ impl RateLimitTracker {
         reason: RateLimitReason,
         model: Option<String>,
     ) -> bool {
-        // 尝试解析 ISO 8601 格式
-        match chrono::DateTime::parse_from_rfc3339(reset_time_str) {
-            Ok(dt) => {
-                let reset_time =
-                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64);
-                self.set_lockout_until(account_id, reset_time, reason, model);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "无法解析配额刷新时间 '{}': {},将使用默认退避策略",
-                    reset_time_str,
-                    e
-                );
-                false
-            }
-        }
+        self.set_lockout_until_iso_with_cap(account_id, reset_time_str, reason, model, true)
     }
 
     /// 从错误响应解析限流信息
@@ -475,13 +499,15 @@ impl RateLimitTracker {
         };
 
         let mut retry_sec = retry_sec;
-        if retry_sec > MAX_LOCKOUT_SECONDS && !preserve_long_image_quota {
+        let max_allowed_lockout = backoff_steps.iter().copied().max().unwrap_or(MAX_LOCKOUT_SECONDS).max(MAX_LOCKOUT_SECONDS);
+        if retry_sec > max_allowed_lockout && !preserve_long_image_quota {
             tracing::info!(
-                "Capping retry lockout time for {} from {}s to 300s (5 minutes)",
+                "Capping retry lockout time for {} from {}s to {}s (max backoff limit)",
                 account_id,
-                retry_sec
+                retry_sec,
+                max_allowed_lockout
             );
-            retry_sec = MAX_LOCKOUT_SECONDS;
+            retry_sec = max_allowed_lockout;
         }
 
         let info = RateLimitInfo {
@@ -557,12 +583,14 @@ impl RateLimitTracker {
         // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
         let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
             || body_lower.contains("resource_exhausted");
-        let explicit_quota_exhausted = body_lower.contains("quota_exhausted")
-            || body_lower.contains("quotaresetdelay")
+        let explicit_quota_exhausted = body_lower.contains("quotaresetdelay")
+            || body_lower.contains("quotareset")
             || body_lower.contains("quota reset")
             || body_lower.contains("quota limit")
             || body_lower.contains("per day")
-            || body_lower.contains("daily quota");
+            || body_lower.contains("daily quota")
+            || (body_lower.contains("quota_exhausted")
+                && crate::proxy::upstream::retry::parse_retry_delay(body, None).is_some());
 
         if body_lower.contains("per minute")
             || body_lower.contains("rate limit")
@@ -570,8 +598,10 @@ impl RateLimitTracker {
             || (generic_resource_exhausted && !explicit_quota_exhausted)
         {
             RateLimitReason::RateLimitExceeded
-        } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
+        } else if explicit_quota_exhausted {
             RateLimitReason::QuotaExhausted
+        } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
+            RateLimitReason::RateLimitExceeded
         } else {
             RateLimitReason::Unknown
         }
@@ -1023,5 +1053,21 @@ mod tests {
         // 第 4 次 429 → 7200 秒
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
         assert_eq!(info.unwrap().retry_after_sec, 7200);
+    }
+
+    #[test]
+    fn test_set_lockout_until_with_cap() {
+        let tracker = RateLimitTracker::new();
+        let target_time = SystemTime::now() + Duration::from_secs(5 * 3600); // 5 hours
+
+        // Capped: should be capped to 300s
+        tracker.set_lockout_until_with_cap("acc_cap", target_time, RateLimitReason::QuotaExhausted, None, true);
+        let wait_capped = tracker.get_remaining_wait("acc_cap", None);
+        assert!(wait_capped <= 300 && wait_capped >= 290);
+
+        // Uncapped (Zero Quota): should retain full 5 hours duration
+        tracker.set_lockout_until_with_cap("acc_uncap", target_time, RateLimitReason::QuotaExhausted, None, false);
+        let wait_uncapped = tracker.get_remaining_wait("acc_uncap", None);
+        assert!(wait_uncapped > 300 && wait_uncapped <= 5 * 3600);
     }
 }

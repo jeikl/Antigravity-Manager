@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Override dark background utilities so enabled switches remain distinct. */
+.dark input.toggle[type="checkbox"]:checked {
+  background-color: var(--app-toggle-active, #3b82f6);
+  border-color: var(--app-toggle-active, #3b82f6);
+}
+
+.dark input.toggle[type="checkbox"]:checked::before {
+  background-color: #ffffff;
+}
+
+.dark input.toggle.toggle-success { --app-toggle-active: #16a34a; }
+.dark input.toggle.toggle-warning { --app-toggle-active: #d97706; }
+.dark input.toggle.toggle-error { --app-toggle-active: #dc2626; }
+
 /* 禁止过度滚动和橡皮筋效果 */
 html,
 body {

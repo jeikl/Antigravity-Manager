@@ -23,6 +23,8 @@ const BACKUP_SUFFIX: &str = ".antigravity-manager.bak";
 const OLD_BACKUP_SUFFIX: &str = ".antigravity.bak";
 
 const ANTIGRAVITY_PROVIDER_ID: &str = "antigravity-manager";
+const APIKEY_FUN_PROVIDER_ID: &str = "apikey-fun";
+const OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
 
 /// Variant type for model variants
 #[derive(Debug, Clone, Copy)]
@@ -345,7 +347,7 @@ fn get_config_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
 /// handled separately by [`strip_jsonc_trailing_commas`].
 fn strip_jsonc_comments(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     let mut in_string = false;
 
@@ -353,10 +355,10 @@ fn strip_jsonc_comments(input: &str) -> String {
         let c = bytes[i];
 
         if in_string {
-            out.push(c as char);
+            out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
                 // Keep the escaped char verbatim (e.g. \", \\, \/).
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -370,7 +372,7 @@ fn strip_jsonc_comments(input: &str) -> String {
         match c {
             b'"' => {
                 in_string = true;
-                out.push('"');
+                out.push(b'"');
                 i += 1;
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
@@ -389,13 +391,14 @@ fn strip_jsonc_comments(input: &str) -> String {
                 i = (i + 2).min(bytes.len());
             }
             _ => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
     }
 
-    out
+    // Only ASCII syntax is removed; all UTF-8 string bytes remain intact.
+    String::from_utf8(out).expect("JSONC normalization preserves UTF-8")
 }
 
 /// Remove trailing commas (a `,` followed, after optional whitespace, by a closing
@@ -404,7 +407,7 @@ fn strip_jsonc_comments(input: &str) -> String {
 /// never touched.
 fn strip_jsonc_trailing_commas(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     let mut in_string = false;
 
@@ -412,9 +415,9 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
         let c = bytes[i];
 
         if in_string {
-            out.push(c as char);
+            out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -427,7 +430,7 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
 
         if c == b'"' {
             in_string = true;
-            out.push('"');
+            out.push(b'"');
             i += 1;
             continue;
         }
@@ -452,17 +455,18 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
                 // Skip the comma (don't push it); leave the whitespace to be pushed normally.
                 i += 1;
             } else {
-                out.push(',');
+                out.push(b',');
                 i += 1;
             }
             continue;
         }
 
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
 
-    out
+    // Only ASCII syntax is removed; all UTF-8 string bytes remain intact.
+    String::from_utf8(out).expect("JSONC normalization preserves UTF-8")
 }
 
 /// Read and parse an OpenCode config file, tolerating JSONC comments and trailing commas.
@@ -1080,7 +1084,10 @@ fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
                 "low".to_string(),
                 build_gemini3_effort_variant(VariantTier::Low),
             );
-            variants.insert("medium".to_string(), serde_json::json!({ "disabled": true }));
+            variants.insert(
+                "medium".to_string(),
+                serde_json::json!({ "disabled": true }),
+            );
             variants.insert(
                 "high".to_string(),
                 build_gemini3_effort_variant(VariantTier::High),
@@ -1218,10 +1225,69 @@ fn build_fallback_model_json(model_id: &str, display_name: Option<&str>) -> Valu
     Value::Object(entry)
 }
 
+/// Bare model id without a `vendor/` prefix (`anthropic/claude-sonnet-4-6` -> `claude-sonnet-4-6`).
+fn strip_model_vendor_prefix(model_id: &str) -> &str {
+    model_id.rsplit('/').next().unwrap_or(model_id)
+}
+
+fn is_short_version_token(s: &str) -> bool {
+    let len = s.len();
+    (1..=2).contains(&len) && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Join adjacent 1–2 digit version tokens with dots (`4-6` -> `4.6`).
+fn merge_hyphenated_version_tokens(model_id: &str) -> String {
+    let parts: Vec<&str> = model_id.split('-').filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(parts.len());
+    let mut i = 0;
+    while i < parts.len() {
+        if i + 1 < parts.len()
+            && is_short_version_token(parts[i])
+            && is_short_version_token(parts[i + 1])
+        {
+            out.push(format!("{}.{}", parts[i], parts[i + 1]));
+            i += 2;
+        } else {
+            out.push(parts[i].to_string());
+            i += 1;
+        }
+    }
+    out.join("-")
+}
+
+/// IDs to try against the catalog: original, vendor-stripped, dotted/dashed version variants.
+fn catalog_lookup_ids(model_id: &str) -> Vec<String> {
+    let bare = strip_model_vendor_prefix(model_id.trim());
+    let mut ids = Vec::new();
+    let mut push = |id: String| {
+        if !id.is_empty() && !ids.iter().any(|existing| existing == &id) {
+            ids.push(id);
+        }
+    };
+    push(model_id.trim().to_string());
+    push(bare.to_string());
+    push(bare.replace('.', "-"));
+    push(merge_hyphenated_version_tokens(bare));
+    ids
+}
+
+fn lookup_catalog_model<'a>(
+    catalog: &HashMap<&str, &'a ModelDef>,
+    model_id: &str,
+) -> Option<&'a ModelDef> {
+    for candidate in catalog_lookup_ids(model_id) {
+        if let Some(model) = catalog.get(candidate.as_str()) {
+            return Some(*model);
+        }
+    }
+    None
+}
+
 /// Derive a readable name from a model id, preserving version dots
-/// (e.g. "gemini-3.5-flash-low" -> "Gemini 3.5 Flash Low").
+/// (e.g. "gemini-3.5-flash-low" -> "Gemini 3.5 Flash Low",
+/// "claude-sonnet-4-6" -> "Claude Sonnet 4.6").
 fn humanize_model_id(model_id: &str) -> String {
-    model_id
+    merge_hyphenated_version_tokens(strip_model_vendor_prefix(model_id))
         .split('-')
         .filter(|s| !s.is_empty())
         .map(|s| {
@@ -1422,6 +1488,91 @@ pub fn sync_opencode_config(
     if sync_accounts {
         sync_accounts_file(&ag_accounts_path)?;
     }
+
+    Ok(())
+}
+
+/// Provider ids become JSON keys in opencode.json and are accepted over the admin
+/// HTTP API, so restrict them to a safe charset.
+fn validate_provider_id(provider_id: &str) -> Result<(), String> {
+    if provider_id.is_empty() {
+        return Err("OpenCode provider id is required".to_string());
+    }
+    if !provider_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "Invalid OpenCode provider id '{}': only letters, digits, '-' and '_' are allowed",
+            provider_id
+        ));
+    }
+    Ok(())
+}
+
+pub fn sync_opencode_openai_provider(
+    provider_id: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    api_key: &str,
+    models_to_sync: Option<Vec<ModelInput>>,
+) -> Result<(), String> {
+    let provider_id = provider_id.trim();
+    validate_provider_id(provider_id)?;
+
+    let Some((config_path, _, _)) = get_config_paths() else {
+        return Err("Failed to get OpenCode config directory".to_string());
+    };
+
+    sync_openai_provider_to_path(
+        &config_path,
+        provider_id,
+        provider_name,
+        proxy_url,
+        api_key,
+        models_to_sync.as_deref(),
+    )
+}
+
+fn sync_openai_provider_to_path(
+    config_path: &PathBuf,
+    provider_id: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    api_key: &str,
+    models_to_sync: Option<&[ModelInput]>,
+) -> Result<(), String> {
+    // A read/parse failure must never turn a user's existing config into {}.
+    let mut config = match fs::read_to_string(config_path) {
+        Ok(content) => parse_jsonc(&content)
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                "OpenCode config must be a valid JSON/JSONC object; file left unchanged".to_string()
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(format!("Failed to read OpenCode config: {}", error)),
+    };
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    create_backup(config_path)?;
+
+    config = apply_openai_compatible_provider_sync(
+        config,
+        provider_id,
+        provider_name,
+        proxy_url,
+        api_key,
+        models_to_sync,
+    );
+
+    let tmp_path = config_path.with_extension("tmp");
+    fs::write(&tmp_path, serde_json::to_string_pretty(&config).unwrap())
+        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    fs::rename(&tmp_path, config_path)
+        .map_err(|e| format!("Failed to rename config file: {}", e))?;
 
     Ok(())
 }
@@ -1671,6 +1822,116 @@ fn apply_sync_to_config(
             merge_provider_options(ag_provider, &normalized_url, api_key);
             migrate_gemini_alias_models(ag_provider);
             merge_catalog_models(ag_provider, models_to_sync);
+        }
+    }
+
+    config
+}
+
+/// Replace the provider's model list with the given inputs. The list mirrors the
+/// models actually exposed by the upstream key, so models absent from the input are
+/// dropped (unlike the Antigravity sync which merges). Known catalog ids still get
+/// full catalog metadata, and user-defined fields on surviving models are preserved.
+fn replace_provider_models(provider: &mut Value, model_inputs: Option<&[ModelInput]>) {
+    if provider.get("models").is_none() {
+        provider["models"] = serde_json::json!({});
+    }
+
+    // An absent or empty list means "keep whatever is there" — e.g. the user synced
+    // before querying models, or called the HTTP API with no models field.
+    let Some(inputs) = model_inputs else {
+        return;
+    };
+    if inputs.is_empty() {
+        return;
+    }
+
+    let catalog = build_model_catalog();
+    let catalog_map: HashMap<&str, &ModelDef> = catalog.iter().map(|m| (m.id, m)).collect();
+    let existing_models: serde_json::Map<String, Value> = provider
+        .get("models")
+        .and_then(|m| m.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut models = serde_json::Map::new();
+    for input in inputs {
+        let model_id = input.id.trim();
+        if model_id.is_empty() {
+            continue;
+        }
+        let entry = match lookup_catalog_model(&catalog_map, model_id) {
+            Some(model_def) => {
+                let catalog_model = build_model_json(model_def);
+                match existing_models.get(model_id) {
+                    Some(existing) if existing.is_object() => {
+                        let mut merged = existing.as_object().unwrap().clone();
+                        if let Some(catalog_obj) = catalog_model.as_object() {
+                            for (key, value) in catalog_obj {
+                                merged.insert(key.clone(), value.clone());
+                            }
+                        }
+                        Value::Object(merged)
+                    }
+                    _ => catalog_model,
+                }
+            }
+            None => {
+                // Unknown upstream models often have manually configured limits,
+                // tool support, or options that cannot be recovered from the catalog.
+                let mut entry = existing_models
+                    .get(model_id)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Value::Object(defaults) =
+                    build_fallback_model_json(model_id, input.name.as_deref())
+                {
+                    for (key, value) in defaults {
+                        entry.entry(key).or_insert(value);
+                    }
+                }
+                Value::Object(entry)
+            }
+        };
+        models.insert(model_id.to_string(), entry);
+    }
+    provider["models"] = Value::Object(models);
+}
+
+fn apply_openai_compatible_provider_sync(
+    mut config: Value,
+    provider_id: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    api_key: &str,
+    models_to_sync: Option<&[ModelInput]>,
+) -> Value {
+    if !config.is_object() {
+        config = serde_json::json!({});
+    }
+
+    if config.get("$schema").is_none() {
+        config["$schema"] = Value::String("https://opencode.ai/config.json".to_string());
+    }
+
+    let normalized_url = normalize_opencode_base_url(proxy_url);
+    let display_name = if provider_name.trim().is_empty() {
+        "APIKEY.FUN"
+    } else {
+        provider_name.trim()
+    };
+
+    ensure_object(&mut config, "provider");
+
+    if let Some(provider) = config.get_mut("provider").and_then(|p| p.as_object_mut()) {
+        ensure_provider_object(provider, provider_id);
+        if let Some(target) = provider.get_mut(provider_id) {
+            ensure_provider_string_field(target, "npm", OPENAI_COMPATIBLE_NPM);
+            ensure_provider_string_field(target, "name", display_name);
+            ensure_object(target, "options");
+            merge_provider_options(target, &normalized_url, api_key);
+            replace_provider_models(target, models_to_sync);
         }
     }
 
@@ -2352,6 +2613,338 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_openai_compatible_sync_creates_apikey_fun_provider() {
+        let config = serde_json::json!({
+            "provider": {
+                ANTIGRAVITY_PROVIDER_ID: {
+                    "npm": "@ai-sdk/anthropic",
+                    "name": "Antigravity Manager",
+                    "options": { "apiKey": "ag-key" }
+                }
+            }
+        });
+        let models_to_sync = [
+            minput("gpt-5.5"),
+            minput_named("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ];
+
+        let result = apply_openai_compatible_provider_sync(
+            config,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun",
+            "fun-key",
+            Some(&models_to_sync),
+        );
+
+        let provider = result.get("provider").unwrap();
+        assert!(
+            provider.get(ANTIGRAVITY_PROVIDER_ID).is_some(),
+            "antigravity-manager provider should be preserved"
+        );
+        let fun = provider.get(APIKEY_FUN_PROVIDER_ID).unwrap();
+        assert_eq!(fun.get("npm").unwrap(), OPENAI_COMPATIBLE_NPM);
+        assert_eq!(fun.get("name").unwrap(), "APIKEY.FUN");
+        assert_eq!(
+            fun.get("options").unwrap().get("baseURL").unwrap(),
+            "https://api.apikey.fun/v1"
+        );
+        assert_eq!(
+            fun.get("options").unwrap().get("apiKey").unwrap(),
+            "fun-key"
+        );
+
+        let models = fun.get("models").unwrap().as_object().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models.get("gpt-5.5").unwrap().get("name").unwrap(),
+            "Gpt 5.5"
+        );
+
+        // claude-sonnet-4-6 is in the catalog: full metadata, dotted display name.
+        let claude = models.get("claude-sonnet-4-6").unwrap();
+        assert_eq!(claude.get("name").unwrap(), "Claude Sonnet 4.6");
+        assert_eq!(claude["limit"]["context"], 200_000);
+        assert_eq!(claude["limit"]["output"], 64_000);
+        assert!(claude.get("modalities").is_some());
+    }
+
+    #[test]
+    fn test_openai_compatible_sync_replaces_models() {
+        let config = serde_json::json!({
+            "provider": {
+                APIKEY_FUN_PROVIDER_ID: {
+                    "models": {
+                        "old-model": { "name": "Old Model" }
+                    }
+                }
+            }
+        });
+
+        let result = apply_openai_compatible_provider_sync(
+            config,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1",
+            "fun-key",
+            Some(&[minput("gpt-5.5")]),
+        );
+
+        let models = result["provider"][APIKEY_FUN_PROVIDER_ID]["models"]
+            .as_object()
+            .unwrap();
+        assert!(models.contains_key("gpt-5.5"));
+        assert!(!models.contains_key("old-model"));
+    }
+
+    #[test]
+    fn test_openai_compatible_sync_empty_models_keeps_existing() {
+        let config = serde_json::json!({
+            "provider": {
+                APIKEY_FUN_PROVIDER_ID: {
+                    "models": {
+                        "gpt-4o": { "name": "GPT-4o", "custom": true }
+                    }
+                }
+            }
+        });
+
+        let result = apply_openai_compatible_provider_sync(
+            config,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1",
+            "fun-key",
+            Some(&[]),
+        );
+
+        let models = result["provider"][APIKEY_FUN_PROVIDER_ID]["models"]
+            .as_object()
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models.get("gpt-4o").unwrap().get("name").unwrap(), "GPT-4o");
+        assert_eq!(
+            models.get("gpt-4o").unwrap().get("custom").unwrap(),
+            &Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_provider_id_validation() {
+        assert!(validate_provider_id("apikey-fun").is_ok());
+        assert!(validate_provider_id("My_Provider2").is_ok());
+        assert!(validate_provider_id("").is_err());
+        assert!(validate_provider_id("  ").is_err());
+        assert!(validate_provider_id("bad/id").is_err());
+        assert!(validate_provider_id("bad id").is_err());
+    }
+
+    #[test]
+    fn test_openai_sync_preserves_unknown_model_settings() {
+        let existing = serde_json::json!({
+            "name": "My GPT",
+            "limit": { "context": 128_000, "output": 16_384 },
+            "options": { "reasoningEffort": "high" },
+            "tool_call": true
+        });
+        let result = apply_openai_compatible_provider_sync(
+            serde_json::json!({ "provider": { APIKEY_FUN_PROVIDER_ID: {
+                "models": { "gpt-5.5": existing.clone() }
+            }}}),
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1/",
+            "fun-key",
+            Some(&[minput("gpt-5.5")]),
+        );
+        assert_eq!(
+            result["provider"][APIKEY_FUN_PROVIDER_ID]["models"]["gpt-5.5"],
+            existing
+        );
+        assert_eq!(
+            result["provider"][APIKEY_FUN_PROVIDER_ID]["options"]["baseURL"],
+            "https://api.apikey.fun/v1"
+        );
+    }
+
+    #[test]
+    fn test_openai_sync_repairs_non_object_options() {
+        for options in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("invalid"),
+        ] {
+            let result = apply_openai_compatible_provider_sync(
+                serde_json::json!({ "provider": { APIKEY_FUN_PROVIDER_ID: { "options": options }}}),
+                APIKEY_FUN_PROVIDER_ID,
+                "APIKEY.FUN",
+                "https://api.apikey.fun",
+                "fun-key",
+                None,
+            );
+            assert_eq!(
+                result["provider"][APIKEY_FUN_PROVIDER_ID]["options"]["apiKey"],
+                "fun-key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openai_sync_leaves_invalid_config_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(OPENCODE_CONFIG_FILE_JSONC);
+        for content in ["{ broken", "[]", "null", ""] {
+            fs::write(&path, content).unwrap();
+            let result = sync_openai_provider_to_path(
+                &path,
+                APIKEY_FUN_PROVIDER_ID,
+                "APIKEY.FUN",
+                "https://api.apikey.fun",
+                "fun-key",
+                None,
+            );
+            assert!(result.is_err(), "must reject invalid config: {content}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+            assert!(!path.with_extension("tmp").exists());
+            assert!(!tmp
+                .path()
+                .join(format!("{OPENCODE_CONFIG_FILE_JSONC}{BACKUP_SUFFIX}"))
+                .exists());
+        }
+        // A read error must also propagate instead of replacing the config.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(sync_openai_provider_to_path(
+            &path,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun",
+            "fun-key",
+            None,
+        )
+        .is_err());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn test_openai_sync_preserves_jsonc_unicode_and_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(OPENCODE_CONFIG_FILE_JSONC);
+        let content = r#"{
+            // User settings must survive syncing another provider.
+            "instructions": ["инструкции.md", "日本語.md", "🚀.md",],
+            "provider": {"custom": {"name": "Мой провайдер",},},
+        }"#;
+        fs::write(&path, content).unwrap();
+        sync_openai_provider_to_path(
+            &path,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1/",
+            "fun-key",
+            Some(&[minput("gpt-5.5")]),
+        )
+        .unwrap();
+        let config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["instructions"],
+            serde_json::json!(["инструкции.md", "日本語.md", "🚀.md"])
+        );
+        assert_eq!(config["provider"]["custom"]["name"], "Мой провайдер");
+        assert_eq!(
+            config["provider"][APIKEY_FUN_PROVIDER_ID]["options"]["baseURL"],
+            "https://api.apikey.fun/v1"
+        );
+        let backup = tmp
+            .path()
+            .join(format!("{OPENCODE_CONFIG_FILE_JSONC}{BACKUP_SUFFIX}"));
+        assert_eq!(fs::read_to_string(&backup).unwrap(), content);
+        sync_openai_provider_to_path(
+            &path,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1",
+            "next-key",
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), content);
+    }
+
+    #[test]
+    fn test_openai_sync_creates_missing_config_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("new").join(OPENCODE_CONFIG_FILE);
+        sync_openai_provider_to_path(
+            &path,
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun",
+            "fun-key",
+            None,
+        )
+        .unwrap();
+        let config = parse_config_file(&path).unwrap();
+        assert_eq!(
+            config["provider"][APIKEY_FUN_PROVIDER_ID]["options"]["apiKey"],
+            "fun-key"
+        );
+    }
+
+    #[test]
+    fn test_humanize_joins_hyphenated_version() {
+        assert_eq!(humanize_model_id("claude-sonnet-4-6"), "Claude Sonnet 4.6");
+        assert_eq!(
+            humanize_model_id("claude-sonnet-4-6-thinking"),
+            "Claude Sonnet 4.6 Thinking"
+        );
+        assert_eq!(
+            humanize_model_id("gemini-3.5-flash-low"),
+            "Gemini 3.5 Flash Low"
+        );
+        assert_eq!(
+            humanize_model_id("anthropic/claude-opus-4-6"),
+            "Claude Opus 4.6"
+        );
+        assert_eq!(humanize_model_id("grok-4.20-0309"), "Grok 4.20 0309");
+    }
+
+    #[test]
+    fn test_openai_compatible_sync_matches_dotted_and_prefixed_ids() {
+        let result = apply_openai_compatible_provider_sync(
+            serde_json::json!({}),
+            APIKEY_FUN_PROVIDER_ID,
+            "APIKEY.FUN",
+            "https://api.apikey.fun/v1",
+            "fun-key",
+            Some(&[
+                minput("claude-sonnet-4.6"),
+                minput("anthropic/claude-opus-4-6"),
+            ]),
+        );
+        let models = result["provider"][APIKEY_FUN_PROVIDER_ID]["models"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            models
+                .get("claude-sonnet-4.6")
+                .unwrap()
+                .get("name")
+                .unwrap(),
+            "Claude Sonnet 4.6"
+        );
+        assert_eq!(
+            models
+                .get("anthropic/claude-opus-4-6")
+                .unwrap()
+                .get("name")
+                .unwrap(),
+            "Claude Opus 4.6"
+        );
+        assert_eq!(models["claude-sonnet-4.6"]["limit"]["context"], 200_000);
+    }
+
     // Tests for apply_clear_to_config
 
     #[test]
@@ -3000,6 +3593,33 @@ pub async fn execute_opencode_sync(
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         sync_opencode_config(&proxy_url, &api_key, sync_accounts.unwrap_or(false), models)
+    })
+    .await
+    .unwrap_or_else(|_| Err("Failed to execute sync".to_string()))
+}
+
+#[tauri::command]
+pub async fn execute_opencode_openai_sync(
+    proxy_url: String,
+    api_key: String,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+    models: Option<Vec<ModelInput>>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        sync_opencode_openai_provider(
+            provider_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or(APIKEY_FUN_PROVIDER_ID),
+            provider_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("APIKEY.FUN"),
+            &proxy_url,
+            &api_key,
+            models,
+        )
     })
     .await
     .unwrap_or_else(|_| Err("Failed to execute sync".to_string()))

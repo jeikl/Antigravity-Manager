@@ -1232,6 +1232,21 @@ print(response.choices[0].message.content)`;
                             </div>
 
 
+                            <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
+                                <div className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">{t('proxy.config.log_retention_title')}</div>
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                    {([['max_body_age_hours', 'log_retention_body_hours'], ['max_age_days', 'log_retention_age_days'], ['max_rows', 'log_retention_rows']] as const).map(([field, label]) => (
+                                        <label key={field} className="text-xs text-gray-600 dark:text-gray-400">
+                                            {t(`proxy.config.${label}`)}
+                                            <input type="number" min={1}
+                                                value={appConfig.proxy.log_retention?.[field] ?? (field === 'max_body_age_hours' ? 24 : field === 'max_age_days' ? 30 : 100000)}
+                                                onChange={(e) => updateProxyConfig({ log_retention: { ...(appConfig.proxy.log_retention || { max_body_age_hours: 24, max_age_days: 30, max_rows: 100000 }), [field]: Math.max(1, Number(e.target.value)) } })}
+                                                className="w-full mt-1 px-2.5 py-1.5 border border-gray-300 dark:border-base-200 rounded-lg bg-white dark:bg-base-200 text-xs" />
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+
                             {/* 局域网访问 & 访问授权 - 合并到同一行 */}
                             <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
                                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

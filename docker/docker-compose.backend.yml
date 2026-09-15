@@ -4,3 +4,8 @@ services:
       dockerfile: docker/Dockerfile.backend
       args:
         FRONTEND_IMAGE: antigravity-manager:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"

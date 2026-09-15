@@ -147,7 +147,11 @@ async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client
     }
 }
 
-const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const CLOUD_CODE_LOAD_PROJECT_ENDPOINTS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+];
 
 /// Fetch project ID and subscription tier
 async fn fetch_project_id(
@@ -158,85 +162,97 @@ async fn fetch_project_id(
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
-    let res = client
-        .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
-        .header(
-            rquest::header::AUTHORIZATION,
-            format!("Bearer {}", access_token),
-        )
-        .header(rquest::header::CONTENT_TYPE, "application/json")
-        .header(
-            rquest::header::USER_AGENT,
-            crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-        )
-        .json(&meta)
-        .send()
-        .await;
+    for (ep_idx, ep_url) in CLOUD_CODE_LOAD_PROJECT_ENDPOINTS.iter().enumerate() {
+        let res = client
+            .post(*ep_url)
+            .header(
+                rquest::header::AUTHORIZATION,
+                format!("Bearer {}", access_token),
+            )
+            .header(rquest::header::CONTENT_TYPE, "application/json")
+            .header(
+                rquest::header::USER_AGENT,
+                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+            )
+            .json(&meta)
+            .send()
+            .await;
 
-    match res {
-        Ok(res) => {
-            if res.status().is_success() {
-                if let Ok(data) = res.json::<LoadProjectResponse>().await {
-                    let project_id = data.project_id.clone();
+        match res {
+            Ok(res) => {
+                if res.status().is_success() {
+                    if let Ok(data) = res.json::<LoadProjectResponse>().await {
+                        let project_id = data.project_id.clone();
 
-                    // Core logic: Multi-level fallback for tier extraction
-                    // 1. Paid Tier (Google One AI Premium etc.)
-                    // 2. Current Tier (If not ineligible)
-                    // 3. Allowed Tiers (Restricted/Default proxy access)
-                    let mut subscription_tier = data
-                        .paid_tier
-                        .as_ref()
-                        .and_then(|t| t.name.clone())
-                        .or_else(|| data.paid_tier.as_ref().and_then(|t| t.id.clone()));
+                        // Core logic: Multi-level fallback for tier extraction
+                        // 1. Paid Tier (Google One AI Premium etc.)
+                        // 2. Current Tier (If not ineligible)
+                        // 3. Allowed Tiers (Restricted/Default proxy access)
+                        let mut subscription_tier = data
+                            .paid_tier
+                            .as_ref()
+                            .and_then(|t| t.name.clone())
+                            .or_else(|| data.paid_tier.as_ref().and_then(|t| t.id.clone()));
 
-                    let is_ineligible = data.ineligible_tiers.is_some()
-                        && !data.ineligible_tiers.as_ref().unwrap().is_empty();
+                        let is_ineligible = data.ineligible_tiers.is_some()
+                            && !data.ineligible_tiers.as_ref().unwrap().is_empty();
 
-                    if subscription_tier.is_none() {
-                        if !is_ineligible {
-                            subscription_tier = data
-                                .current_tier
-                                .as_ref()
-                                .and_then(|t| t.name.clone())
-                                .or_else(|| data.current_tier.as_ref().and_then(|t| t.id.clone()));
-                        } else {
-                            // If account is marked as INELIGIBLE, drop to allowedTiers and extract default
-                            if let Some(mut allowed) = data.allowed_tiers {
-                                if let Some(default_tier) =
-                                    allowed.iter_mut().find(|t| t.is_default == Some(true))
-                                {
-                                    if let Some(name) = &default_tier.name {
-                                        subscription_tier = Some(format!("{} (Restricted)", name));
-                                    } else if let Some(id) = &default_tier.id {
-                                        subscription_tier = Some(format!("{} (Restricted)", id));
+                        if subscription_tier.is_none() {
+                            if !is_ineligible {
+                                subscription_tier = data
+                                    .current_tier
+                                    .as_ref()
+                                    .and_then(|t| t.name.clone())
+                                    .or_else(|| data.current_tier.as_ref().and_then(|t| t.id.clone()));
+                            } else {
+                                // If account is marked as INELIGIBLE, drop to allowedTiers and extract default
+                                if let Some(mut allowed) = data.allowed_tiers {
+                                    if let Some(default_tier) =
+                                        allowed.iter_mut().find(|t| t.is_default == Some(true))
+                                    {
+                                        if let Some(name) = &default_tier.name {
+                                            subscription_tier = Some(format!("{} (Restricted)", name));
+                                        } else if let Some(id) = &default_tier.id {
+                                            subscription_tier = Some(format!("{} (Restricted)", id));
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    if let Some(ref tier) = subscription_tier {
-                        crate::modules::logger::log_info(&format!(
-                            "📊 [{}] Subscription identified successfully: {}",
-                            email, tier
-                        ));
-                    }
+                        if let Some(ref tier) = subscription_tier {
+                            crate::modules::logger::log_info(&format!(
+                                "📊 [{}] Subscription identified successfully: {}",
+                                email, tier
+                            ));
+                        }
 
-                    return (project_id, subscription_tier);
+                        if ep_idx > 0 {
+                            crate::modules::logger::log_info(&format!(
+                                "loadCodeAssist fallback succeeded at endpoint #{}",
+                                ep_idx + 1
+                            ));
+                        }
+
+                        return (project_id, subscription_tier);
+                    }
+                } else {
+                    crate::modules::logger::log_warn(&format!(
+                        "⚠️  [{}] loadCodeAssist failed at {}: Status: {}",
+                        email,
+                        ep_url,
+                        res.status()
+                    ));
+                    continue;
                 }
-            } else {
-                crate::modules::logger::log_warn(&format!(
-                    "⚠️  [{}] loadCodeAssist failed: Status: {}",
-                    email,
-                    res.status()
-                ));
             }
-        }
-        Err(e) => {
-            crate::modules::logger::log_error(&format!(
-                "❌ [{}] loadCodeAssist network error: {}",
-                email, e
-            ));
+            Err(e) => {
+                crate::modules::logger::log_error(&format!(
+                    "❌ [{}] loadCodeAssist network error at {}: {}",
+                    email, ep_url, e
+                ));
+                continue;
+            }
         }
     }
 
@@ -409,9 +425,48 @@ pub async fn fetch_quota_with_cache(
 
                     // Best-effort: fetch grouped quota summary (weekly + 5h windows).
                     // Failure here must not block the primary quota result.
-                    quota_data.quota_groups =
+                    let quota_groups =
                         fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
                             .await;
+
+                    // [FIX #3426] Fuse real bucket quotas into models so UI doesn't show fake 100%
+                    if let Some(ref groups) = quota_groups {
+                        for model in quota_data.models.iter_mut() {
+                            let name_lower = model.name.to_lowercase();
+                            let is_claude_or_gpt = name_lower.starts_with("claude") || name_lower.starts_with("gpt");
+                            let is_gemini = name_lower.starts_with("gemini");
+
+                            for group in groups {
+                                let gname = group.display_name.to_lowercase();
+                                let matches_group = if is_claude_or_gpt {
+                                    gname.contains("claude") || gname.contains("gpt") || gname.contains("3p")
+                                } else if is_gemini {
+                                    gname.contains("gemini") || (!gname.contains("claude") && !gname.contains("gpt") && !gname.contains("3p"))
+                                } else {
+                                    false
+                                };
+
+                                if matches_group {
+                                    // Look for 5h bucket first, then fallback to any bucket
+                                    let target_bucket = group.buckets.iter().find(|b| {
+                                        let win = b.window.to_lowercase();
+                                        let bid = b.bucket_id.to_lowercase();
+                                        win.contains("5h") || bid.contains("5h") || win.contains("hour") || bid.contains("hour")
+                                    }).or_else(|| group.buckets.first());
+
+                                    if let Some(b) = target_bucket {
+                                        model.percentage = (b.remaining_fraction * 100.0).round() as i32;
+                                        if !b.reset_time.is_empty() {
+                                            model.reset_time = b.reset_time.clone();
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    quota_data.quota_groups = quota_groups;
 
                     return Ok((quota_data, project_id.clone()));
                 }
@@ -472,10 +527,6 @@ async fn fetch_quota_summary(
                         "QuotaSummary API {} returned {}, trying next endpoint",
                         ep_url, status
                     ));
-                    // 4xx (非 429) 通常所有端点行为一致,直接退出避免无谓重试
-                    if status.is_client_error() && status != rquest::StatusCode::TOO_MANY_REQUESTS {
-                        return None;
-                    }
                     continue;
                 }
 

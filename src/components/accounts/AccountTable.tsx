@@ -604,7 +604,7 @@ function AccountRowContent({
                                         label={model.label}
                                         percentage={modelData?.percentage || 0}
                                         resetTime={modelData?.reset_time}
-                                        isProtected={isModelProtected(account.protected_models, model.protectedKey)}
+                                        isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
                                         liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                         Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
                                     />

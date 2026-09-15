@@ -467,6 +467,7 @@
       "default_export_path_desc": "设置后，导出文件将直接保存到该目录，不再弹出选择框",
       "select_btn": "选择",
       "open_btn": "打开",
+      "migrate_btn": "更改并迁移",
       "data_dir": "数据目录",
       "data_dir_desc": "账号数据、配置、日志和思考库的存储位置。选择新目录后会自动迁移并删除原目录（同一父目录则直接重命名）。",
       "data_dir_select": "选择数据目录",
@@ -474,6 +475,15 @@
       "data_dir_migrate_msg": "将把全部数据迁移到：{{path}}\n原目录会被删除（同一父目录则重命名）。请先停止 API 反代和隧道。",
       "data_dir_migrated": "数据目录已迁移",
       "data_dir_restart_hint": "建议重启应用，让日志等仍被占用的文件完全切换到新目录",
+      "migrate_title": "迁移数据目录",
+      "migrate_desc": "将当前数据目录（包括账号、配置、请求日志及数据库）完整迁移至新位置。",
+      "migrate_source": "源数据目录",
+      "migrate_target": "新数据目录",
+      "migrate_clean_source": "迁移成功后清理原目录数据（释放磁盘空间）",
+      "migrate_restart_notice": "迁移完成后客户端将自动重启以加载新数据目录。",
+      "migrate_confirm_btn": "开始迁移并重启",
+      "migrating_text": "正在迁移数据并准备重启...",
+      "migrate_success": "数据迁移成功，正在重启应用...",
       "antigravity_path": "反重力程序路径",
       "antigravity_path_placeholder": "未设置 (将使用自动探测)",
       "antigravity_path_desc": "如果您将 Antigravity 应用安装在非标准位置，可在此手动指定可执行文件路径（MacOS 指向 .app 目录）。",
@@ -772,6 +782,10 @@
       "request_timeout_hint": "默认 120 秒，范围 30-7200 秒。修改后需重启服务生效。",
       "enable_logging": "启用请求日志",
       "enable_logging_hint": "记录历史记录以便调试 (微小性能损耗)",
+      "log_retention_title": "请求日志保留",
+      "log_retention_body_hours": "请求体保留小时数",
+      "log_retention_age_days": "日志保留天数",
+      "log_retention_rows": "最大日志行数",
       "upstream_proxy": {
         "title": "全局上游代理 (Global Proxy)",
         "desc": "开启后，应用内所有外部请求（API 反代、Token 刷新、配额查询、更新检测）都将通过此代理。",
@@ -810,6 +824,8 @@
       "circuit_breaker": {
         "title": "自适应熔断器",
         "tooltip": "当账号因配额耗尽反复失败时，自动增加锁定时间。这可以防止在死账号上浪费 API 调用，同时允许瞬态错误快速恢复。",
+        "lock_on_zero_quota": "零配额持续熔断 (5小时 / 周配额)",
+        "lock_on_zero_quota_desc": "开启后，若账号 5 小时滚动窗口或周配额用光 (0%)，立即将其锁定至官方重置时间，跳过短阶梯退避并杜绝无效调用。提示：本功能的状态获取与自动解禁依赖「常规设置」中的「自动刷新配额」。",
         "backoff_levels": "退避等级 (秒)",
         "input_placeholder": "输入退避时长 (秒)，以逗号分隔",
         "level": "等级 {{level}}",
@@ -1435,7 +1451,8 @@
       "quickConfig": "一键配置本地开发环境",
       "syncDesc": "同步至官方标准配置",
       "codexTooltip": "将 API Key 与 BaseURL 同步至 Codex / ChatGPT CLI",
-      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code"
+      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code",
+      "opencodeTooltip": "将 API Key、BaseURL 和模型同步至 OpenCode"
     },
     "models": {
       "title": "可用模型",

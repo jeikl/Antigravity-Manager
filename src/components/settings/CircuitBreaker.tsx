@@ -63,6 +63,27 @@ export default function CircuitBreaker({
                 </div>
             </div>
 
+            {/* 零配额持续熔断开关 */}
+            <div className="flex items-center justify-between p-3 bg-gray-50/50 dark:bg-base-200/50 rounded-xl border border-gray-100 dark:border-base-300/50">
+                <div className="space-y-0.5">
+                    <div className="text-sm font-bold text-gray-900 dark:text-gray-100">
+                        {t("proxy.config.circuit_breaker.lock_on_zero_quota", { defaultValue: "Lock on Zero Quota (5h / Weekly)" })}
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                        {t("proxy.config.circuit_breaker.lock_on_zero_quota_desc", { defaultValue: "Automatically locks the account until its exact quota reset time whenever 5-hour rolling or weekly quota hits 0%, skipping short backoffs." })}
+                    </div>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                        type="checkbox"
+                        className="sr-only peer"
+                        checked={!!config.lock_on_zero_quota}
+                        onChange={(e) => onChange({ ...config, lock_on_zero_quota: e.target.checked })}
+                    />
+                    <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-orange-500 shadow-inner"></div>
+                </label>
+            </div>
+
             <div className="space-y-4">
                 <div className="flex justify-between items-center">
                     <label className="text-sm font-bold text-gray-700 dark:text-gray-300 flex items-center gap-2">

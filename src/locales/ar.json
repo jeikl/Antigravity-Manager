@@ -1225,7 +1225,8 @@
       "quickConfig": "One-Click Local Dev Setup",
       "syncDesc": "Sync to official standard configuration",
       "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
+      "claudeTooltip": "Sync API Key & BaseURL to Claude Code",
+      "opencodeTooltip": "Sync API Key, BaseURL and models to OpenCode"
     },
     "models": {
       "title": "Available Models",

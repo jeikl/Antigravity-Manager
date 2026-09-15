@@ -612,6 +612,12 @@ const DATA_DIR: &str = ".antigravity_tools";
 const LOCATION_POINTER_FILE: &str = ".antigravity_tools_location";
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
+const DATA_DIR_POINTER_FILE: &str = "data_dir.txt";
+
+/// 获取数据目录自举指针文件路径（保存在系统标准配置目录下）
+pub fn get_data_dir_pointer_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("antigravity-tools").join(DATA_DIR_POINTER_FILE))
+}
 
 static DATA_DIR_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
@@ -958,28 +964,12 @@ fn load_account_index_in_dir(data_dir: &PathBuf) -> Result<AccountIndex, String>
 /// Save account index to a specific directory (internal helper)
 fn save_account_index_in_dir(data_dir: &PathBuf, index: &AccountIndex) -> Result<(), String> {
     let index_path = data_dir.join(ACCOUNTS_INDEX);
-    // Use unique temp file name per write to avoid collision
-    let temp_filename = format!("{}.tmp.{}", ACCOUNTS_INDEX, Uuid::new_v4());
-    let temp_path = data_dir.join(&temp_filename);
 
     let content = serde_json::to_string_pretty(index)
         .map_err(|e| format!("failed_to_serialize_account_index: {}", e))?;
 
-    // Write to temporary file
-    if let Err(e) = fs::write(&temp_path, content) {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("failed_to_write_temp_index_file: {}", e));
-    }
-
-    // Atomic rename with platform-specific handling
-    if let Err(e) = atomic_replace_file(&temp_path, &index_path) {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("failed_to_replace_index_file: {}", e));
-    }
-
-    Ok(())
+    crate::utils::fs::write_atomic(&index_path, content.as_bytes())
+        .map_err(|e| format!("failed_to_save_account_index: {}", e))
 }
 
 /// Rebuild AccountIndex by scanning accounts/*.json files in specific directory
@@ -1105,7 +1095,7 @@ fn try_save_recovered_index(
         let timestamp = chrono::Utc::now().timestamp();
         let backup_name = format!("accounts.json.corrupt-{}-{}", timestamp, Uuid::new_v4());
         let backup_path = data_dir.join(&backup_name);
-        if let Err(e) = fs::write(&backup_path, content) {
+        if let Err(e) = crate::utils::fs::write_atomic(&backup_path, content) {
             crate::modules::logger::log_warn(&format!(
                 "Failed to backup corrupt index to {}: {}",
                 backup_name, e
@@ -1146,57 +1136,6 @@ pub fn save_account_index(index: &AccountIndex) -> Result<(), String> {
     save_account_index_in_dir(&data_dir, index)
 }
 
-/// Platform-specific atomic file replacement
-#[cfg(target_os = "windows")]
-fn atomic_replace_file(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    type Bool = i32;
-    type Dword = u32;
-
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            lp_existing_file_name: *const u16,
-            lp_new_file_name: *const u16,
-            dw_flags: Dword,
-        ) -> Bool;
-    }
-
-    let src_wide: Vec<u16> = src
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let dst_wide: Vec<u16> = dst
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // MOVEFILE_REPLACE_EXISTING = 0x1
-    // MOVEFILE_WRITE_THROUGH = 0x8
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-
-    let result = unsafe { MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), flags) };
-    if result == 0 {
-        let err = std::io::Error::last_os_error();
-        // Clean up source file on failure
-        let _ = fs::remove_file(src);
-        return Err(format!("MoveFileExW failed: {}", err));
-    }
-
-    Ok(())
-}
-
-/// Non-Windows: use standard rename
-#[cfg(not(target_os = "windows"))]
-fn atomic_replace_file(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
-    fs::rename(src, dst).map_err(|e| format!("rename failed: {}", e))
-}
-
 /// Load account data
 pub fn load_account(account_id: &str) -> Result<Account, String> {
     let accounts_dir = get_accounts_dir()?;
@@ -1209,28 +1148,11 @@ fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(),
     let _lock = get_account_lock(&account.id);
     let _guard = _lock.lock().unwrap();
 
-    let parent_dir = account_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| "invalid_account_path".to_string())?;
-
-    let temp_filename = format!("{}.tmp.{}", account.id, Uuid::new_v4());
-    let temp_path = parent_dir.join(&temp_filename);
-
     let content = serde_json::to_string_pretty(account)
         .map_err(|e| format!("failed_to_serialize_account_data: {}", e))?;
 
-    if let Err(e) = std::fs::write(&temp_path, content) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("failed_to_write_temp_account_file: {}", e));
-    }
-
-    if let Err(e) = atomic_replace_file(&temp_path, account_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("failed_to_replace_account_file: {}", e));
-    }
-
-    Ok(())
+    crate::utils::fs::write_atomic(account_path, content.as_bytes())
+        .map_err(|e| format!("failed_to_save_account_file: {}", e))
 }
 
 /// Save account data (thread-safe and atomic)
@@ -1979,23 +1901,25 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                 }
 
                 for std_id in &config.quota_protection.monitored_models {
-                    let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
+                    let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                        .unwrap_or_else(|| std_id.clone());
+                    let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
 
                     if max_pct < threshold {
-                        if !account.protected_models.contains(std_id) {
+                        if !account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
                                 "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
-                                account.email, std_id, max_pct, threshold
+                                account.email, lookup_key, max_pct, threshold
                             ));
-                            account.protected_models.insert(std_id.clone());
+                            account.protected_models.insert(lookup_key.clone());
                         }
                     } else {
-                        if account.protected_models.contains(std_id) {
+                        if account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
                                 "[Quota] Model protection recovered: {} (Group: {} Max: {}% >= Thres: {}%)",
-                                account.email, std_id, max_pct, threshold
+                                account.email, lookup_key, max_pct, threshold
                             ));
-                            account.protected_models.remove(std_id);
+                            account.protected_models.remove(&lookup_key);
                         }
                     }
                 }
@@ -2015,6 +1939,15 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                     account.proxy_disabled_reason = None;
                     account.proxy_disabled_at = None;
                 }
+            }
+        } else {
+            // [FIX] 当配额保护在全局关闭时，清空受保护模型列表，避免遗留历史锁
+            if !account.protected_models.is_empty() {
+                crate::modules::logger::log_info(&format!(
+                    "[Quota] Quota protection disabled globally, clearing protected models for {}",
+                    account.email
+                ));
+                account.protected_models.clear();
             }
         }
     }
@@ -2256,13 +2189,15 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
         }
     }
 
-    // 2. Attempt query
-    let result: crate::error::AppResult<(QuotaData, Option<String>)> = modules::fetch_quota(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
-    )
-    .await;
+    // 2. Attempt query (pass cached project_id if available to avoid unnecessary loadCodeAssist)
+    let result: crate::error::AppResult<(QuotaData, Option<String>)> =
+        modules::fetch_quota_with_cache(
+            &account.token.access_token,
+            &account.email,
+            account.token.project_id.as_deref(),
+            Some(&account.id),
+        )
+        .await;
 
     // Capture potentially updated project_id and save
     if let Ok((ref _q, ref project_id)) = result {
@@ -2350,11 +2285,12 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
                 upsert_account(account.email.clone(), name, new_token.clone())
                     .map_err(AppError::Account)?;
 
-                // Retry query
+                // Retry query (pass cached project_id if available)
                 let retry_result: crate::error::AppResult<(QuotaData, Option<String>)> =
-                    modules::fetch_quota(
+                    modules::fetch_quota_with_cache(
                         &new_token.access_token,
                         &account.email,
+                        account.token.project_id.as_deref(),
                         Some(&account.id),
                     )
                     .await;

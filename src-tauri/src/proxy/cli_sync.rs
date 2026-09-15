@@ -571,7 +571,7 @@ pub fn sync_config(
                             Value::String(proxy_url.to_string()),
                         );
                         if !api_key.is_empty() {
-                            if proxy_url.contains("apikey.fun") {
+                            if proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan") {
                                 env_obj.insert(
                                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                                     Value::String(api_key.to_string()),
@@ -624,7 +624,7 @@ pub fn sync_config(
                             "OPENAI_API_KEY".to_string(),
                             Value::String(api_key.to_string()),
                         );
-                        if proxy_url.contains("apikey.fun") {
+                        if proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan") {
                             obj.remove("OPENAI_BASE_URL");
                         } else {
                             // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
@@ -643,7 +643,8 @@ pub fn sync_config(
 
                     // 必须使用 custom 提供商，Codex 不支持原生的 codex provider
                     let provider_key = "custom";
-                    let display_name = if proxy_url.contains("apikey.fun") {
+                    let is_apikey_fun = proxy_url.contains("apikey.fun") || proxy_url.contains("apikey.fan");
+                    let display_name = if is_apikey_fun {
                         "APIKEY.FUN"
                     } else {
                         "Custom Node"
@@ -652,7 +653,7 @@ pub fn sync_config(
                     // 优先设置 Root Keys 确保位于顶部
                     doc.insert("model_provider", value(provider_key));
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_fun {
                         doc.insert("model", value("gpt-5.5"));
                         doc.insert("review_model", value("gpt-5.5"));
                         doc.insert("model_reasoning_effort", value("high"));
@@ -691,7 +692,7 @@ pub fn sync_config(
                         }
                     }
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_fun {
                         let features = doc
                             .entry("features")
                             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));

@@ -1262,7 +1262,8 @@
       "quickConfig": "一鍵配置本地開發環境",
       "syncDesc": "同步至官方標準配置",
       "codexTooltip": "將 API Key 同步至 Antigravity Codex",
-      "claudeTooltip": "將 API Key 同步至 Claude Code"
+      "claudeTooltip": "將 API Key 同步至 Claude Code",
+      "opencodeTooltip": "將 API Key、BaseURL 與模型同步至 OpenCode"
     },
     "models": {
       "title": "可用模型",

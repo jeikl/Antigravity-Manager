@@ -2,6 +2,84 @@
 use super::models::*;
 use serde_json::Value;
 
+pub fn is_shell_or_terminal_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "shell"
+            | "bash"
+            | "local_shell"
+            | "local_shell_call"
+            | "powershell"
+            | "pwsh"
+            | "terminal"
+            | "cmd"
+            | "run_command"
+            | "execute_command"
+    )
+}
+
+/// 标准化并清洗 shell / 命令执行工具参数
+/// 1. 将 cmd / code / script / shell_command / input 等别名重命名为 command
+/// 2. [Issue #3430] 若仍缺失 command，利用 description 或默认信息填充安全无害的占位命令，
+///    既防止下游客户端（如 WorkBuddy PowerShell/Bash 执行器）抛出 Cannot read properties of undefined (reading 'split') 崩溃，
+///    又带有明确的 [OK] 语义，防止模型在未达预期的循环中重复漏参重试导致死锁。
+pub fn normalize_and_sanitize_tool_args(tool_name: &str, args: &mut Value) {
+    if !is_shell_or_terminal_tool(tool_name) {
+        return;
+    }
+
+    if let Some(obj) = args.as_object_mut() {
+        // 1. 别名归一化
+        if !obj.contains_key("command") {
+            for alt_key in &["cmd", "code", "script", "shell_command", "input"] {
+                if let Some(val) = obj.remove(*alt_key) {
+                    obj.insert("command".to_string(), val);
+                    tracing::debug!(
+                        "[OpenAI] Normalized tool '{}' arg '{}' -> 'command'",
+                        tool_name,
+                        alt_key
+                    );
+                    break;
+                }
+            }
+        }
+
+        // 2. 兜底保护：如果仍缺失 command 或 command 为空字符串
+        let needs_fallback = match obj.get("command") {
+            None => true,
+            Some(v) => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
+        };
+
+        if needs_fallback {
+            let desc_owned: String = obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Action logged")
+                .to_string();
+
+            // 过滤危险字符，保留字母、数字、中文及常见标点，构造安全 echo 命令
+            let safe_desc: String = desc_owned
+                .chars()
+                .filter(|c| c.is_alphanumeric() || " _-:.,/".contains(*c))
+                .collect();
+            let trimmed = safe_desc.trim();
+            let safe_title = if trimmed.is_empty() {
+                "Action logged"
+            } else {
+                trimmed
+            };
+
+            let fallback_cmd = format!("echo \"[OK: Action logged - {}]\"", safe_title);
+            obj.insert("command".to_string(), Value::String(fallback_cmd));
+            tracing::warn!(
+                tool = %tool_name,
+                description = %desc_owned,
+                "Injected safe fallback 'command' into tool call arguments to prevent downstream client crash (Issue #3430)"
+            );
+        }
+    }
+}
+
 pub fn resolve_shell_tool_name(
     model_tool_name: &str,
     client_tool_names: &std::collections::HashSet<String>,
@@ -118,20 +196,8 @@ pub fn transform_openai_response(
                         let mut args_json =
                             fc.get("args").unwrap_or(&serde_json::json!({})).clone();
 
-                        // [FIX #1575] 标准化 shell 工具参数名称
-                        if name == "shell" || name == "bash" || name == "local_shell" {
-                            if let Some(obj) = args_json.as_object_mut() {
-                                if !obj.contains_key("command") {
-                                    for alt_key in &["cmd", "code", "script", "shell_command"] {
-                                        if let Some(val) = obj.remove(*alt_key) {
-                                            obj.insert("command".to_string(), val);
-                                            tracing::debug!("[OpenAI-Stream] Normalized shell arg '{}' -> 'command'", alt_key);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // [FIX #1575 & #3430] 标准化并清洗 shell / PowerShell 等工具参数名称与必填字段
+                        normalize_and_sanitize_tool_args(name, &mut args_json);
 
                         let mut arguments_str = args_json.to_string();
 
@@ -289,14 +355,16 @@ pub fn transform_openai_response(
                 }
             }
 
-            let finish_reason = candidate
-                .get("finishReason")
-                .and_then(|f| f.as_str())
+            let raw_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str());
+            let is_malformed_function_call = raw_finish_reason == Some("MALFORMED_FUNCTION_CALL");
+
+            let finish_reason = raw_finish_reason
                 .map(|f| match f {
                     "STOP" => "stop",
                     "MAX_TOKENS" => "length",
                     "SAFETY" => "content_filter",
                     "RECITATION" => "content_filter",
+                    "MALFORMED_FUNCTION_CALL" => "stop",
                     _ => "stop",
                 })
                 .unwrap_or("stop");
@@ -306,6 +374,11 @@ pub fn transform_openai_response(
             } else {
                 None
             };
+
+            // [FIX MALFORMED_FUNCTION_CALL] 避免客户端空白
+            if is_malformed_function_call && content_out.is_empty() {
+                content_out.push_str("很抱歉，当前模型在尝试调取实时信息时遇到了格式异常。若需要查询实时天气或最新资讯，请尝试使用联网模式（模型名带 -online 后缀）或配置天气/搜索插件。");
+            }
 
             choices.push(Choice {
                 index: idx as u32,
@@ -568,5 +641,83 @@ mod tests {
 
         let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_shell_alias() {
+        let mut args = json!({
+            "cmd": "ls -la /tmp"
+        });
+        normalize_and_sanitize_tool_args("shell", &mut args);
+        assert_eq!(args["command"], "ls -la /tmp");
+        assert!(!args.as_object().unwrap().contains_key("cmd"));
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_powershell_missing_command_with_description() {
+        // [Issue #3430] WorkBuddy PowerShell tool call with only description
+        let mut args = json!({
+            "description": "列出目录内容"
+        });
+        normalize_and_sanitize_tool_args("PowerShell", &mut args);
+        assert_eq!(
+            args["command"],
+            "echo \"[OK: Action logged - 列出目录内容]\""
+        );
+        assert_eq!(args["description"], "列出目录内容");
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_bash_empty_command_fallback() {
+        let mut args = json!({
+            "command": "   ",
+            "description": "Fetch status"
+        });
+        normalize_and_sanitize_tool_args("Bash", &mut args);
+        assert_eq!(
+            args["command"],
+            "echo \"[OK: Action logged - Fetch status]\""
+        );
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_unrelated_tool_untouched() {
+        let mut args = json!({
+            "query": "select * from users"
+        });
+        normalize_and_sanitize_tool_args("sql_query", &mut args);
+        assert!(!args.as_object().unwrap().contains_key("command"));
+        assert_eq!(args["query"], "select * from users");
+    }
+
+    #[test]
+    fn test_transform_openai_response_sanitizes_powershell_tool_call() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "PowerShell",
+                            "args": {
+                                "description": "查看当前系统信息"
+                            }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let result = transform_openai_response(&gemini_resp, None, 1, None);
+        let tool_calls = result.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.as_ref().unwrap().name, "PowerShell");
+
+        let parsed_args: Value =
+            serde_json::from_str(&tool_calls[0].function.as_ref().unwrap().arguments).unwrap();
+        assert_eq!(
+            parsed_args["command"],
+            "echo \"[OK: Action logged - 查看当前系统信息]\""
+        );
     }
 }

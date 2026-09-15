@@ -1,3 +1,4 @@
+use crate::proxy::config::LogRetentionConfig;
 use crate::proxy::monitor::ProxyRequestLog;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
@@ -390,6 +391,57 @@ pub fn cleanup_old_thinking_records(days: i64) -> Result<usize, String> {
     Ok(deleted_tools + deleted_records)
 }
 
+pub fn apply_retention(policy: &LogRetentionConfig) -> Result<(usize, usize), String> {
+    let conn = connect_db()?;
+    apply_retention_with_connection(&conn, policy)
+}
+
+fn apply_retention_with_connection(
+    conn: &Connection,
+    policy: &LogRetentionConfig,
+) -> Result<(usize, usize), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let body_cutoff = now - (policy.max_body_age_hours as i64 * 3600 * 1000);
+    let age_cutoff = now - (policy.max_age_days as i64 * 24 * 3600 * 1000);
+    let bodies_cleared = conn.execute(
+        "UPDATE request_logs SET request_body = NULL, upstream_request_body = NULL, response_body = NULL WHERE timestamp < ?1 AND (request_body IS NOT NULL OR upstream_request_body IS NOT NULL OR response_body IS NOT NULL)",
+        [body_cutoff],
+    ).map_err(|e| e.to_string())?;
+    let mut rows_deleted = conn
+        .execute(
+            "DELETE FROM request_logs WHERE timestamp < ?1",
+            [age_cutoff],
+        )
+        .map_err(|e| e.to_string())?;
+    if policy.max_rows > 0 {
+        rows_deleted += conn.execute(
+            "DELETE FROM request_logs WHERE id NOT IN (SELECT id FROM request_logs ORDER BY timestamp DESC LIMIT ?1)",
+            [policy.max_rows],
+        ).map_err(|e| e.to_string())?;
+    }
+    let auto_vacuum: i64 = conn
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if auto_vacuum == 0 {
+        let db_size = get_proxy_db_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if db_size < 1024 * 1024 * 1024 {
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+                .map_err(|e| e.to_string())?;
+        } else {
+            tracing::warn!(
+                "Skipping auto_vacuum migration for proxy logs database larger than 1 GiB"
+            );
+        }
+    }
+    conn.execute_batch("PRAGMA incremental_vacuum;")
+        .map_err(|e| e.to_string())?;
+    Ok((bodies_cleared, rows_deleted))
+}
+
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
 
@@ -498,6 +550,60 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 
     stmt.query_row([log_id], map_request_log_row)
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::apply_retention_with_connection;
+    use crate::proxy::config::LogRetentionConfig;
+    use rusqlite::Connection;
+
+    #[test]
+    fn clears_old_bodies_and_limits_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE request_logs (id TEXT PRIMARY KEY, timestamp INTEGER, request_body TEXT, response_body TEXT)").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO request_logs VALUES ('retained-with-old-body', ?1, 'request', 'response')",
+            [now - 25 * 3600 * 1000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO request_logs VALUES ('new-1', ?1, NULL, NULL)",
+            [now - 30 * 3600 * 1000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO request_logs VALUES ('deleted-1', ?1, NULL, NULL)",
+            [now - 35 * 3600 * 1000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO request_logs VALUES ('deleted-2', ?1, NULL, NULL)",
+            [now - 40 * 3600 * 1000],
+        )
+        .unwrap();
+        let policy = LogRetentionConfig {
+            max_body_age_hours: 24,
+            max_age_days: 30,
+            max_rows: 2,
+        };
+        let (cleared, deleted) = apply_retention_with_connection(&conn, &policy).unwrap();
+        assert_eq!(cleared, 1);
+        assert_eq!(deleted, 2);
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT request_body FROM request_logs WHERE id = 'retained-with-old-body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, None);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
 }
 
 /// Cleanup old logs (keep last N days)

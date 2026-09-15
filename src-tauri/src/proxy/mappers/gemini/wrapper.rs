@@ -734,11 +734,14 @@ pub fn wrap_request_v2(
             }
         }
     } else {
-        // WebSearch 专属身份仿真 (仅当 request_type == "web_search" 时)
-        let web_search_identity = if config.request_type == "web_search" {
-            Some("You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.")
+        // WebSearch 专属身份仿真 / Antigravity 身份（末尾换行隔离 Markdown）
+        let antigravity_identity = if config.request_type == "web_search" {
+            "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
         } else {
-            None
+            "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
+            You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
+            **Absolute paths only**\n\
+            **Proactiveness**\n\n"
         };
 
         // 检查是否已有 systemInstruction
@@ -752,42 +755,55 @@ pub fn wrap_request_v2(
 
             if let Some(parts) = system_instruction.get_mut("parts") {
                 if let Some(parts_array) = parts.as_array_mut() {
-                    let mut insert_offset = 0;
-                    if let Some(ws_id) = web_search_identity {
-                        parts_array.insert(0, json!({"text": ws_id}));
-                        insert_offset += 1;
+                    let has_identity = parts_array
+                        .get(0)
+                        .and_then(|p| p.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| {
+                            s.contains("You are Antigravity")
+                                || s.contains("search engine bot")
+                        })
+                        .unwrap_or(false);
+
+                    if !has_identity {
+                        parts_array.insert(0, json!({"text": antigravity_identity}));
                     }
 
-                    // 注入全局系统提示词 (如果启用)
+                    // 注入全局系统提示词（去重 + 换行隔离）
                     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
                     if global_prompt_config.enabled
                         && !global_prompt_config.content.trim().is_empty()
                     {
-                        if insert_offset <= parts_array.len() {
-                            parts_array
-                                .insert(insert_offset, json!({"text": global_prompt_config.content}));
-                        } else {
-                            parts_array.push(json!({"text": global_prompt_config.content}));
+                        let prompt_content = global_prompt_config.content.trim();
+                        let already_has_global = parts_array.iter().any(|p| {
+                            p.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.contains(prompt_content))
+                                .unwrap_or(false)
+                        });
+
+                        if !already_has_global {
+                            let formatted = format!("{}\n\n", prompt_content);
+                            if 1 <= parts_array.len() {
+                                parts_array.insert(1, json!({"text": formatted}));
+                            } else {
+                                parts_array.push(json!({"text": formatted}));
+                            }
                         }
                     }
                 }
             }
         } else {
-            // 没有 systemInstruction，仅在有 web_search 或启用全局提示词时创建
-            let mut parts = Vec::new();
-            if let Some(ws_id) = web_search_identity {
-                parts.push(json!({"text": ws_id}));
-            }
+            // 没有 systemInstruction，创建身份 + 可选全局提示词
+            let mut parts = vec![json!({"text": antigravity_identity})];
             let global_prompt_config = crate::proxy::config::get_global_system_prompt();
             if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-                parts.push(json!({"text": global_prompt_config.content}));
+                parts.push(json!({"text": format!("{}\n\n", global_prompt_config.content.trim())}));
             }
-            if !parts.is_empty() {
-                inner_request["systemInstruction"] = json!({
-                    "role": "user",
-                    "parts": parts
-                });
-            }
+            inner_request["systemInstruction"] = json!({
+                "role": "user",
+                "parts": parts
+            });
         }
     }
 
@@ -818,9 +834,15 @@ pub fn wrap_request_v2(
     }
 
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
+    // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id_str) = account_id {
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
-            account_id_str
+        let fingerprint = session_id.unwrap_or("default");
+        let generation =
+            crate::proxy::common::session::current_bump(account_id_str, fingerprint);
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+            account_id_str,
+            fingerprint,
+            generation
         ));
     }
 
@@ -866,11 +888,20 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] 3. 条件注入 enabledCreditTypes
-    // 这是官方 Worker 极高权重的一个指纹字段。
-    // 只有在非图像生成请求（即 agent 类型请求）时注入，避免图像生成场景出现 Credit 判定异常。
-    // 特别注意：这是 Google 识别“官方客户端”的重要凭证之一。
-    let is_agent_request = config.request_type != "image_gen";
+    // [NEW] 3. 动态判断是否需要 agent requestType 与 enabledCreditTypes
+    // 对齐官方语言服务原生设计：只有存在工具定义 (tools) 或包含工具调用上下文时才进入 agent 模式。
+    // 普通问答、纯文本补全不注入 requestType: "agent"，避开 Google 后端针对 Agent 资源池的过载限流。
+    let has_tools = inner_request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    let has_tool_interactions = inner_request
+        .get("contents")
+        .map(crate::proxy::mappers::common_utils::contents_has_tool_interactions)
+        .unwrap_or(false);
+
+    let is_agent_request = config.request_type != "image_gen" && (has_tools || has_tool_interactions);
 
     // [CACHE] 重建 inner_request 字段顺序——稳定前缀在前，动态内容在后
     // 遵循 Google 官方建议："将较大且常见的内容放置在提示的开头"
@@ -918,12 +949,14 @@ pub fn wrap_request_v2(
         "request": reordered_inner,
         "model": config.final_model,
         "userAgent": official_user_agent,
-        "requestType": if is_agent_request { "agent" } else { "image_gen" },
         // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
     });
 
-    if is_agent_request {
+    if config.request_type == "image_gen" {
+        final_request_obj["requestType"] = json!("image_gen");
+    } else if is_agent_request {
+        final_request_obj["requestType"] = json!("agent");
         if let Some(obj) = final_request_obj.as_object_mut() {
             // 强制注入 Google One AI 信用额度支持标号
             obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));

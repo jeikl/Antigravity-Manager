@@ -379,7 +379,17 @@ impl ProxyPoolManager {
         // 优先使用结构化 auth，兜底使用从 URL 内嵌解析出的 auth
         if let Some(auth) = &entry.auth {
             if !auth.username.is_empty() {
-                proxy = proxy.basic_auth(&auth.username, &auth.password);
+                if auth.password.starts_with("ag_enc_") && parsed_auth.is_some() {
+                    tracing::warn!(
+                        "[ProxyPool] Proxy password decryption failed (retains ag_enc_ prefix); falling back to credentials embedded in URL"
+                    );
+                    let (user, pass) = parsed_auth.as_ref().unwrap();
+                    proxy = proxy.basic_auth(user, pass);
+                } else {
+                    proxy = proxy.basic_auth(&auth.username, &auth.password);
+                }
+            } else if let Some((user, pass)) = parsed_auth {
+                proxy = proxy.basic_auth(&user, &pass);
             }
         } else if let Some((user, pass)) = parsed_auth {
             proxy = proxy.basic_auth(&user, &pass);
@@ -696,6 +706,32 @@ mod tests {
         let res = pool.build_proxy_config(&entry);
         assert!(res.is_ok());
         assert_eq!(res.unwrap().entry_id, "p2");
+    }
+
+    #[test]
+    fn test_build_proxy_config_fallback_to_url_auth_on_decrypt_failure() {
+        let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig::default())));
+        let entry = ProxyEntry {
+            id: "p3".to_string(),
+            name: "test_fallback_auth".to_string(),
+            url: "http://url_user:url_pass@127.0.0.1:10080".to_string(),
+            auth: Some(ProxyAuth {
+                username: "struct_user".to_string(),
+                password: "ag_enc_v2_failed_decrypt_payload".to_string(),
+            }),
+            enabled: true,
+            priority: 1,
+            tags: vec![],
+            max_accounts: None,
+            health_check_url: None,
+            last_check_time: None,
+            is_healthy: true,
+            latency: None,
+        };
+
+        let res = pool.build_proxy_config(&entry);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().entry_id, "p3");
     }
 }
 

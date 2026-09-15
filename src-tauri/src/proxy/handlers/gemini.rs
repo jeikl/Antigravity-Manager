@@ -11,8 +11,8 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, next_rotation_attempt, should_rotate_account, FailureStatusTracker,
-    RequestRetryState, RetryStrategy,
+    apply_retry_strategy, build_token_error_headers, next_rotation_attempt, should_rotate_account,
+    FailureStatusTracker, RequestRetryState, RetryStrategy,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -102,7 +102,7 @@ pub async fn handle_generate(
     // 1. 验证方法
     // [NEW] :countTokens 冒号语法，直接代理到上游 v1internal:countTokens
     if method == "countTokens" {
-        return execute_count_tokens(state, model_name, body).await;
+        return Ok(execute_count_tokens(state, model_name, body).await);
     }
 
     if method != "generateContent" && method != "streamGenerateContent" {
@@ -154,16 +154,18 @@ pub async fn handle_generate(
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
 
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &model_name,
+        &*state.custom_mapping.read().await,
+    );
+
     while let Some(attempt) = next_rotation_attempt(
         &mut used_attempts,
         max_attempts,
         retry_credentials.is_some(),
     ) {
         // 3. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &model_name,
-            &*state.custom_mapping.read().await,
-        );
+        let mapped_model = initial_mapped_model.clone();
         // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
         let tools_val: Option<Vec<Value>> =
             body.get("tools").and_then(|t| t.as_array()).map(|arr| {
@@ -240,10 +242,17 @@ pub async fn handle_generate(
                 {
                     Ok(t) => t,
                     Err(e) => {
-                        return Err((
+                        let headers = build_token_error_headers(
+                            Some(mapped_model.as_str()),
+                            last_email.as_deref(),
+                            &e,
+                        );
+                        return Ok((
                             StatusCode::SERVICE_UNAVAILABLE,
+                            headers,
                             format!("Token error: {}", e),
-                        ));
+                        )
+                            .into_response());
                     }
                 }
             };
@@ -919,21 +928,18 @@ pub async fn handle_generate(
 
     // 所有尝试均失败：仅当全部结构化失败状态均为 429 时返回 429
     let final_status = failure_statuses.final_status();
+    let headers = build_token_error_headers(
+        Some(initial_mapped_model.as_str()),
+        last_email.as_deref(),
+        &last_error,
+    );
 
-    if let Some(email) = last_email {
-        Ok((
-            final_status,
-            [("X-Account-Email", email)],
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    } else {
-        Ok((
-            final_status,
-            format!("All accounts exhausted. Last error: {}", last_error),
-        )
-            .into_response())
-    }
+    Ok((
+        final_status,
+        headers,
+        format!("All accounts exhausted. Last error: {}", last_error),
+    )
+        .into_response())
 }
 
 pub async fn handle_list_models(
@@ -975,17 +981,12 @@ pub async fn handle_get_model(Path(model_name): Path<String>) -> impl IntoRespon
     }))
 }
 
-/// 处理 /countTokens 斜杠语法路由
-/// 委托给 execute_count_tokens，与 :countTokens 冒号语法共用同一实现
 pub async fn handle_count_tokens(
     State(state): State<AppState>,
     Path(model_name): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    match execute_count_tokens(state, model_name, body).await {
-        Ok(resp) => resp,
-        Err((status, msg)) => (status, Json(json!({ "error": msg }))).into_response(),
-    }
+    execute_count_tokens(state, model_name, body).await
 }
 
 /// 核心 countTokens 实现：透明代理到上游 v1internal:countTokens
@@ -996,7 +997,7 @@ pub async fn execute_count_tokens(
     state: AppState,
     model_name: String,
     mut body: Value,
-) -> Result<Response, (StatusCode, String)> {
+) -> Response {
     // [DEFENSE] 净化 Gemini 原生请求体中的所有 inlineData (过滤或降级空数据/损坏图片)
     crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
 
@@ -1019,7 +1020,7 @@ pub async fn execute_count_tokens(
 
     let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-    let (access_token, _project_id, email, account_id, _wait_ms) = state
+    let (access_token, _project_id, email, account_id, _wait_ms) = match state
         .token_manager
         .get_token(
             &config.request_type,
@@ -1028,12 +1029,22 @@ pub async fn execute_count_tokens(
             &config.final_model,
         )
         .await
-        .map_err(|e| {
-            (
+    {
+        Ok(t) => t,
+        Err(e) => {
+            let headers = build_token_error_headers(
+                Some(mapped_model.as_str()),
+                None,
+                &e,
+            );
+            return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Token error: {}", e),
+                headers,
+                Json(json!({ "error": format!("Token error: {}", e) })),
             )
-        })?;
+                .into_response();
+        }
+    };
 
     // 3. 包装为 v1internal 格式
     // [已验证] countTokens 与 generateContent 不同: 顶层只允许 "request" 键,
@@ -1048,7 +1059,7 @@ pub async fn execute_count_tokens(
     });
 
     // 4. 调用上游 v1internal:countTokens
-    let call_result = state
+    let call_result = match state
         .upstream
         .call_v1_internal_with_headers(
             "countTokens",
@@ -1059,25 +1070,39 @@ pub async fn execute_count_tokens(
             Some(account_id.as_str()),
         )
         .await
-        .map_err(|e| {
-            (
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
                 StatusCode::BAD_GATEWAY,
-                format!("Upstream call error: {}", e),
+                Json(json!({ "error": format!("Upstream call error: {}", e) })),
             )
-        })?;
+                .into_response();
+        }
+    };
 
     let response = call_result.response;
     let status = response.status();
 
     if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
-        return Err((status, format!("Upstream countTokens error: {}", err_text)));
+        return (
+            status,
+            Json(json!({ "error": format!("Upstream countTokens error: {}", err_text) })),
+        )
+            .into_response();
     }
 
-    let gemini_resp: Value = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+    let gemini_resp: Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("Parse error: {}", e) })),
+            )
+                .into_response();
+        }
+    };
 
     // 5. 提取 totalTokens (兼容 wrapped / unwrapped 两种响应格式)
     let total_tokens = gemini_resp
@@ -1088,7 +1113,7 @@ pub async fn execute_count_tokens(
         .unwrap_or(0);
 
     // 6. 返回标准 Gemini REST 响应
-    Ok((
+    (
         StatusCode::OK,
         [
             ("X-Account-Email", email.as_str()),
@@ -1096,5 +1121,5 @@ pub async fn execute_count_tokens(
         ],
         Json(json!({ "totalTokens": total_tokens })),
     )
-        .into_response())
+        .into_response()
 }

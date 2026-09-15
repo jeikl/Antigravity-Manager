@@ -149,10 +149,18 @@ pub struct CircuitBreakerConfig {
     /// Default: [60, 300, 1800, 7200]
     #[serde(default = "default_backoff_steps")]
     pub backoff_steps: Vec<u64>,
+
+    /// Lock account until quota reset time when 5-hour rolling or weekly quota reaches 0
+    #[serde(default = "default_lock_on_zero_quota")]
+    pub lock_on_zero_quota: bool,
 }
 
 fn default_backoff_steps() -> Vec<u64> {
     vec![60, 300, 1800, 7200]
+}
+
+fn default_lock_on_zero_quota() -> bool {
+    false
 }
 
 impl CircuitBreakerConfig {
@@ -160,6 +168,7 @@ impl CircuitBreakerConfig {
         Self {
             enabled: true,
             backoff_steps: default_backoff_steps(),
+            lock_on_zero_quota: false,
         }
     }
 }
@@ -173,7 +182,7 @@ impl Default for CircuitBreakerConfig {
 impl AppConfig {
     pub fn new() -> Self {
         Self {
-            language: "zh".to_string(),
+            language: crate::modules::i18n::default_language(),
             theme: "system".to_string(),
             auto_refresh: true,
             refresh_interval: 15,
@@ -199,5 +208,21 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn saved_language_is_preserved_when_loading_config() {
+        let mut config = AppConfig::new();
+        for language in ["en", "zh", "zh-TW", "ru"] {
+            config.language = language.to_string();
+            let saved = serde_json::to_string(&config).unwrap();
+            let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.language, language);
+        }
     }
 }

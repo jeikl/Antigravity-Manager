@@ -340,65 +340,83 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
     #[cfg(target_os = "linux")]
     {
         // 2.3 Linux Secret Service API
+        // [FIX #3418] 在 Linux GNOME 环境下，Secret Service 往往同时存在 'login' 集合与 'default' 集合。
+        // agy CLI 读取凭据时严格从 'login' 集合检索。若未指定 --collection，secret-tool 会写入 default 集合，
+        // 导致两个集合内容分叉，agy 持续读取到 login 集合中的旧账号。
+        // 此处封装辅助函数：优先写入 login 集合，同时确保与 default 集合同步。
         use std::io::Write;
         use std::sync::mpsc;
 
-        let mut child = Command::new("secret-tool")
-            .args([
-                "store",
-                "--label=gemini",
-                "service",
-                "gemini",
-                "username",
-                "antigravity",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn secret-tool: {}", e))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(payload_json.as_bytes())
-                .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
-            // stdin is dropped here, closing the pipe and signalling EOF to secret-tool
-        }
-
-        // Protect against indefinite blocking when D-Bus is unavailable (common on Wayland
-        // sessions where DBUS_SESSION_BUS_ADDRESS is not inherited by the Tauri process).
-        let child_pid = child.id();
-        let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
-        std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-
-        let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(result) => result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?,
-            Err(_) => {
-                // secret-tool has been blocked for more than 10 seconds.
-                // Most likely cause: D-Bus session bus is not reachable from the Tauri process
-                // (typical on Wayland without proper DBUS_SESSION_BUS_ADDRESS propagation).
-                // Kill the hung subprocess before returning the error.
-                let _ = Command::new("kill")
-                    .args(["-9", &child_pid.to_string()])
-                    .output();
-                crate::modules::logger::log_error(
-                    "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable. \
-                     Ensure gnome-keyring/kwallet is running and DBUS_SESSION_BUS_ADDRESS is exported.",
-                );
-                return Err(
-                    "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process, \
-                     which is common on Wayland without proper session setup. \
-                     Please ensure gnome-keyring or kwallet is running."
-                        .to_string(),
-                );
+        let store_to_collection = |collection_opt: Option<&str>, payload: &[u8]| -> Result<(), String> {
+            let mut cmd = Command::new("secret-tool");
+            cmd.arg("store");
+            if let Some(col) = collection_opt {
+                cmd.arg(format!("--collection={}", col));
+                cmd.arg("--label=Password for 'antigravity' on 'gemini'");
+            } else {
+                cmd.arg("--label=gemini");
             }
+            cmd.args(["service", "gemini", "username", "antigravity"]);
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("Failed to spawn secret-tool: {}", e))?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(payload)
+                    .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
+            }
+
+            let child_pid = child.id();
+            let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+
+            let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(result) => result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?,
+                Err(_) => {
+                    let _ = Command::new("kill").args(["-9", &child_pid.to_string()]).output();
+                    crate::modules::logger::log_error(
+                        "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable.",
+                    );
+                    return Err(
+                        "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process."
+                            .to_string(),
+                    );
+                }
+            };
+
+            if !output.status.success() {
+                let err_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Linux secret-tool failed: {}", err_msg.trim()));
+            }
+
+            Ok(())
         };
 
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Linux secret-tool failed: {}", err_msg.trim()));
+        // 1. 优先尝试写入 'login' 集合（agy CLI 所需）
+        let login_res = store_to_collection(Some("login"), payload_json.as_bytes());
+
+        // 2. 同时写入默认集合（保证其他依赖 default collection 的系统工具也能读取）
+        let default_res = store_to_collection(None, payload_json.as_bytes());
+
+        // 若两者均失败，则返回错误；若至少一个成功，则记录并继续
+        if login_res.is_err() && default_res.is_err() {
+            return Err(login_res.unwrap_err());
+        } else if let Err(e) = login_res {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Failed to write token to 'login' collection, falling back to default collection: {}",
+                e
+            ));
+        } else {
+            crate::modules::logger::log_info(
+                "[Desktop] Successfully synced credential to Secret Service 'login' collection.",
+            );
         }
     }
 

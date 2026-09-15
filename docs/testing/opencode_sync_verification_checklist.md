@@ -165,6 +165,37 @@ ls -la ~/.config/opencode/*.bak
 
 ---
 
+## APIKEY.FUN → OpenCode
+
+- [ ] On APIKEY.FUN, query a key's models and click **OpenCode**. Verify
+  `provider.apikey-fun` uses `@ai-sdk/openai-compatible`, the current key and
+  BaseURL, and the queried model IDs. Existing providers must remain unchanged.
+- [ ] Repeat with a saved BaseURL ending in `/v1/`; the stored URL must end in
+  exactly `/v1`, without a duplicate suffix.
+- [ ] Edit the key after querying, or switch keys while a query is in flight.
+  Models fetched with another key or URL must not be exported for the current key.
+- [ ] Verify the button is disabled while querying or syncing and for a blank key.
+- [ ] Sync a nonempty model list twice: unavailable models are removed, while
+  custom limits/options on surviving unknown models are preserved. Omitting models
+  (including a query that returned no models) preserves the existing model list.
+- [ ] With an existing `opencode.jsonc` containing comments, trailing commas,
+  Unicode instructions/paths, and another provider, sync and verify those values
+  survive. The original file must be preserved in the `.antigravity-manager.bak`
+  backup; subsequent syncs must not overwrite that backup.
+- [ ] With an invalid JSON/JSONC config, verify sync reports an error and leaves
+  the original file unchanged.
+- [ ] Verify both desktop invocation and the authenticated web endpoint
+  `POST /api/proxy/opencode/openai-sync`. In web/server deployments, the config is
+  written on the server running Antigravity Manager.
+- [ ] Restart OpenCode, select an `apikey-fun/…` model, and send a short request.
+
+Automated backend coverage:
+
+```bash
+cd src-tauri
+cargo test --lib opencode_sync
+```
+
 ## Test Environment
 
 - **OS**: 

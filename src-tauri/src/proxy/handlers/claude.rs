@@ -860,7 +860,11 @@ pub async fn handle_messages(
                 } else {
                     e
                 };
-                let headers = [("X-Mapped-Model", mapped_model.as_str())];
+                let headers = crate::proxy::handlers::common::build_token_error_headers(
+                    Some(mapped_model.as_str()),
+                    None,
+                    &safe_message,
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     headers,
@@ -1916,6 +1920,12 @@ pub async fn handle_messages(
             last_status
         };
 
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+            if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
+                headers.insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+
         (response_status, headers, Json(json!({
             "type": "error",
             "error": {
@@ -1930,6 +1940,11 @@ pub async fn handle_messages(
         if let Some(model) = last_mapped_model {
             if let Ok(v) = header::HeaderValue::from_str(&model) {
                 headers.insert("X-Mapped-Model", v);
+            }
+        }
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+            if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
+                headers.insert(axum::http::header::RETRY_AFTER, val);
             }
         }
 

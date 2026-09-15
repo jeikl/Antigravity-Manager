@@ -40,7 +40,7 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.6.9');
+    const [appVersion, setAppVersion] = useState<string>('4.7.2');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -1639,6 +1639,7 @@ function Settings() {
                     }
                 </div >
 
+                {/* Data Directory Migration Modal */}
                 <ModalDialog
                     isOpen={isClearLogsOpen}
                     title={t('settings.advanced.clear_logs_title')}

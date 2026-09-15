@@ -1,5 +1,5 @@
 cask "antigravity-tools" do
-  version "4.6.9"
+  version "4.7.2"
   sha256 :no_check
 
   name "Antigravity Tools"
@@ -13,11 +13,10 @@ cask "antigravity-tools" do
 
     app "Antigravity Tools.app"
 
-    postflight do
-      system_command "xattr",
-                     args:         ["-rd", "com.apple.quarantine", "#{appdir}/Antigravity Tools.app"],
-                     sudo:         false,
-                     must_succeed: false
+    postflight_steps do
+      run "/usr/bin/xattr",
+          args:         ["-rd", "com.apple.quarantine", "{{appdir}}/Antigravity Tools.app"],
+          must_succeed: false
     end
 
     zap trash: [
@@ -26,8 +25,6 @@ cask "antigravity-tools" do
       "~/Library/Preferences/com.lbjlaq.antigravity-tools.plist",
       "~/Library/Saved Application State/com.lbjlaq.antigravity-tools.savedState",
     ]
-
-
   end
 
   on_linux do
@@ -36,8 +33,8 @@ cask "antigravity-tools" do
     url "https://github.com/lbjlaq/Antigravity-Manager/releases/download/v#{version}/Antigravity.Tools_#{version}_#{arch}.AppImage"
     binary "Antigravity.Tools_#{version}_#{arch}.AppImage", target: "antigravity-tools"
 
-    preflight do
-      system_command "/bin/chmod", args: ["+x", "#{staged_path}/Antigravity.Tools_#{version}_#{arch}.AppImage"]
+    preflight_steps do
+      set_permissions "Antigravity.Tools_{{version}}_{{arch}}.AppImage", "0755"
     end
   end
 end

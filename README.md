@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.6.9)
+> 专业级 AI 账号管理与协议代理系统 (v4.7.2)
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
 
@@ -8,7 +8,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.6.9-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.7.2-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -45,7 +45,7 @@
 | 赞助商 (Sponsor) | 简介 (Description) |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | 感谢 **PackyCode** 对本项目的赞助！PackyCode 是一家可靠高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种服务的中转。PackyCode 为本项目的用户提供了特别优惠：使用[此链接](https://www.packyapi.com/register?aff=Ctrler)注册，并在充值时输入 **“Ctrler”** 优惠码即可享受 **九折优惠**。 |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fun/register?aff=Ctrler)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fan/register?aff=Ctrler)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
 | <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | 感谢 **Claude API** 对本项目的支持！claudeapi.com 是一家走**官方与 AWS 渠道**接入的 **Claude API** 中转站，专注 Claude，主打高稳定、低延迟，完整支持 Claude Code。为本项目用户提供专属福利：通过[专属链接](https://console.claudeapi.com/register?source=antigravity)注册即送**免费测试额度，零门槛跑通**；充值再享 **95 折**专属优惠(联系客服）。 |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | 感谢 AICodeMirror 赞助了本项目！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定中转服务，支持企业级高并发、极速开票、7×24 专属技术支持。 Claude Code / Codex / Gemini 官方渠道低至 3.8 / 0.2 / 0.9 折，充值更有折上折！AICodeMirror 为 Antigravity-Manager 的用户提供了特别福利，通过[此链接](https://aicodemirror.ai/register?invitecode=MV5XUM)注册的用户，可享受首充8折，企业客户最高可享 7.5 折！ |
 
@@ -226,6 +226,7 @@ cd docker
 # 2. 启动服务
 docker compose up -d
 ```
+> **日志轮转**: Compose 默认将 JSON 日志限制为单文件 `100m`、保留 `3` 个文件，避免日志无限增长。
 > **访问地址**: `http://localhost:8045` (管理后台) | `http://localhost:8045/v1` (API Base)
 > **系统要求**:
 > - **内存**: 建议 **1GB** (最小 256MB)。
@@ -237,7 +238,8 @@ docker compose up -d
 
 Copyright © 2024-2026 [lbjlaq](https://github.com/lbjlaq)
 
-### 🛠️ 常见问题排查 (Troubleshooting)
+<details>
+<summary><b>🛠️ 常见问题排查 (Troubleshooting) - 点击展开</b></summary>
 
 #### macOS 提示“应用已损坏，无法打开”？
 由于 macOS 的安全机制，非 App Store 下载的应用可能会触发此提示。您可以按照以下步骤快速修复：
@@ -260,6 +262,8 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 - `ANTIGRAVITY_FORCE_WAYLAND=1`: 保持原生 Wayland（不强制切 X11）
 - `ANTIGRAVITY_FORCE_X11=1`: 仍需走 X11 时强制启用
 - `WEBKIT_DISABLE_DMABUF_RENDERER=1`: 禁用 WebKit DMA-BUF 渲染器
+
+</details>
 
 ## 🔌 快速接入示例
 
@@ -357,6 +361,9 @@ with open("output.png", "wb") as f:
 - **`n`**: 生成图片数量（1-10）
 - **`response_format`**: `"b64_json"` 或 `"url"`（Data URI）
 
+<details>
+<summary><b>🎨 展开查看更多图片调用方式与参数映射规则 (Chat API / 模型后缀 / Cherry Studio)</b></summary>
+
 #### 方式二：Chat API + 参数设置 (✨ 新增)
 
 **所有协议**（OpenAI、Claude）的 Chat API 现在都支持直接传递 `size` 和 `quality` 参数：
@@ -384,13 +391,11 @@ curl -X POST http://127.0.0.1:8045/v1/messages \
   }'
 ```
 
-```
-
 **参数优先级**: `imageSize` 参数 > `quality` 参数 > 模型后缀
 
 **✨ 新增 `imageSize` 参数支持**:
 
-除了 `quality` 参数外,现在还支持直接使用 Gemini 原生的 `imageSize` 参数:
+除了 `quality` 参数外，现在还支持直接使用 Gemini 原生的 `imageSize` 参数:
 
 ```python
 # 使用 imageSize 参数(最高优先级)
@@ -418,8 +423,7 @@ curl -X POST http://127.0.0.1:8045/v1/messages \
 **参数说明**:
 - **`imageSize`**: 直接指定分辨率 (`"1K"` / `"2K"` / `"4K"`)
 - **`quality`**: 通过质量等级推断分辨率 (`"standard"` → 1K, `"medium"` → 2K, `"hd"` → 4K)
-- **优先级**: 如果同时指定 `imageSize` 和 `quality`,系统会优先使用 `imageSize`
-
+- **优先级**: 如果同时指定 `imageSize` 和 `quality`, 系统会优先使用 `imageSize`
 
 #### 方式三：Chat 接口 + 模型后缀
 ```python
@@ -449,14 +453,16 @@ response = client.chat.completions.create(
 - `quality: "hd"` → 映射为 `4K` 分辨率
 - `quality: "medium"` → 映射为 `2K` 分辨率
 
+</details>
 
 ## 📝 更新日志
 
-> 最新版本 **v4.6.9**（2026-09-08）：全面增强多协议 Agent 稳定性，修复 Responses 会话路由与签名解耦、遵守 store:false 抑制内存泄漏、修复 429 故障转移死循环与熔断切号、增加 Gemini 首轮 User Primer 解决自主智能体 400 轮次报错、修复 /accounts/switch targetIde 免重启 IDE。
+> 最新版本 **v4.7.2**（2026-09-15）：支持自定义数据存储目录与全量平滑迁移（彻底解决 C 盘爆满问题并自动重启生效）、规范化 Codex 客户端中 Gemini 思考流为标准 reasoning summary 事件、全局系统提示词换行隔离与 Markdown 格式安全保护、Gemini Wrapper 提示词去重、配置保存即时同步全局内存。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
-## 👥 核心贡献者 (Contributors)
+<details>
+<summary><b>👥 核心贡献者 (Contributors) - 点击展开</b></summary>
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
@@ -489,7 +495,10 @@ response = client.chat.completions.create(
 
 感谢所有为本项目付出汗水与智慧的开发者。
 
-## 🤝 鸣谢项目 (Special Thanks)
+</details>
+
+<details>
+<summary><b>🤝 鸣谢项目 (Special Thanks) - 点击展开</b></summary>
 
 本项目在开发过程中参考或借鉴了以下优秀开源项目的思路或代码，排名不分先后：
 
@@ -501,6 +510,8 @@ response = client.chat.completions.create(
 *   [aistudio-gemini-proxy](https://github.com/zhongruichen/aistudio-gemini-proxy)
 *   [gcli2api](https://github.com/su-kaka/gcli2api)
 *   [agent-vibes](https://github.com/funny-vibes/agent-vibes)
+
+</details>
 
 *   **版权许可**: 基于 **CC BY-NC-SA 4.0** 许可，**严禁任何形式的商业行为**。
 *   **安全声明**: 本应用所有账号数据加密存储于本地 SQLite 数据库，除非开启同步功能，否则数据绝不离开您的设备。

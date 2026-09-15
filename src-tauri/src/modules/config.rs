@@ -98,7 +98,7 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     Ok(config)
 }
 
-/// Save application configuration
+/// Save application configuration (atomic write)
 pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
@@ -106,5 +106,6 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
 
-    fs::write(&config_path, content).map_err(|e| format!("failed_to_save_config: {}", e))
+    crate::utils::fs::write_atomic(&config_path, content.as_bytes())
+        .map_err(|e| format!("failed_to_save_config: {}", e))
 }

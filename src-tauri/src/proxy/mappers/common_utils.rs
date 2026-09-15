@@ -622,6 +622,35 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
     false
 }
 
+/// 检测是否携带任何工具定义 (无论是本地函数还是联网工具)
+pub fn has_any_tools(tools: &Option<Vec<Value>>) -> bool {
+    if let Some(list) = tools {
+        !list.is_empty()
+    } else {
+        false
+    }
+}
+
+/// 检查 contents 中是否包含工具调用或工具返回结果 (表明处于多轮 Agent 会话中)
+pub fn contents_has_tool_interactions(contents: &Value) -> bool {
+    if let Some(arr) = contents.as_array() {
+        for msg in arr {
+            if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if part.get("functionCall").is_some()
+                        || part.get("functionResponse").is_some()
+                        || part.get("tool_use").is_some()
+                        || part.get("tool_result").is_some()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

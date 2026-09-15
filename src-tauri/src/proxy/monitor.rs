@@ -134,16 +134,18 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        let log_days = crate::proxy::config::get_log_retention_days() as i64;
         let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
+        let retention = crate::modules::config::load_app_config()
+            .map(|config| config.proxy.log_retention)
+            .unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            match crate::modules::proxy_db::cleanup_old_logs(log_days) {
-                Ok(deleted) => {
-                    if deleted > 0 {
+            match crate::modules::proxy_db::apply_retention(&retention) {
+                Ok((cleared, deleted)) => {
+                    if cleared > 0 || deleted > 0 {
                         tracing::info!(
-                            "Auto cleanup: removed {} old logs (>{} days)",
-                            deleted,
-                            log_days
+                            "Proxy log retention: cleared {} bodies, deleted {} rows",
+                            cleared,
+                            deleted
                         );
                     }
                 }
@@ -163,6 +165,54 @@ impl ProxyMonitor {
                 }
                 Err(e) => {
                     tracing::error!("Failed to cleanup thinking records: {}", e);
+                }
+            }
+        });
+
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
+                let retention = crate::modules::config::load_app_config()
+                    .map(|config| config.proxy.log_retention)
+                    .unwrap_or_default();
+                let result = tokio::task::spawn_blocking(move || {
+                    let retention_res = crate::modules::proxy_db::apply_retention(&retention);
+                    let thinking_res =
+                        crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days);
+                    (retention_res, thinking_res)
+                })
+                .await;
+                match result {
+                    Ok((retention_res, thinking_res)) => {
+                        match retention_res {
+                            Ok((cleared, deleted)) => {
+                                if cleared > 0 || deleted > 0 {
+                                    tracing::info!(
+                                        "Proxy log retention: cleared {} bodies, deleted {} rows",
+                                        cleared,
+                                        deleted
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!("Failed to apply proxy log retention: {}", error)
+                            }
+                        }
+                        if let Ok(deleted) = thinking_res {
+                            if deleted > 0 {
+                                tracing::info!(
+                                    "Auto cleanup: removed {} old thinking/signature records",
+                                    deleted
+                                );
+                            }
+                        } else if let Err(e) = thinking_res {
+                            tracing::error!("Failed to cleanup thinking records: {}", e);
+                        }
+                    }
+                    Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
                 }
             }
         });

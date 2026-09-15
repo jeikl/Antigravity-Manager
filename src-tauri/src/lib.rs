@@ -617,6 +617,7 @@ pub fn run() {
             commands::open_data_folder,
             commands::get_data_dir_path,
             commands::set_data_dir,
+            commands::migrate_data_dir,
             commands::show_main_window,
             commands::set_window_theme,
             commands::get_antigravity_path,
@@ -659,7 +660,6 @@ pub fn run() {
             commands::proxy::get_preferred_account,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
-            commands::proxy::check_proxy_health,
             // Proxy Pool Binding commands
             commands::proxy_pool::bind_account_proxy,
             commands::proxy_pool::unbind_account_proxy,
@@ -693,6 +693,7 @@ pub fn run() {
             proxy::opencode_sync::get_opencode_sync_status,
             proxy::opencode_sync::get_canonical_families,
             proxy::opencode_sync::execute_opencode_sync,
+            proxy::opencode_sync::execute_opencode_openai_sync,
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,
