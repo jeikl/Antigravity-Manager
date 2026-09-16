@@ -226,19 +226,18 @@ pub fn wrap_request_v2(
     }
 
     let lower_model = final_model_name.to_lowercase();
-    let force_server_thinking =
-        crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+    let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(final_model_name)
+        || crate::proxy::model_specs::is_gemini_under_v3(original_model);
+    let force_server_thinking = !is_under_v3
+        && crate::proxy::thinking_store::any_model_forces_server_thinking(&[
             final_model_name,
             original_model,
         ]);
     let is_preview = lower_model.contains("preview");
-    let should_inject = force_server_thinking
-        || lower_model.contains("thinking")
-        || lower_model.contains("flash")
-        || lower_model.contains("agent")
-        || (lower_model.contains("gemini-2.0-pro") && !is_preview)
-        || (lower_model.contains("gemini-3-pro") && !is_preview)
-        || (lower_model.contains("gemini-3.1-pro") && !is_preview);
+    let should_inject = !is_under_v3
+        && (force_server_thinking
+            || lower_model.contains("thinking")
+            || (crate::proxy::model_specs::is_gemini_v3_or_above(final_model_name) && !is_preview));
 
     if let Some(contents) = inner_request
         .get_mut("contents")
@@ -337,7 +336,9 @@ pub fn wrap_request_v2(
             }
         }
         if let Some(s_id) = session_id {
-            crate::proxy::thinking_store::hydrate_gemini_contents(s_id, contents);
+            if should_inject {
+                crate::proxy::thinking_store::hydrate_gemini_contents(s_id, contents);
+            }
         }
         crate::proxy::thinking_store::finalize_gemini_contents_thinking(
             contents,
@@ -414,6 +415,10 @@ pub fn wrap_request_v2(
             .as_object_mut()
             .unwrap();
 
+        if is_under_v3 {
+            gen_config.remove("thinkingConfig");
+        }
+
         // [ADDED v4.1.24] Inject topK=40 and topP=1.0 if not present to match official client
         if !gen_config.contains_key("topK") {
             gen_config.insert("topK".to_string(), json!(40));
@@ -473,47 +478,24 @@ pub fn wrap_request_v2(
         }
 
         if let Some(thinking_config) = gen_config.get_mut("thinkingConfig") {
-            if let Some(budget_val) = thinking_config.get("thinkingBudget") {
-                if let Some(budget_i64) = budget_val.as_i64() {
-                    // [NEW] -1 indicates native dynamic mode, skip capping
-                    if budget_i64 != -1 {
-                        let budget = budget_i64 as u64;
-                        let thinking_budget_cap =
-                            crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
-                        let tb_config = crate::proxy::config::get_thinking_budget_config();
-                        let final_budget = match tb_config.mode {
-                            crate::proxy::config::ThinkingBudgetMode::Passthrough => budget,
-                            crate::proxy::config::ThinkingBudgetMode::Custom => {
-                                let val = tb_config.custom_value as u64;
-                                let is_limited = (final_model_name.contains("gemini")
-                                    || final_model_name.contains("thinking"))
-                                    && !final_model_name.contains("-image");
-
-                                if is_limited && val > thinking_budget_cap {
-                                    thinking_budget_cap
-                                } else {
-                                    val
-                                }
-                            }
-                            crate::proxy::config::ThinkingBudgetMode::Auto => {
-                                let is_limited = (final_model_name.contains("gemini")
-                                    || final_model_name.contains("thinking"))
-                                    && !final_model_name.contains("-image");
-
-                                if is_limited && budget > thinking_budget_cap {
-                                    thinking_budget_cap
-                                } else {
-                                    budget
-                                }
-                            }
-                            crate::proxy::config::ThinkingBudgetMode::Adaptive => budget,
-                        };
-
-                        if final_budget != budget {
-                            thinking_config["thinkingBudget"] = json!(final_budget);
-                        }
+            // [USER RULE] 完全忽略客户端思考预算，统一使用根据模型规范与档位字典自动选取的预算
+            let default_budget =
+                crate::proxy::model_specs::get_thinking_budget(final_model_name, token) as i64;
+            let tb_config = crate::proxy::config::get_thinking_budget_config();
+            let final_budget = match tb_config.mode {
+                crate::proxy::config::ThinkingBudgetMode::Custom => {
+                    let custom_val = tb_config.custom_value as i64;
+                    if custom_val > default_budget {
+                        default_budget
+                    } else {
+                        custom_val
                     }
                 }
+                _ => default_budget,
+            };
+            thinking_config["thinkingBudget"] = json!(final_budget);
+            if let Some(tc) = thinking_config.as_object_mut() {
+                tc.remove("thinkingLevel");
             }
         }
 
@@ -582,6 +564,9 @@ pub fn wrap_request_v2(
                 );
                 gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_cap));
             }
+        }
+        if is_under_v3 {
+            gen_config.remove("thinkingConfig");
         }
     }
 
@@ -1403,8 +1388,8 @@ mod tests {
             ["thinkingBudget"]
             .as_u64()
             .unwrap();
-        // [FIX #1592] Pro models now also capped to 24576 in wrap_request logic
-        assert_eq!(budget_pro, 24576);
+        // Pro models now use model_specs budget (49152) in wrap_request logic
+        assert_eq!(budget_pro, 49152);
     }
 
     #[test]

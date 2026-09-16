@@ -110,7 +110,8 @@ pub fn resolve_request_config(
         || mapped_model.contains("claude-3-opus")
         || mapped_model.contains("claude-sonnet")
         || mapped_model.contains("claude-opus")
-        || mapped_model.contains("claude-4");
+        || mapped_model.contains("claude-4")
+        || crate::proxy::model_specs::is_gemini_v3_or_above(mapped_model);
 
     // Determine if we should enable networking
     // [FIX] 禁用基于模型的自动联网逻辑，防止图像请求被联网搜索结果覆盖。
@@ -131,14 +132,12 @@ pub fn resolve_request_config(
         _ => final_model,
     };
 
-    // [FIX] Check allowlist before forcing downgrade
-    // If networking is enabled but the model doesn't support search, fall back to Flash
+    // [FIX] 不再强行将模型降级为 gemini-2.5-flash，彻底杜绝静默降级
     if enable_networking && !_is_high_quality_model {
-        tracing::info!(
-            "[Common-Utils] Downgrading {} to gemini-2.5-flash for web search (model not in search allowlist)",
+        tracing::debug!(
+            "[Common-Utils] Request enables web search for model {}",
             final_model
         );
-        final_model = "gemini-2.5-flash".to_string();
     }
 
     RequestConfig {

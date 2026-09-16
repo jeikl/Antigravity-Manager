@@ -312,21 +312,21 @@ pub fn transform_openai_request_with_session(
         None,                          // body
     );
 
-    // [FIX] 仅当模型名称显式包含 "-thinking" 时才视为 Gemini 思维模型
-    // 避免对 gemini-3-pro (preview) 等其实不支持 thinkingConfig 的模型注入参数导致 400
-    // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to bypass thinking check
-    // These models support thinking but do not have "-thinking" suffix
-    let is_gemini_3_thinking = mapped_model_lower.contains("gemini")
+    let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(mapped_model)
+        || crate::proxy::model_specs::is_gemini_under_v3(&request.model);
+
+    // [FIX] 仅当模型名称显式包含 "-thinking" 或 Gemini 3+ 思维模型时才视为 Gemini 思维模型
+    let is_gemini_3_thinking = !is_under_v3
+        && mapped_model_lower.contains("gemini")
         && (mapped_model_lower.contains("-thinking")
-            || mapped_model_lower.contains("gemini-2.0-pro")
-            || mapped_model_lower.contains("gemini-3-pro")
-            || mapped_model_lower.contains("gemini-3.1-pro")
+            || crate::proxy::model_specs::is_gemini_v3_or_above(mapped_model)
             || mapped_model_lower.contains("gemini-pro")
             || mapped_model_lower.contains("-pro-agent"))
         && !mapped_model_lower.contains("claude");
-    // [FIX #2167] gemini-*-flash 支持 thinking，functionCall 必须携带 thoughtSignature
-    // [FEATURE] 同时注入 includeThoughts:true 使 Gemini 返回 thought:true chunk，客户端可显示思维链
-    let is_gemini_flash_thinking = mapped_model_lower.contains("gemini")
+    // [FIX #2167] gemini-*-flash 支持 thinking (需为 Gemini 3 及以上版本)
+    let is_gemini_flash_thinking = !is_under_v3
+        && crate::proxy::model_specs::is_gemini_v3_or_above(mapped_model)
+        && mapped_model_lower.contains("gemini")
         && (mapped_model_lower.contains("flash")
             || mapped_model_lower.contains("-flash-")
             || mapped_model_lower.contains("-flash-agent"))
@@ -341,8 +341,8 @@ pub fn transform_openai_request_with_session(
     let is_claude_model = mapped_model_lower.contains("claude");
     let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
         || (is_claude_model && user_enabled_thinking);
-    let force_server_thinking =
-        crate::proxy::thinking_store::any_model_forces_server_thinking(&[
+    let force_server_thinking = !is_under_v3
+        && crate::proxy::thinking_store::any_model_forces_server_thinking(&[
             request.model.as_str(),
             mapped_model,
         ]);
@@ -354,13 +354,15 @@ pub fn transform_openai_request_with_session(
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
     let has_incompatible_assistant_history = request.messages.iter().any(|msg| {
         msg.role == "assistant"
-            && msg
-                .reasoning_content
-                .as_ref()
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
+            && (msg.reasoning_content.is_none()
+                || msg
+                    .reasoning_content
+                    .as_ref()
+                    .map_or(false, |r| r.is_empty()))
     });
-    let has_tool_history = request
+
+    // 检查历史中是否有工具调用
+    let has_tool_calls_in_history = request
         .messages
         .iter()
         .any(|msg| msg.role == "tool" || msg.role == "function" || msg.tool_calls.is_some());
@@ -368,13 +370,9 @@ pub fn transform_openai_request_with_session(
     // [NEW] 决定是否开启 Thinking 功能:
     // 1. 模型名包含 -thinking 时自动开启
     // 2. 用户在请求中显式设置 thinking.type = "enabled" 时开启
-    // [FIX #3391] 如果是 Claude 思考模型且存在缺失 reasoning_content 的 Assistant 历史，
-    // Claude 上游严格要求每个 thinking 块必须有真实签名且不支持哨兵签名，
-    // 注入无签名占位块必触发 400 thinking.signature: Field required。
-    // 因此对于带有不兼容历史的 Claude 思考请求，安全降级为不开启 thinking。
-    // Clients typically omit thinking config. Keyword models still force includeThoughts.
-    let mut actual_include_thinking =
-        is_thinking_model || user_enabled_thinking || force_server_thinking;
+    // 3. 若为 Gemini < 3 模型，保底强制关闭 thinking
+    let mut actual_include_thinking = !is_under_v3
+        && (is_thinking_model || user_enabled_thinking || force_server_thinking);
 
     // [REFACTORED] 使用 SignatureCache 获取 Session 级别的签名
     let session_thought_sig = signature_read_key
@@ -872,7 +870,9 @@ pub fn transform_openai_request_with_session(
         }
         merged_contents.push(msg);
     }
-    crate::proxy::thinking_store::hydrate_gemini_contents(&session_id, &mut merged_contents);
+    if actual_include_thinking {
+        crate::proxy::thinking_store::hydrate_gemini_contents(&session_id, &mut merged_contents);
+    }
     let mut contents = merged_contents;
 
     crate::proxy::thinking_store::finalize_gemini_contents_thinking(
@@ -947,47 +947,23 @@ pub fn transform_openai_request_with_session(
                 "includeThoughts": false
             });
         } else {
-            // [CONFIGURABLE] 根据配置和模型规格决定 thinking_budget (v4.1.29)
+            // [CONFIGURABLE] 完全忽略客户端 budget，统一根据映射后的 Gemini 模型 ID 字典自动填充
+            let default_budget = model_specs::get_thinking_budget(mapped_model, token) as i64;
             let tb_config = crate::proxy::config::get_thinking_budget_config();
-            // 优先使用用户在请求中传入的 budget，否则从规格表中获取默认值
-            let default_budget = model_specs::get_thinking_budget(mapped_model, token);
-            let user_budget: i64 = user_thinking_budget
-                .map(|b| b as i64)
-                .unwrap_or(default_budget as i64);
-
-            let budget = match tb_config.mode {
-                crate::proxy::config::ThinkingBudgetMode::Passthrough => user_budget,
+            let final_budget = match tb_config.mode {
+                crate::proxy::config::ThinkingBudgetMode::Passthrough => {
+                    user_thinking_budget.map(|b| b as i64).unwrap_or(default_budget)
+                }
                 crate::proxy::config::ThinkingBudgetMode::Custom => {
-                    let mut custom_value = tb_config.custom_value as i64;
-                    // 如果自定义值超过了模型规格上限，则进行裁剪
-                    if custom_value > default_budget as i64 {
-                        tracing::warn!(
-                            "[OpenAI-Request] Custom budget {} exceeds model spec limit {}, capping.",
-                            custom_value, default_budget
-                        );
-                        custom_value = default_budget as i64;
-                    }
-                    custom_value
-                }
-                crate::proxy::config::ThinkingBudgetMode::Auto => {
-                    // Auto 模式下，直接应用规格建议的预算
-                    if user_budget > default_budget as i64 {
-                        default_budget as i64
+                    let custom_value = tb_config.custom_value as i64;
+                    if custom_value > default_budget {
+                        default_budget
                     } else {
-                        user_budget
+                        custom_value
                     }
                 }
-                crate::proxy::config::ThinkingBudgetMode::Adaptive => user_budget,
+                _ => default_budget,
             };
-
-            let model_lower = mapped_model.to_lowercase();
-            let mut final_budget = budget;
-            if model_lower.contains("claude-opus-4-6-thinking") {
-                tracing::debug!(
-                    "[Opus-Alignment] Enforcing fixed thinkingBudget 24576 for Opus 4.6 (OpenAI)"
-                );
-                final_budget = 24576;
-            }
 
             gen_config["thinkingConfig"] = json!({
                 "includeThoughts": true,
@@ -1007,7 +983,7 @@ pub fn transform_openai_request_with_session(
                 8192
             };
 
-            if model_lower.contains("claude-opus-4-6-thinking") {
+            if mapped_model_lower.contains("claude-opus-4-6-thinking") {
                 gen_config["maxOutputTokens"] = json!(57344);
                 tracing::debug!(
                     "[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6 (OpenAI)"
@@ -1052,9 +1028,10 @@ pub fn transform_openai_request_with_session(
 
     // [FIX] Cap maxOutputTokens to prevent 400 Invalid Argument
     if let Some(val) = gen_config["maxOutputTokens"].as_i64() {
-        let model_lower = mapped_model.to_lowercase();
-        let safe_limit = if model_lower.contains("claude") {
+        let safe_limit = if mapped_model_lower.contains("claude") {
             64000
+        } else if mapped_model_lower.contains("pro") {
+            65535
         } else {
             65536
         };
@@ -1068,8 +1045,7 @@ pub fn transform_openai_request_with_session(
     }
 
     if let Some(stop) = &request.stop {
-        let model_lower = mapped_model.to_lowercase();
-        if !model_lower.contains("claude-opus-4-6-thinking") {
+        if !mapped_model_lower.contains("claude-opus-4-6-thinking") {
             if stop.is_string() {
                 gen_config["stopSequences"] = json!([stop]);
             } else if stop.is_array() {
@@ -1780,15 +1756,15 @@ mod tests {
             ..Default::default()
         };
 
-        // Auto mode (default) should cap gemini-3-pro thinking budget to 24576
+        // Auto mode (default) should map gemini-3-pro thinking budget to 49152 per model_specs
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-v", "gemini-3-pro", None);
         let budget = result["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
         assert_eq!(
-            budget, 24576,
-            "Gemini-3-pro budget must be capped to 24576 in Auto mode"
+            budget, 49152,
+            "Gemini-3-pro budget must match model_specs (49152) in Auto mode"
         );
     }
 
@@ -2064,15 +2040,15 @@ mod tests {
             transform_openai_request(&req, "test-p", "gemini-3-pro-high-thinking", None);
         let gen_config = &result["request"]["generationConfig"];
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        // budget(24576) + overhead(32768) = 57344
-        assert_eq!(max_output_tokens, 57344);
+        // budget(10001) + overhead(32768) = 42769
+        assert_eq!(max_output_tokens, 42769);
 
         // Verify thinkingBudget
         let budget = gen_config["thinkingConfig"]["thinkingBudget"]
             .as_i64()
             .unwrap();
-        // actual(24576)
-        assert_eq!(budget, 24576);
+        // actual(10001) for high-thinking pro
+        assert_eq!(budget, 10001);
     }
 
     #[test]

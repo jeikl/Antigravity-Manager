@@ -447,29 +447,58 @@ pub async fn handle_messages(
             }
         };
 
-    // [Task #6] Apply OpenCode variants thinking hints from raw JSON
-    // 由于此时还没拿到账号，先用模型默认限额兜底
-    let temp_cap = model_specs::get_thinking_budget(&request.model, None);
-    let thinking_hint = extract_thinking_hint(&original_body);
-    apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
-
     // [Variant] Resolve canonical model + variant → real model + real params.
-    let client_budget = original_body
-        .get("thinking")
-        .and_then(|t| t.get("budget_tokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let model_lower = request.model.to_lowercase();
+    let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
+    let is_explicit_tier_model = model_lower.ends_with("-high")
+        || model_lower.ends_with("-medium")
+        || model_lower.ends_with("-low")
+        || model_lower.ends_with("-extra-low");
+
+    let thinking_hint = extract_thinking_hint(&original_body);
+
+    // [USER RULE] 对于 Gemini >= 3 或显式指定档位的模型，进站阶段彻底忽略客户端思考与预算参数，绝不被客户端 1024 或 low 污染
+    if is_v3_or_above || is_explicit_tier_model {
+        // 如果客户端未显式提供 thinking 结构体，或者需要开启思考，初始化为 enabled，但绝不填客户端 budget
+        if request.thinking.is_none() {
+            request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                type_: "enabled".to_string(),
+                budget_tokens: None,
+                effort: None,
+            });
+        } else if let Some(ref mut t) = request.thinking {
+            t.budget_tokens = None; // 清理客户端 budget_tokens，防止污染
+        }
+    } else {
+        // 由于此时还没拿到账号，先用模型默认限额兜底
+        let temp_cap = model_specs::get_thinking_budget(&request.model, None);
+        apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
+    }
+
+    // [USER RULE] 对显式指定档位或 Gemini >= 3 的思考模型，进站阶段彻底忽略客户端思考预算，绝不参与档位推断
+    let effective_budget_hint = if is_explicit_tier_model || is_v3_or_above {
+        None
+    } else {
+        original_body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    };
+
     let effort_hint = request
         .output_config
         .as_ref()
-        .and_then(|config| config.effort.clone());
+        .and_then(|config| config.effort.clone())
+        .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
+        .or_else(|| thinking_hint.level.clone());
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
-    if let Some(spec) = apply_variant(&mut request, effort_tier, client_budget) {
+    if let Some(spec) = apply_variant(&mut request, effort_tier, effective_budget_hint) {
         tracing::info!(
             "[{}] [Variant] canonical='{}' effort_hint={:?} budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
-            trace_id, canonical_model, effort_hint, client_budget, spec.id, spec.thinking_budget, spec.max_output_tokens
+            trace_id, canonical_model, effort_hint, effective_budget_hint, spec.id, spec.thinking_budget, spec.max_output_tokens
         );
     }
 
@@ -883,47 +912,8 @@ pub async fn handle_messages(
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
-        // ===== 【优化】后台任务智能检测与降级 =====
-        // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略
-        let background_task_type = detect_background_task_type(&request_for_body);
-
-        // 传递映射后的模型名
+        // 方案 A：移除后台任务静默降级策略，请求直通客户端指定的模型，与 OpenAI 协议保持一致
         let mut request_with_mapped = request_for_body.clone();
-
-        if let Some(task_type) = background_task_type {
-            // 检测到后台任务,强制降级到 Flash 模型
-            let virtual_model_id = select_background_model(task_type);
-
-            // [FIX] 必须根据虚拟 ID Re-resolve 路由，以支持用户自定义映射 (如 internal-task -> gemini-3)
-            // 否则会直接使用 generic ID 导致下游无法识别或只能使用静态默认值
-            let resolved_model = crate::proxy::common::model_mapping::resolve_model_route(
-                virtual_model_id,
-                &*state.custom_mapping.read().await,
-            );
-
-            info!(
-                "[{}][AUTO] 检测到后台任务 (类型: {:?}), 路由重定向: {} -> {} (最终物理模型: {})",
-                trace_id, task_type, mapped_model, virtual_model_id, resolved_model
-            );
-
-            // 覆盖用户自定义映射 (同时更新变量和 Request 对象)
-            mapped_model = resolved_model.clone();
-            request_with_mapped.model = resolved_model;
-
-            // 后台任务净化：
-            // 1. 移除工具定义（后台任务不需要工具）
-            request_with_mapped.tools = None;
-
-            // 2. 移除 Thinking 配置（Flash 模型不支持）
-            request_with_mapped.thinking = None;
-
-            // 3. 清理历史消息中的 Thinking Block，防止 Invalid Argument
-            // 使用 ContextManager 的统一策略 (Aggressive)
-            crate::proxy::mappers::context_manager::ContextManager::purify_history(
-                &mut request_with_mapped.messages,
-                crate::proxy::mappers::context_manager::PurificationStrategy::Aggressive,
-            );
-        }
 
         // ===== [3-Layer Progressive Compression + Calibrated Estimation] Context Management =====
         // [ENHANCED] 整合 3.3.47 的三层压缩框架 + PR #925 的动态校准机制
@@ -2080,6 +2070,7 @@ mod tests {
 // ===== 后台任务检测辅助函数 =====
 
 /// 后台任务类型
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BackgroundTaskType {
     TitleGeneration,    // 标题生成
@@ -2090,7 +2081,7 @@ enum BackgroundTaskType {
     EnvironmentProbe,   // 环境探测
 }
 
-/// 标题生成关键词
+#[allow(dead_code)]
 const TITLE_KEYWORDS: &[&str] = &[
     "write a 5-10 word title",
     "Please write a 5-10 word title",
@@ -2103,7 +2094,7 @@ const TITLE_KEYWORDS: &[&str] = &[
     "为对话起个标题",
 ];
 
-/// 摘要生成关键词
+#[allow(dead_code)]
 const SUMMARY_KEYWORDS: &[&str] = &[
     "Summarize this coding conversation",
     "Summarize the conversation",
@@ -2116,7 +2107,7 @@ const SUMMARY_KEYWORDS: &[&str] = &[
     "extract key points from",
 ];
 
-/// 建议生成关键词
+#[allow(dead_code)]
 const SUGGESTION_KEYWORDS: &[&str] = &[
     "prompt suggestion generator",
     "suggest next prompts",
@@ -2126,7 +2117,7 @@ const SUGGESTION_KEYWORDS: &[&str] = &[
     "possible next actions",
 ];
 
-/// 系统消息关键词
+#[allow(dead_code)]
 const SYSTEM_KEYWORDS: &[&str] = &[
     "Warmup",
     "<system-reminder>",
@@ -2134,7 +2125,7 @@ const SYSTEM_KEYWORDS: &[&str] = &[
     "This is a system message",
 ];
 
-/// 环境探测关键词
+#[allow(dead_code)]
 const PROBE_KEYWORDS: &[&str] = &[
     "check current directory",
     "list available tools",
@@ -2142,7 +2133,7 @@ const PROBE_KEYWORDS: &[&str] = &[
     "test connection",
 ];
 
-/// 检测后台任务并返回任务类型
+#[allow(dead_code)]
 fn detect_background_task_type(request: &ClaudeRequest) -> Option<BackgroundTaskType> {
     let last_user_msg = extract_last_user_message_for_detection(request)?;
     let preview = last_user_msg.chars().take(500).collect::<String>();
@@ -2179,12 +2170,12 @@ fn detect_background_task_type(request: &ClaudeRequest) -> Option<BackgroundTask
     None
 }
 
-/// 辅助函数：关键词匹配
+#[allow(dead_code)]
 fn matches_keywords(text: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|kw| text.contains(kw))
 }
 
-/// 辅助函数：提取最后一条用户消息（用于检测）
+#[allow(dead_code)]
 fn extract_last_user_message_for_detection(request: &ClaudeRequest) -> Option<String> {
     request
         .messages
@@ -2217,7 +2208,7 @@ fn extract_last_user_message_for_detection(request: &ClaudeRequest) -> Option<St
         })
 }
 
-/// 根据后台任务类型选择合适的模型
+#[allow(dead_code)]
 fn select_background_model(task_type: BackgroundTaskType) -> &'static str {
     match task_type {
         BackgroundTaskType::TitleGeneration => INTERNAL_BACKGROUND_TASK,

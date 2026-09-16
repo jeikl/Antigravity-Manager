@@ -1906,19 +1906,38 @@ pub async fn handle_chat_completions(
     // Replace the client's model/thinking/max_tokens with verified real values so the
     // forwarded request matches the expected upstream format. OpenCode encodes the variant as
     // thinking.budget_tokens; we infer the tier from its magnitude.
-    let client_budget = openai_req.thinking.as_ref().and_then(|t| t.budget_tokens);
+    let model_lower = openai_req.model.to_lowercase();
+    let is_v3_or_above = crate::proxy::model_specs::is_gemini_v3_or_above(&openai_req.model);
+    let is_explicit_tier_model = model_lower.ends_with("-high")
+        || model_lower.ends_with("-medium")
+        || model_lower.ends_with("-low")
+        || model_lower.ends_with("-extra-low");
+    let client_budget = if is_v3_or_above || is_explicit_tier_model {
+        if let Some(ref mut t) = openai_req.thinking {
+            t.budget_tokens = None; // 清理客户端 budget_tokens，防止污染
+        }
+        None
+    } else {
+        openai_req.thinking.as_ref().and_then(|t| t.budget_tokens)
+    };
+    let effective_budget_hint = if is_explicit_tier_model || is_v3_or_above {
+        None
+    } else {
+        client_budget
+    };
+
     let variant_spec =
         if crate::proxy::mappers::openai::request::is_tiered_flash_model(&openai_req.model) {
             None
         } else {
-            crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
+            crate::proxy::common::variant_mapping::resolve(&openai_req.model, effective_budget_hint)
         };
     if let Some(spec) = variant_spec {
         tracing::info!(
             "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
             trace_id,
             openai_req.model,
-            client_budget,
+            effective_budget_hint,
             spec.id,
             spec.thinking_budget,
             spec.max_output_tokens
@@ -1934,7 +1953,7 @@ pub async fn handle_chat_completions(
         } else {
             openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
                 thinking_type: Some("enabled".to_string()),
-                budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+                budget_tokens: Some(spec.thinking_budget),
                 effort: None,
             });
         }

@@ -858,10 +858,18 @@ pub fn finalize_gemini_contents_thinking(
                         part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
                     }
                 }
+
+                // 思考块始终强制排在最前面，其他部件紧随其后
+                parts.extend(thinking_parts);
+            } else {
+                // 当思考模式为关时，不应补充或保留任何思考块，清洗所有 functionCall 上的 thoughtSignature
+                for part in other_parts.iter_mut() {
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.remove("thoughtSignature");
+                    }
+                }
             }
 
-            // 思考块始终强制排在最前面，其他部件紧随其后
-            parts.extend(thinking_parts);
             parts.extend(other_parts);
         }
     }
