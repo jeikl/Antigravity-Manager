@@ -30,6 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 base64 = "0.22"
 sysinfo = "0.31"
 sys-locale = "0.3.2"

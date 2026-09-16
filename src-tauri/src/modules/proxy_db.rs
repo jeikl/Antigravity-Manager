@@ -1,40 +1,270 @@
 use crate::proxy::config::LogRetentionConfig;
 use crate::proxy::monitor::ProxyRequestLog;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use rusqlite::{params, Connection};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+const THOUGHT_RAW_MAGIC: &[u8] = b"RAW1";
+const THOUGHT_GZIP_MAGIC: &[u8] = b"AGZ1";
+const MIN_GZIP_THOUGHT: usize = 384;
+const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
+const MIN_REAL_SIGNATURE: usize = 50;
+
+fn persist_signature(signature: Option<&str>) -> Option<&str> {
+    signature.filter(|s| s.len() >= MIN_REAL_SIGNATURE && *s != SENTINEL_SIGNATURE)
+}
+
+/// Tool turns match by tool_id at fill time — visible/tool_names are in the request JSON.
+/// Only text-only turns keep visible so prefix matching still works after restart.
+fn persist_visible<'a>(tool_ids: &[String], visible: &'a str) -> &'a str {
+    if tool_ids.is_empty() {
+        visible
+    } else {
+        ""
+    }
+}
+
+fn pack_thought(s: &str) -> Vec<u8> {
+    if s.len() >= MIN_GZIP_THOUGHT {
+        let mut enc = GzEncoder::new(Vec::with_capacity(s.len() / 2), Compression::fast());
+        if enc.write_all(s.as_bytes()).is_ok() {
+            if let Ok(buf) = enc.finish() {
+                if buf.len() + THOUGHT_GZIP_MAGIC.len() < s.len() {
+                    let mut out = Vec::with_capacity(THOUGHT_GZIP_MAGIC.len() + buf.len());
+                    out.extend_from_slice(THOUGHT_GZIP_MAGIC);
+                    out.extend_from_slice(&buf);
+                    return out;
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(THOUGHT_RAW_MAGIC.len() + s.len());
+    out.extend_from_slice(THOUGHT_RAW_MAGIC);
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+fn unpack_thought(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(THOUGHT_GZIP_MAGIC) {
+        let mut decoder = GzDecoder::new(rest);
+        let mut s = String::new();
+        if decoder.read_to_string(&mut s).is_ok() {
+            return s;
+        }
+    }
+    if let Some(rest) = bytes.strip_prefix(THOUGHT_RAW_MAGIC) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
     Ok(data_dir.join("proxy_logs.db"))
 }
 
-fn connect_db() -> Result<Connection, String> {
-    let db_path = get_proxy_db_path()?;
-    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+pub fn get_thinking_db_path() -> Result<PathBuf, String> {
+    let data_dir = crate::modules::account::get_data_dir()?;
+    Ok(data_dir.join("thinking_store.db"))
+}
 
-    // Enable WAL mode for better concurrency
+fn apply_fast_pragmas(conn: &Connection) -> Result<(), String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-
-    // Set busy timeout to 5000ms to avoid "database is locked" errors
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|e| e.to_string())?;
-
-    // Synchronous NORMAL is faster and safe enough for WAL
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
-
-    // 大数据量查询性能调优: 64MB 页面缓存 + 内存临时存储 + 256MB 内存映射 (mmap)
     let _ = conn.pragma_update(None, "cache_size", -64000);
     let _ = conn.pragma_update(None, "temp_store", "MEMORY");
     let _ = conn.pragma_update(None, "mmap_size", 268435456);
+    Ok(())
+}
 
+fn connect_db() -> Result<Connection, String> {
+    let db_path = get_proxy_db_path()?;
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    apply_fast_pragmas(&conn)?;
+    Ok(conn)
+}
+
+fn init_thinking_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS thinking_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            thought TEXT NOT NULL,
+            signature TEXT,
+            tool_ids TEXT NOT NULL,
+            tool_names TEXT NOT NULL,
+            visible TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_accessed INTEGER
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     let _ = conn.execute(
-        "ALTER TABLE thinking_records ADD COLUMN last_accessed INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_session ON thinking_records (session_key, created_at ASC)",
         [],
     );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_fp ON thinking_records (session_key, fingerprint)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_latest ON thinking_records (session_key, id DESC)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_accessed ON thinking_records (last_accessed ASC)",
+        [],
+    );
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS thinking_sessions (
+            session_key TEXT PRIMARY KEY,
+            last_accessed INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS thinking_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
+fn open_thinking_db() -> Result<Connection, String> {
+    let db_path = get_thinking_db_path()?;
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    apply_fast_pragmas(&conn)?;
+    init_thinking_schema(&conn)?;
     Ok(conn)
+}
+
+/// Process-lifetime connection to thinking_store.db.
+/// Fill/hydrate must not open proxy_logs.db (it can be multi-GB on HDD).
+fn thinking_db() -> Result<MutexGuard<'static, Connection>, String> {
+    static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
+    if DB.get().is_none() {
+        let conn = open_thinking_db()?;
+        let _ = DB.set(Mutex::new(conn));
+    }
+    DB.get()
+        .ok_or_else(|| "thinking db was not initialized".to_string())?
+        .lock()
+        .map_err(|e| format!("thinking db lock: {e}"))
+}
+
+fn mark_thinking_imported(conn: &Connection) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO thinking_meta (k, v) VALUES ('imported_from_proxy_logs', '1')",
+        [],
+    );
+}
+
+/// Copy old thinking rows out of proxy_logs.db into thinking_store.db.
+/// Never deletes the log DB. Old uncompressed rows stay readable via unpack_thought.
+fn migrate_thinking_from_logs() -> Result<(), String> {
+    let conn = thinking_db()?;
+    let imported: Option<String> = conn
+        .query_row(
+            "SELECT v FROM thinking_meta WHERE k = 'imported_from_proxy_logs'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if imported.as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    let logs_path = get_proxy_db_path()?;
+    if !logs_path.exists() {
+        mark_thinking_imported(&conn);
+        return Ok(());
+    }
+
+    let escaped = logs_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    if conn
+        .execute(&format!("ATTACH DATABASE '{}' AS logs", escaped), [])
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM logs.sqlite_master WHERE type='table' AND name='thinking_records'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if has_table == 0 {
+        let _ = conn.execute("DETACH DATABASE logs", []);
+        mark_thinking_imported(&conn);
+        return Ok(());
+    }
+
+    // Copy only rows not already present. Do not gzip/rewrite on import — that
+    // would stall HDD by touching every old thought blob at startup.
+    let copy_with_accessed = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
+             SELECT src.session_key, src.fingerprint, src.thought, src.signature, src.tool_ids, src.tool_names, src.visible, src.created_at,
+                    COALESCE(src.last_accessed, src.created_at)
+             FROM logs.thinking_records src
+             WHERE NOT EXISTS (
+                SELECT 1 FROM thinking_records t
+                WHERE t.session_key = src.session_key
+                  AND t.fingerprint = src.fingerprint
+                  AND t.created_at = src.created_at
+             )";
+    let copy_basic = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
+             SELECT src.session_key, src.fingerprint, src.thought, src.signature, src.tool_ids, src.tool_names, src.visible, src.created_at, src.created_at
+             FROM logs.thinking_records src
+             WHERE NOT EXISTS (
+                SELECT 1 FROM thinking_records t
+                WHERE t.session_key = src.session_key
+                  AND t.fingerprint = src.fingerprint
+                  AND t.created_at = src.created_at
+             )";
+    let copied = match conn.execute(copy_with_accessed, []) {
+        Ok(n) => n,
+        Err(_) => match conn.execute(copy_basic, []) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = conn.execute("DETACH DATABASE logs", []);
+                tracing::warn!("[ThinkingStore] Import from proxy_logs.db failed (will retry next start): {e}");
+                return Ok(());
+            }
+        },
+    };
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO thinking_sessions (session_key, last_accessed)
+         SELECT session_key, MAX(created_at) FROM thinking_records GROUP BY session_key",
+        [],
+    );
+    let _ = conn.execute("DETACH DATABASE logs", []);
+    mark_thinking_imported(&conn);
+    if copied > 0 {
+        tracing::info!(
+            "[ThinkingStore] Imported {} thinking row(s) from proxy_logs.db (old file kept as backup)",
+            copied
+        );
+    }
+    Ok(())
 }
 
 pub fn init_db() -> Result<(), String> {
@@ -148,42 +378,8 @@ pub fn init_db() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_sig_created ON tool_signatures (created_at DESC)", []);
 
-    // 持久化思考记录表 (支持多轮对话、代理重启与会话回放时根据 session_key 精准恢复思考正文与签名)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS thinking_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_key TEXT NOT NULL,
-            fingerprint TEXT NOT NULL,
-            thought TEXT NOT NULL,
-            signature TEXT,
-            tool_ids TEXT NOT NULL,
-            tool_names TEXT NOT NULL,
-            visible TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_session ON thinking_records (session_key, created_at ASC)", []);
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_thinking_rec_fp ON thinking_records (session_key, fingerprint)", []);
-    // Latest-turn lookup for consecutive-chunk merge: never UNIQUE(session_key, fingerprint),
-    // because two real turns in the same session can share visible text.
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_latest ON thinking_records (session_key, id DESC)",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE thinking_records ADD COLUMN last_accessed INTEGER",
-        [],
-    );
-    let _ = conn.execute(
-        "UPDATE thinking_records SET last_accessed = created_at WHERE last_accessed IS NULL",
-        [],
-    );
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_thinking_rec_accessed ON thinking_records (last_accessed ASC)",
-        [],
-    );
+    drop(conn);
+    migrate_thinking_from_logs()?;
 
     Ok(())
 }
@@ -262,16 +458,20 @@ pub fn save_thinking_record(
     thought: &str,
     signature: Option<&str>,
     tool_ids: &[String],
-    tool_names: &[String],
+    _tool_names: &[String],
     visible: &str,
 ) -> Result<(), String> {
     if session_key.is_empty() {
         return Ok(());
     }
-    let conn = connect_db()?;
+    let conn = thinking_db()?;
     let now = chrono::Utc::now().timestamp_millis();
     let tool_ids_json = serde_json::to_string(tool_ids).unwrap_or_else(|_| "[]".to_string());
-    let tool_names_json = serde_json::to_string(tool_names).unwrap_or_else(|_| "[]".to_string());
+    // tool_names / full visible for tool turns are reconstructable from the next
+    // request JSON at fill time. Do not write them.
+    let visible_persist = persist_visible(tool_ids, visible);
+    let packed_thought = pack_thought(thought);
+    let signature = persist_signature(signature);
 
     // Align with in-memory ThinkingStore: only merge consecutive chunks of the
     // current (latest) turn. Never rewrite an older turn that happens to share
@@ -287,14 +487,13 @@ pub fn save_thinking_record(
     let updated = if let Some(id) = latest_id {
         conn.execute(
             "UPDATE thinking_records
-             SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = ?4, visible = ?5, created_at = ?6, last_accessed = ?6
-             WHERE id = ?7 AND fingerprint = ?8",
+             SET thought = ?1, signature = ?2, tool_ids = ?3, tool_names = '[]', visible = ?4, created_at = ?5
+             WHERE id = ?6 AND fingerprint = ?7",
             params![
-                thought,
+                packed_thought.as_slice(),
                 signature,
-                tool_ids_json,
-                tool_names_json,
-                visible,
+                &tool_ids_json,
+                visible_persist,
                 now,
                 id,
                 fingerprint,
@@ -307,21 +506,25 @@ pub fn save_thinking_record(
 
     if updated == 0 {
         conn.execute(
-            "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7)",
             params![
                 session_key,
                 fingerprint,
-                thought,
+                packed_thought.as_slice(),
                 signature,
-                tool_ids_json,
-                tool_names_json,
-                visible,
+                &tool_ids_json,
+                visible_persist,
                 now,
             ],
         )
         .map_err(|e| e.to_string())?;
     }
+    let _ = conn.execute(
+        "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
+         ON CONFLICT(session_key) DO UPDATE SET last_accessed = excluded.last_accessed",
+        params![session_key, now],
+    );
     Ok(())
 }
 
@@ -329,7 +532,7 @@ pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingR
     if session_key.is_empty() {
         return Ok(Vec::new());
     }
-    let conn = connect_db()?;
+    let conn = thinking_db()?;
     let mut stmt = conn
         .prepare(
             "SELECT fingerprint, thought, signature, tool_ids, tool_names, visible 
@@ -342,24 +545,24 @@ pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingR
     let rows = stmt
         .query_map(params![session_key], |row| {
             let fp: String = row.get(0)?;
-            let thought: String = row.get(1)?;
+            let thought_raw: Vec<u8> = row.get(1)?;
             let signature: Option<String> = row.get(2)?;
             let tool_ids_str: String = row.get(3)?;
             let tool_names_str: String = row.get(4)?;
             let visible: String = row.get(5)?;
-            Ok((fp, thought, signature, tool_ids_str, tool_names_str, visible))
+            Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible))
         })
         .map_err(|e| e.to_string())?;
 
     let mut result = Vec::new();
     for row in rows {
-        if let Ok((fp, thought, signature, tool_ids_str, tool_names_str, visible)) = row {
+        if let Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible)) = row {
             let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
             let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
             result.push(PersistedThinkingRecord {
                 fingerprint: fp,
-                thought,
-                signature,
+                thought: unpack_thought(&thought_raw),
+                signature: persist_signature(signature.as_deref()).map(str::to_string),
                 tool_ids,
                 tool_names,
                 visible,
@@ -373,17 +576,42 @@ pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
     if session_key.is_empty() {
         return Ok(0);
     }
-    let conn = connect_db()?;
+    let conn = thinking_db()?;
     let now = chrono::Utc::now().timestamp_millis();
+    // Touch a 1-row session table. Never UPDATE thinking_records here — that
+    // rewrites every thought/visible TEXT blob for the session.
     conn.execute(
-        "UPDATE thinking_records SET last_accessed = ?1 WHERE session_key = ?2",
-        params![now, session_key],
+        "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
+         ON CONFLICT(session_key) DO UPDATE SET last_accessed = excluded.last_accessed",
+        params![session_key, now],
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn delete_thinking_records_except_fingerprints(
+    session_key: &str,
+    keep_fps: &[String],
+) -> Result<usize, String> {
+    if session_key.is_empty() || keep_fps.is_empty() {
+        return Ok(0);
+    }
+    let conn = thinking_db()?;
+    let fps_json = serde_json::to_string(keep_fps).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "DELETE FROM thinking_records
+         WHERE session_key = ?1
+         AND fingerprint NOT IN (SELECT value FROM json_each(?2))",
+        params![session_key, fps_json],
     )
     .map_err(|e| e.to_string())
 }
 
 pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
-    let conn = connect_db()?;
+    let conn = thinking_db()?;
+    let _ = conn.execute(
+        "DELETE FROM thinking_sessions WHERE session_key = ?1",
+        params![session_key],
+    );
     conn.execute(
         "DELETE FROM thinking_records WHERE session_key = ?1",
         params![session_key],
@@ -392,17 +620,33 @@ pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, S
 }
 
 pub fn cleanup_old_thinking_records(days: i64) -> Result<usize, String> {
-    let conn = connect_db()?;
     let cutoff = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
-    let deleted_tools = conn
-        .execute("DELETE FROM tool_signatures WHERE created_at < ?1", params![cutoff])
+    let deleted_tools = connect_db()
+        .ok()
+        .and_then(|conn| {
+            conn.execute(
+                "DELETE FROM tool_signatures WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .ok()
+        })
         .unwrap_or(0);
+    let conn = thinking_db()?;
     let deleted_records = conn
         .execute(
-            "DELETE FROM thinking_records WHERE COALESCE(last_accessed, created_at) < ?1",
+            "DELETE FROM thinking_records WHERE session_key IN (
+                SELECT session_key FROM thinking_sessions WHERE last_accessed < ?1
+             ) OR (
+                session_key NOT IN (SELECT session_key FROM thinking_sessions)
+                AND COALESCE(last_accessed, created_at) < ?1
+             )",
             params![cutoff],
         )
         .unwrap_or(0);
+    let _ = conn.execute(
+        "DELETE FROM thinking_sessions WHERE last_accessed < ?1",
+        params![cutoff],
+    );
     Ok(deleted_tools + deleted_records)
 }
 
@@ -565,6 +809,38 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 
     stmt.query_row([log_id], map_request_log_row)
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod thinking_pack_tests {
+    use super::*;
+
+    #[test]
+    fn pack_roundtrip_short_and_long() {
+        let short = "hello thought";
+        assert_eq!(unpack_thought(&pack_thought(short)), short);
+        assert!(pack_thought(short).starts_with(THOUGHT_RAW_MAGIC));
+
+        let long = "word ".repeat(2000);
+        let packed = pack_thought(&long);
+        assert!(
+            packed.starts_with(THOUGHT_GZIP_MAGIC),
+            "long thought should gzip"
+        );
+        assert!(packed.len() < long.len());
+        assert_eq!(unpack_thought(&packed), long);
+    }
+
+    #[test]
+    fn unpack_legacy_utf8() {
+        assert_eq!(unpack_thought(b"plain old thought"), "plain old thought");
+    }
+
+    #[test]
+    fn persist_visible_drops_tool_turns() {
+        assert_eq!(persist_visible(&["call_1".to_string()], "I will run the tool"), "");
+        assert_eq!(persist_visible(&[], "hello"), "hello");
+    }
 }
 
 #[cfg(test)]

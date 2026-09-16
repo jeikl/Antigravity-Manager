@@ -24,6 +24,8 @@ pub const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
 const MAX_SESSIONS: usize = 2000;
 const MAX_TURNS_PER_SESSION: usize = 200;
 const MAX_BYTES_PER_SESSION: usize = 32 * 1024 * 1024;
+/// Persist last_accessed at most this often. Fill/hydrate is memory-only between writes.
+const TOUCH_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 fn idle_ttl() -> Duration {
     let days = crate::proxy::config::get_thinking_retention_days().max(1) as u64;
@@ -84,7 +86,9 @@ pub struct ThinkingRecord {
 struct SessionEntry {
     turns: Vec<Arc<ThinkingRecord>>,
     last_access: Instant,
+    last_persist_touch: Instant,
     bytes: usize,
+    l2_loaded: bool,
 }
 
 impl SessionEntry {
@@ -92,7 +96,9 @@ impl SessionEntry {
         Self {
             turns: Vec::new(),
             last_access: Instant::now(),
+            last_persist_touch: Instant::now(),
             bytes: 0,
+            l2_loaded: false,
         }
     }
 }
@@ -141,10 +147,14 @@ impl ThinkingStore {
         if rec.thought.trim().is_empty() && rec.signature.is_none() {
             return;
         }
+        // Placeholder "..." / sentinel-only blocks are injected for Gemini protocol
+        // compliance. Recording them as new turns made every 300K-context request
+        // append N dummies, then prune rewrite the whole SQLite session.
+        if !is_capturable_thought(&rec.thought, rec.signature.as_deref()) {
+            return;
+        }
 
-        let rec_bytes = rec.thought.len()
-            + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-            + rec.visible.len();
+        let rec_bytes = record_bytes(&rec);
 
         self.maybe_evict(store_key);
 
@@ -154,6 +164,7 @@ impl ThinkingStore {
                 .entry(store_key.to_string())
                 .or_insert_with(SessionEntry::new);
             entry.last_access = Instant::now();
+            entry.l2_loaded = true;
 
             let merge_last = entry
                 .turns
@@ -215,15 +226,151 @@ impl ThinkingStore {
         }
     }
 
-    /// Refresh the sliding-window expiry for a client session on every request.
+    /// Refresh in-memory expiry. SQLite last_accessed is debounced so HDD
+    /// never sees a write on the fill hot path after the session is warm.
     pub fn touch_session(&self, store_key: &str) {
         if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
             return;
         }
+        let mut persist = false;
         if let Some(mut entry) = self.sessions.get_mut(store_key) {
             entry.last_access = Instant::now();
+            if entry.last_persist_touch.elapsed() >= TOUCH_PERSIST_INTERVAL {
+                entry.last_persist_touch = Instant::now();
+                persist = true;
+            }
         }
-        let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
+        if persist {
+            let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
+        }
+    }
+
+    fn load_turns(&self, store_key: &str) -> Vec<Arc<ThinkingRecord>> {
+        if let Some(e) = self.sessions.get(store_key) {
+            if e.l2_loaded {
+                let turns = e.turns.clone();
+                drop(e);
+                if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                    entry.last_access = Instant::now();
+                }
+                return turns;
+            }
+        }
+
+        let persisted = crate::modules::proxy_db::load_thinking_records(store_key).unwrap_or_default();
+        let loaded_len = persisted.len();
+        let mut entry = self
+            .sessions
+            .entry(store_key.to_string())
+            .or_insert_with(SessionEntry::new);
+        if !entry.l2_loaded && entry.turns.is_empty() && !persisted.is_empty() {
+            for p in persisted {
+                let rec = ThinkingRecord {
+                    fingerprint: p.fingerprint,
+                    thought: p.thought,
+                    signature: p.signature,
+                    tool_ids: p.tool_ids,
+                    tool_names: p.tool_names,
+                    visible: p.visible,
+                };
+                entry.bytes += record_bytes(&rec);
+                entry.turns.push(Arc::new(rec));
+            }
+            tracing::info!(
+                "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
+                entry.turns.len(),
+                store_key
+            );
+        }
+        entry.l2_loaded = true;
+        entry.last_access = Instant::now();
+        entry.last_persist_touch = Instant::now();
+        let turns = entry.turns.clone();
+        drop(entry);
+        if loaded_len > 0 {
+            let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
+        }
+        turns
+    }
+
+    /// Capture real thinking from the inbound request without re-appending
+    /// history that is already stored. Placeholder blocks are ignored.
+    pub fn ingest_from_contents(&self, store_key: &str, contents: &[Value]) {
+        if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
+            return;
+        }
+
+        let mut incoming: Vec<ThinkingRecord> = Vec::new();
+        for content in contents {
+            let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "model" && role != "assistant" {
+                continue;
+            }
+            let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            let mut acc = TurnAccumulator::new();
+            for part in parts {
+                acc.ingest_part(part);
+            }
+            if !acc.should_capture() {
+                continue;
+            }
+            incoming.push(acc.into_record());
+        }
+        if incoming.is_empty() {
+            return;
+        }
+
+        let existing = self.load_turns(store_key);
+        let mut used = vec![false; existing.len()];
+        let mut to_append = Vec::new();
+        let mut to_upgrade: Vec<(usize, ThinkingRecord)> = Vec::new();
+
+        for rec in incoming {
+            if let Some(idx) = match_existing_record(&rec, &existing, &used) {
+                used[idx] = true;
+                if is_stronger_record(&rec, &existing[idx]) {
+                    to_upgrade.push((idx, rec));
+                }
+            } else {
+                to_append.push(rec);
+            }
+        }
+
+        if !to_upgrade.is_empty() {
+            if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                for (idx, rec) in &to_upgrade {
+                    if *idx >= entry.turns.len() {
+                        continue;
+                    }
+                    let new_bytes = record_bytes(rec);
+                    let old_bytes = record_bytes(&entry.turns[*idx]);
+                    entry.bytes = entry
+                        .bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(new_bytes);
+                    *Arc::make_mut(&mut entry.turns[*idx]) = rec.clone();
+                }
+            }
+            if let Some((idx, rec)) = to_upgrade.last() {
+                if *idx + 1 == existing.len() {
+                    let _ = crate::modules::proxy_db::save_thinking_record(
+                        store_key,
+                        &rec.fingerprint,
+                        &rec.thought,
+                        rec.signature.as_deref(),
+                        &rec.tool_ids,
+                        &rec.tool_names,
+                        &rec.visible,
+                    );
+                }
+            }
+        }
+
+        for rec in to_append {
+            self.record(store_key, rec);
+        }
     }
 
     pub fn restore_gemini_contents(&self, store_key: &str, contents: &mut Vec<Value>) -> usize {
@@ -234,51 +381,7 @@ impl ThinkingStore {
             return 0;
         }
 
-        let records = {
-            let cached = self.sessions.get(store_key).and_then(|e| {
-                if e.turns.is_empty() {
-                    None
-                } else {
-                    Some(e.turns.clone())
-                }
-            });
-            if let Some(turns) = cached {
-                if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                    entry.last_access = Instant::now();
-                }
-                turns
-            } else {
-                let persisted = crate::modules::proxy_db::load_thinking_records(store_key)
-                    .unwrap_or_default();
-                let mut entry = self
-                    .sessions
-                    .entry(store_key.to_string())
-                    .or_insert_with(SessionEntry::new);
-                if entry.turns.is_empty() && !persisted.is_empty() {
-                    for p in persisted {
-                        let bytes = p.thought.len()
-                            + p.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                            + p.visible.len();
-                        entry.bytes += bytes;
-                        entry.turns.push(Arc::new(ThinkingRecord {
-                            fingerprint: p.fingerprint,
-                            thought: p.thought,
-                            signature: p.signature,
-                            tool_ids: p.tool_ids,
-                            tool_names: p.tool_names,
-                            visible: p.visible,
-                        }));
-                    }
-                    tracing::info!(
-                        "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
-                        entry.turns.len(),
-                        store_key
-                    );
-                }
-                entry.last_access = Instant::now();
-                entry.turns.clone()
-            }
-        };
+        let records = self.load_turns(store_key);
         if records.is_empty() {
             return 0;
         }
@@ -287,6 +390,7 @@ impl ThinkingStore {
         struct ModelTurnMeta {
             content_idx: usize,
             visible: String,
+            norm_visible: String,
             tool_ids: Vec<String>,
             #[allow(dead_code)]
             tool_names: Vec<String>,
@@ -310,14 +414,16 @@ impl ThinkingStore {
             };
             let (visible, tool_ids, tool_names, existing_thought) = inspect_parts(parts);
             let already_complete = !turn_needs_restore(parts, &existing_thought);
-            let fp = fingerprint(&visible, &tool_ids, &tool_names);
+            // Agent tool turns match by tool_id (Phase 1). Skip fingerprint /
+            // whitespace-normalize until a later phase actually needs them.
             model_turns.push(ModelTurnMeta {
                 content_idx: c_idx,
                 visible,
+                norm_visible: String::new(),
                 tool_ids,
                 tool_names,
                 existing_thought,
-                fp,
+                fp: String::new(),
                 matched_record_idx: None,
                 already_complete,
             });
@@ -362,6 +468,9 @@ impl ThinkingStore {
             if turn.already_complete || turn.matched_record_idx.is_some() {
                 continue;
             }
+            if turn.fp.is_empty() {
+                turn.fp = fingerprint(&turn.visible, &turn.tool_ids, &turn.tool_names);
+            }
             let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
             let Some(idxs) = by_fp.get(turn.fp.as_str()) else {
                 continue;
@@ -380,20 +489,46 @@ impl ThinkingStore {
         }
 
         // Phase 3: 纯文本前缀 / 正文相似匹配（仅限纯文本轮次）
-        for turn in model_turns.iter_mut().rev() {
-            if turn.already_complete || turn.matched_record_idx.is_some() {
-                continue;
-            }
-            let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
-            if !turn_has_tools && !turn.visible.trim().is_empty() {
-                let norm_vis: String = turn.visible.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Normalize each record once. The old inner-loop split_whitespace().collect().join()
+        // was O(turns * records * visible_len) and stalled 10s+ at ~300K context.
+        let needs_phase3 = model_turns.iter().any(|t| {
+            !t.already_complete
+                && t.matched_record_idx.is_none()
+                && t.tool_ids.is_empty()
+                && t.tool_names.is_empty()
+                && !t.visible.trim().is_empty()
+        });
+        let rec_norms: Vec<String> = if needs_phase3 {
+            records.iter().map(|r| normalize_ws(&r.visible)).collect()
+        } else {
+            Vec::new()
+        };
+        if needs_phase3 {
+            for turn in model_turns.iter_mut().rev() {
+                if turn.already_complete || turn.matched_record_idx.is_some() {
+                    continue;
+                }
+                let turn_has_tools = !turn.tool_ids.is_empty() || !turn.tool_names.is_empty();
+                if turn_has_tools || turn.visible.trim().is_empty() {
+                    continue;
+                }
+                if turn.norm_visible.is_empty() {
+                    turn.norm_visible = normalize_ws(&turn.visible);
+                }
+                if turn.norm_visible.is_empty() {
+                    continue;
+                }
                 for (rec_idx, rec) in records.iter().enumerate().rev() {
                     let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
-                    if used[rec_idx] || rec_has_tools || rec.visible.trim().is_empty() {
+                    if used[rec_idx] || rec_has_tools || rec_norms[rec_idx].is_empty() {
                         continue;
                     }
-                    let norm_rec: String = rec.visible.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if norm_rec == norm_vis || norm_rec.starts_with(&norm_vis) || norm_vis.starts_with(&norm_rec) {
+                    let norm_rec = &rec_norms[rec_idx];
+                    let norm_vis = &turn.norm_visible;
+                    if norm_rec == norm_vis
+                        || norm_rec.starts_with(norm_vis)
+                        || norm_vis.starts_with(norm_rec)
+                    {
                         turn.matched_record_idx = Some(rec_idx);
                         used[rec_idx] = true;
                         break;
@@ -518,32 +653,39 @@ impl ThinkingStore {
             return;
         }
 
+        let mem_turns = self.sessions.get(store_key).map(|e| e.turns.len()).unwrap_or(0);
+        if mem_turns == 0 {
+            return;
+        }
+        let live_turn_count = contents.iter().filter(|c| is_model_or_assistant(c)).count();
+        // Typical agent path: stored turns ≈ live model turns. Skip inspect/fingerprint/SQLite.
+        if mem_turns <= live_turn_count.saturating_add(2) {
+            return;
+        }
+
         let mut live_tool_ids = std::collections::HashSet::new();
         let mut live_fps = std::collections::HashSet::new();
         let mut live_visibles: Vec<String> = Vec::new();
-        let mut live_turn_count = 0usize;
 
         for content in contents {
-            let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role != "model" && role != "assistant" {
+            if !is_model_or_assistant(content) {
                 continue;
             }
             let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
                 continue;
             };
-            live_turn_count += 1;
             let (visible, tool_ids, tool_names, _) = inspect_parts(parts);
             live_fps.insert(fingerprint(&visible, &tool_ids, &tool_names));
             for id in tool_ids {
                 live_tool_ids.insert(id);
             }
-            let norm: String = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+            let norm = normalize_ws(&visible);
             if !norm.is_empty() {
                 live_visibles.push(norm);
             }
         }
 
-        let keep = {
+        let keep_fps = {
             let Some(mut entry) = self.sessions.get_mut(store_key) else {
                 return;
             };
@@ -551,16 +693,21 @@ impl ThinkingStore {
                 return;
             }
 
+            let rec_norms: Vec<String> = entry
+                .turns
+                .iter()
+                .map(|r| normalize_ws(&r.visible))
+                .collect();
             let total = entry.turns.len();
             let keep_tail_start = total.saturating_sub(2);
             let mut keep: Vec<Arc<ThinkingRecord>> = Vec::new();
             for (i, rec) in entry.turns.iter().enumerate() {
                 let matched_tool = rec.tool_ids.iter().any(|id| live_tool_ids.contains(id));
                 let matched_fp = live_fps.contains(&rec.fingerprint);
-                let norm_rec: String = rec.visible.split_whitespace().collect::<Vec<_>>().join(" ");
+                let norm_rec = &rec_norms[i];
                 let matched_text = !norm_rec.is_empty()
                     && live_visibles.iter().any(|v| {
-                        v == &norm_rec || v.starts_with(&norm_rec) || norm_rec.starts_with(v)
+                        v == norm_rec || v.starts_with(norm_rec) || norm_rec.starts_with(v)
                     });
                 if matched_tool || matched_fp || matched_text || i >= keep_tail_start {
                     keep.push(rec.clone());
@@ -572,35 +719,22 @@ impl ThinkingStore {
             }
 
             let dropped = entry.turns.len() - keep.len();
-            entry.bytes = keep
-                .iter()
-                .map(|r| {
-                    r.thought.len()
-                        + r.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                        + r.visible.len()
-                })
-                .sum();
-            entry.turns = keep.clone();
+            entry.bytes = keep.iter().map(|r| record_bytes(r)).sum();
+            let fps: Vec<String> = keep.iter().map(|r| r.fingerprint.clone()).collect();
+            entry.turns = keep;
             tracing::info!(
                 "[ThinkingStore] Pruned {} orphaned thinking record(s) after context compression for session {}",
                 dropped,
                 store_key
             );
-            keep
+            fps
         };
 
-        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(store_key);
-        for rec in &keep {
-            let _ = crate::modules::proxy_db::save_thinking_record(
-                store_key,
-                &rec.fingerprint,
-                &rec.thought,
-                rec.signature.as_deref(),
-                &rec.tool_ids,
-                &rec.tool_names,
-                &rec.visible,
-            );
-        }
+        // Delete orphans by fingerprint. Never DELETE+re-INSERT the kept blobs.
+        let _ = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
+            store_key,
+            &keep_fps,
+        );
     }
 
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
@@ -730,29 +864,35 @@ impl TurnAccumulator {
         self.thought.trim().is_empty() && self.signature.is_none()
     }
 
+    fn should_capture(&self) -> bool {
+        !self.is_empty() && is_capturable_thought(&self.thought, self.signature.as_deref())
+    }
+
+    fn into_record(self) -> ThinkingRecord {
+        let fp = fingerprint(&self.visible, &self.tool_ids, &self.tool_names);
+        ThinkingRecord {
+            fingerprint: fp,
+            thought: self.thought,
+            signature: self.signature,
+            tool_ids: self.tool_ids,
+            tool_names: self.tool_names,
+            visible: self.visible,
+        }
+    }
+
     pub fn commit(self, store_key: &str) {
-        if self.is_empty() || store_key.is_empty() {
+        if store_key.is_empty() || !self.should_capture() {
             return;
         }
-        let fp = fingerprint(&self.visible, &self.tool_ids, &self.tool_names);
+        let rec = self.into_record();
         tracing::debug!(
             "[ThinkingStore] Capture thought len={} sig_len={} fp={} sid={}",
-            self.thought.len(),
-            self.signature.as_ref().map(|s| s.len()).unwrap_or(0),
-            fp,
+            rec.thought.len(),
+            rec.signature.as_ref().map(|s| s.len()).unwrap_or(0),
+            rec.fingerprint,
             store_key
         );
-        ThinkingStore::global().record(
-            store_key,
-            ThinkingRecord {
-                fingerprint: fp,
-                thought: self.thought,
-                signature: self.signature,
-                tool_ids: self.tool_ids,
-                tool_names: self.tool_names,
-                visible: self.visible,
-            },
-        );
+        ThinkingStore::global().record(store_key, rec);
     }
 }
 
@@ -772,12 +912,55 @@ pub fn capture_gemini_contents(store_key: &str, contents: &[Value]) {
 }
 
 /// Capture client-supplied thinking, restore missing blocks, then prune compressed-away history.
+///
+/// Client histories usually have no real thinking (Claude/OpenAI). After a session is
+/// warm in memory, this path is RAM-only: no SQLite open, no placeholder ingest, no prune
+/// rewrite. JSON fill still copies stored thought text into the freshly built request.
 pub fn hydrate_gemini_contents(store_key: &str, contents: &mut Vec<Value>) -> usize {
-    ThinkingStore::global().touch_session(store_key);
-    capture_gemini_contents(store_key, contents);
-    let restored = ThinkingStore::global().restore_gemini_contents(store_key, contents);
-    ThinkingStore::global().prune_orphaned_records(store_key, contents);
+    if store_key.is_empty() {
+        return 0;
+    }
+    let store = ThinkingStore::global();
+    store.touch_session(store_key);
+    if contents_have_capturable_thought(contents) {
+        store.ingest_from_contents(store_key, contents);
+    }
+    let restored = store.restore_gemini_contents(store_key, contents);
+    store.prune_orphaned_records(store_key, contents);
     restored
+}
+
+fn is_model_or_assistant(content: &Value) -> bool {
+    matches!(
+        content.get("role").and_then(|v| v.as_str()),
+        Some("model") | Some("assistant")
+    )
+}
+
+fn contents_have_capturable_thought(contents: &[Value]) -> bool {
+    for content in contents {
+        if !is_model_or_assistant(content) {
+            continue;
+        }
+        let Some(parts) = content.get("parts").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for part in parts {
+            let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !is_thought {
+                continue;
+            }
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let sig = part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|s| s.as_str());
+            if is_capturable_thought(text, sig) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn capture_gemini_parts(store_key: &str, parts: &[Value]) {
@@ -1113,6 +1296,80 @@ pub fn is_placeholder_thought(s: &str) -> bool {
         || t.chars().all(|c| c == '.' || c == '·' || c == '…')
 }
 
+fn is_capturable_thought(thought: &str, signature: Option<&str>) -> bool {
+    if signature.is_some_and(is_real_signature) {
+        return true;
+    }
+    !is_placeholder_thought(thought)
+}
+
+fn record_bytes(rec: &ThinkingRecord) -> usize {
+    rec.thought.len()
+        + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+        + rec.visible.len()
+}
+
+fn is_stronger_record(new: &ThinkingRecord, old: &ThinkingRecord) -> bool {
+    new.thought.len() > old.thought.len()
+        || new.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+            > old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
+}
+
+fn match_existing_record(
+    rec: &ThinkingRecord,
+    existing: &[Arc<ThinkingRecord>],
+    used: &[bool],
+) -> Option<usize> {
+    if !rec.tool_ids.is_empty() {
+        for (i, ex) in existing.iter().enumerate().rev() {
+            if used[i] {
+                continue;
+            }
+            if rec.tool_ids.iter().any(|id| ex.tool_ids.iter().any(|x| x == id)) {
+                return Some(i);
+            }
+        }
+    }
+    let rec_has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
+    for (i, ex) in existing.iter().enumerate().rev() {
+        if used[i] {
+            continue;
+        }
+        if ex.fingerprint != rec.fingerprint {
+            continue;
+        }
+        let ex_has_tools = !ex.tool_ids.is_empty() || !ex.tool_names.is_empty();
+        if rec_has_tools == ex_has_tools {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn normalize_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut need_space = false;
+    for word in s.split_whitespace() {
+        if need_space {
+            out.push(' ');
+        }
+        out.push_str(word);
+        need_space = true;
+    }
+    out
+}
+
+fn hash_normalized_ws(hasher: &mut impl Digest, s: &str) {
+    let mut need_space = false;
+    for word in s.split_whitespace() {
+        if need_space {
+            hasher.update(b" ");
+        }
+        hasher.update(word.as_bytes());
+        need_space = true;
+    }
+}
+
 fn turn_needs_restore(parts: &[Value], existing_thought: &str) -> bool {
     if is_placeholder_thought(existing_thought) {
         return true;
@@ -1175,8 +1432,7 @@ fn inspect_parts(parts: &[Value]) -> (String, Vec<String>, Vec<String>, String) 
 
 pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) -> String {
     let mut hasher = Sha256::new();
-    let norm: String = visible.split_whitespace().collect::<Vec<_>>().join(" ");
-    hasher.update(norm.as_bytes());
+    hash_normalized_ws(&mut hasher, visible);
     hasher.update([0xff]);
     for id in tool_ids {
         hasher.update(id.as_bytes());
@@ -1704,6 +1960,186 @@ mod tests {
         assert!(turns <= 3, "orphaned compressed turns should be pruned, got {turns}");
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["text"], "thought-keep");
+    }
+
+    #[test]
+    fn fingerprint_matches_legacy_whitespace_join() {
+        let visible = "  hello\n\tworld  foo";
+        let ids: Vec<String> = vec!["call_1".to_string()];
+        let names: Vec<String> = vec!["shell".to_string()];
+        let mut hasher = Sha256::new();
+        let norm: String = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+        hasher.update(norm.as_bytes());
+        hasher.update([0xff]);
+        hasher.update(ids[0].as_bytes());
+        hasher.update([0xfe]);
+        hasher.update([0xfd]);
+        hasher.update(names[0].as_bytes());
+        hasher.update([0xfc]);
+        let hex = format!("{:x}", hasher.finalize());
+        assert_eq!(fingerprint(visible, &ids, &names), hex[..16].to_string());
+    }
+
+    #[test]
+    fn placeholder_thoughts_are_not_recorded() {
+        let store = ThinkingStore::new();
+        let key = "t:placeholder-skip";
+        store.record(
+            key,
+            ThinkingRecord {
+                fingerprint: fingerprint("visible answer", &[], &[]),
+                thought: "...".to_string(),
+                signature: None,
+                tool_ids: vec![],
+                tool_names: vec![],
+                visible: "visible answer".to_string(),
+            },
+        );
+        store.record(
+            key,
+            ThinkingRecord {
+                fingerprint: fingerprint("visible answer", &[], &[]),
+                thought: "...".to_string(),
+                signature: Some(SENTINEL_SIGNATURE.to_string()),
+                tool_ids: vec![],
+                tool_names: vec![],
+                visible: "visible answer".to_string(),
+            },
+        );
+        assert!(
+            store.session_stats(key).is_none(),
+            "placeholder / sentinel-only thoughts must not create store turns"
+        );
+    }
+
+    #[test]
+    fn ingest_placeholders_does_not_duplicate_history() {
+        let store = ThinkingStore::new();
+        let key = "t:ingest-no-dup";
+        for i in 0..20 {
+            store.record(
+                key,
+                rec(
+                    &format!("thought-{i}"),
+                    &format!("answer {i}"),
+                    Some(&format!("call_{i}")),
+                ),
+            );
+        }
+        let (before, _) = store.session_stats(key).unwrap();
+        assert_eq!(before, 20);
+
+        let contents: Vec<Value> = (0..20)
+            .map(|i| {
+                json!({
+                    "role": "model",
+                    "parts": [
+                        { "text": "...", "thought": true, "thoughtSignature": SENTINEL_SIGNATURE },
+                        { "text": format!("answer {i}") },
+                        { "functionCall": { "name": "shell", "id": format!("call_{i}"), "args": {} } }
+                    ]
+                })
+            })
+            .collect();
+
+        store.ingest_from_contents(key, &contents);
+        let (after, _) = store.session_stats(key).unwrap();
+        assert_eq!(after, 20, "placeholder history must not be appended as new turns");
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
+    }
+
+    #[test]
+    fn ingest_real_client_thinking_is_idempotent() {
+        let store = ThinkingStore::new();
+        let key = "t:ingest-real";
+        let sig = "s".repeat(60);
+        let contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "full chain of thought here", "thought": true, "thoughtSignature": sig },
+                { "text": "hello world" }
+            ]
+        })];
+        store.ingest_from_contents(key, &contents);
+        store.ingest_from_contents(key, &contents);
+        let (turns, _) = store.session_stats(key).unwrap();
+        assert_eq!(turns, 1);
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
+    }
+
+    #[test]
+    fn restore_large_visible_text_is_linear() {
+        let store = ThinkingStore::new();
+        let key = "t:big-visible";
+        let blob = "word ".repeat(8_000); // ~40KB per turn
+        for i in 0..30 {
+            let visible = format!("head-{i} {blob}");
+            store.record(key, rec(&format!("thought-{i}"), &visible, None));
+        }
+        // Truncated visibles force Phase 3 prefix matching (the old quadratic path).
+        let mut contents: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({
+                    "role": "model",
+                    "parts": [{ "text": format!("head-{i}") }]
+                })
+            })
+            .collect();
+        let start = Instant::now();
+        let n = store.restore_gemini_contents(key, &mut contents);
+        let elapsed = start.elapsed();
+        assert_eq!(n, 30);
+        assert!(
+            elapsed.as_millis() < 800,
+            "restore of ~1.2MB visible text took {elapsed:?}; matching must not be quadratic"
+        );
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
+    }
+
+    #[test]
+    fn placeholder_history_fills_in_order_without_scramble() {
+        let store = ThinkingStore::new();
+        let key = "t:fill-order";
+        for i in 0..12 {
+            store.record(
+                key,
+                rec(
+                    &format!("THOUGHT-BLOCK-{i}"),
+                    &format!("answer {i}"),
+                    Some(&format!("call_{i}")),
+                ),
+            );
+        }
+        let mut contents: Vec<Value> = (0..12)
+            .map(|i| {
+                json!({
+                    "role": "model",
+                    "parts": [
+                        { "text": "...", "thought": true, "thoughtSignature": SENTINEL_SIGNATURE },
+                        { "text": format!("answer {i}") },
+                        { "functionCall": { "name": "shell", "id": format!("call_{i}"), "args": { "n": i } } }
+                    ]
+                })
+            })
+            .collect();
+
+        assert!(!contents_have_capturable_thought(&contents));
+        let n = store.restore_gemini_contents(key, &mut contents);
+        assert_eq!(n, 12);
+        for i in 0..12 {
+            let parts = contents[i]["parts"].as_array().unwrap();
+            assert_eq!(parts[0]["thought"], true, "thought must stay at parts[0] for turn {i}");
+            assert_eq!(parts[0]["text"], format!("THOUGHT-BLOCK-{i}"));
+            assert_eq!(parts[0]["thoughtSignature"].as_str().unwrap().len(), 60);
+            assert_eq!(parts[1]["text"], format!("answer {i}"));
+            assert_eq!(parts[2]["functionCall"]["id"], format!("call_{i}"));
+            assert_eq!(parts[2]["functionCall"]["args"]["n"], i);
+            assert_eq!(parts[2]["thoughtSignature"].as_str().unwrap().len(), 60);
+        }
+        store.prune_orphaned_records(key, &contents);
+        let (turns, _) = store.session_stats(key).unwrap();
+        assert_eq!(turns, 12, "placeholder fill must not prune live tool turns");
+        let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
     }
 }
 
