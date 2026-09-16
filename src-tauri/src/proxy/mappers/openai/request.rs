@@ -947,22 +947,33 @@ pub fn transform_openai_request_with_session(
                 "includeThoughts": false
             });
         } else {
-            // [CONFIGURABLE] 完全忽略客户端 budget，统一根据映射后的 Gemini 模型 ID 字典自动填充
+            // [CONFIGURABLE] 思考预算配置与防污染处理
             let default_budget = model_specs::get_thinking_budget(mapped_model, token) as i64;
             let tb_config = crate::proxy::config::get_thinking_budget_config();
-            let final_budget = match tb_config.mode {
-                crate::proxy::config::ThinkingBudgetMode::Passthrough => {
-                    user_thinking_budget.map(|b| b as i64).unwrap_or(default_budget)
-                }
-                crate::proxy::config::ThinkingBudgetMode::Custom => {
-                    let custom_value = tb_config.custom_value as i64;
-                    if custom_value > default_budget {
-                        default_budget
-                    } else {
-                        custom_value
+            let is_v3_or_above = model_specs::is_gemini_v3_or_above(mapped_model)
+                || model_specs::is_gemini_v3_or_above(&request.model);
+            let is_explicit_tier = mapped_model_lower.ends_with("-high")
+                || mapped_model_lower.ends_with("-medium")
+                || mapped_model_lower.ends_with("-low")
+                || mapped_model_lower.ends_with("-extra-low");
+            // [ANTI-POLLUTION] 对齐 Anthropic：对于 Gemini >= 3 或显式档位模型，彻底忽略客户端过小预算，绝不被客户端 1024 或 low 污染
+            let final_budget = if is_v3_or_above || is_explicit_tier {
+                default_budget
+            } else {
+                match tb_config.mode {
+                    crate::proxy::config::ThinkingBudgetMode::Passthrough => {
+                        user_thinking_budget.map(|b| b as i64).unwrap_or(default_budget)
                     }
+                    crate::proxy::config::ThinkingBudgetMode::Custom => {
+                        let custom_value = tb_config.custom_value as i64;
+                        if custom_value > default_budget {
+                            default_budget
+                        } else {
+                            custom_value
+                        }
+                    }
+                    _ => default_budget,
                 }
-                _ => default_budget,
             };
 
             gen_config["thinkingConfig"] = json!({

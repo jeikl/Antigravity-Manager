@@ -1,5 +1,6 @@
 // Gemini Handler
 use axum::{
+    body::Body,
     extract::State,
     extract::{Json, Path},
     http::StatusCode,
@@ -73,6 +74,8 @@ pub async fn handle_generate(
     upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let clean_start = std::time::Instant::now();
+
     // 解析 model:method
     let (model_name, method) = if let Some((m, action)) = model_action.rsplit_once(':') {
         (m.to_string(), action.to_string())
@@ -98,6 +101,13 @@ pub async fn handle_generate(
 
     // [DEFENSE] 净化 Gemini 原生请求体中的所有 inlineData (过滤或降级空数据/损坏图片)
     crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
+
+    // [Stage Timing] 阶段耗时度量变量 (毫秒)
+    let clean_micros = clean_start.elapsed().as_micros() as u64;
+    let clean_ms: f64 = clean_micros as f64 / 1000.0;
+    let mut norm_ms: f64 = 0.0;
+    let mut think_fill_ms: f64 = 0.0;
+    let mut ttft_ms: f64 = 0.0;
 
     // 1. 验证方法
     // [NEW] :countTokens 冒号语法，直接代理到上游 v1internal:countTokens
@@ -164,6 +174,9 @@ pub async fn handle_generate(
         max_attempts,
         retry_credentials.is_some(),
     ) {
+        // [Stage Timing] 中转归一计时起点
+        let norm_start = std::time::Instant::now();
+
         // 3. 模型路由解析
         let mapped_model = initial_mapped_model.clone();
         // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
@@ -268,6 +281,7 @@ pub async fn handle_generate(
         // [FIX #765] Pass session_id to wrap_request for signature injection
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
+        let tf_start = std::time::Instant::now();
         let mut wrapped_body = wrap_request_v2(
             &body,
             &project_id,
@@ -277,6 +291,11 @@ pub async fn handle_generate(
             token_obj.as_ref(),
             Some(&token_manager),
         );
+        let tf_micros = tf_start.elapsed().as_micros() as u64;
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
+
         let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
             &mut wrapped_body,
             &mapped_model,
@@ -324,6 +343,7 @@ pub async fn handle_generate(
             );
         }
 
+        let upstream_req_start = std::time::Instant::now();
         let call_result = match upstream
             .call_v1_internal_with_headers(
                 upstream_method,
@@ -439,6 +459,7 @@ pub async fn handle_generate(
                             tracing::warn!("[Gemini] Empty first chunk received, retrying...");
                             retry_gemini = true;
                         } else {
+                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                             first_chunk = Some(bytes);
                         }
                     }
@@ -631,6 +652,10 @@ pub async fn handle_generate(
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &client_session_id)
                         .header("X-Antigravity-Session-Id", &client_session_id)
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -644,16 +669,19 @@ pub async fn handle_generate(
                                 session_id
                             );
                             let unwrapped = unwrap_response(&gemini_resp);
-                            return Ok((
-                                StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                    ("X-Session-Id", client_session_id.as_str()),
-                                    ("X-Antigravity-Session-Id", client_session_id.as_str()),
-                                ],
-                                Json(unwrapped),
-                            )
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", &email)
+                                .header("X-Mapped-Model", &mapped_model)
+                                .header("X-Session-Id", &client_session_id)
+                                .header("X-Antigravity-Session-Id", &client_session_id)
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                .body(Body::from(serde_json::to_string(&unwrapped).unwrap()))
+                                .unwrap()
                                 .into_response());
                         }
                         Err(e) => {
@@ -668,6 +696,7 @@ pub async fn handle_generate(
                 }
             }
 
+            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
             let mut gemini_resp: Value = response
                 .json()
                 .await
@@ -716,14 +745,19 @@ pub async fn handle_generate(
 
             crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
             let unwrapped = unwrap_response(&gemini_resp);
-            return Ok((
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(unwrapped),
-            )
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Account-Email", &email)
+                .header("X-Mapped-Model", &mapped_model)
+                .header("X-Session-Id", &client_session_id)
+                .header("X-Antigravity-Session-Id", &client_session_id)
+                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                .body(Body::from(serde_json::to_string(&unwrapped).unwrap()))
+                .unwrap()
                 .into_response());
         }
 

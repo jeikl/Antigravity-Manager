@@ -365,28 +365,33 @@ pub fn wrap_request_v2(
 
         if should_inject {
             // Scope for borrowing inner_request/gen_config
-            let mut has_thinking = false;
-            if is_claude {
-                has_thinking = inner_request.get("thinking").is_some();
+            let has_thinking = if is_claude {
+                inner_request.get("thinking").is_some()
             } else {
-                if let Some(gc) = inner_request
+                inner_request
                     .get("generationConfig")
                     .and_then(|v| v.as_object())
-                {
-                    has_thinking = gc.get("thinkingConfig").is_some();
-                }
-            }
+                    .map_or(false, |gc| gc.get("thinkingConfig").is_some())
+            };
 
-            if !has_thinking {
+            let default_budget =
+                crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
+
+            let is_v3_or_above = crate::proxy::model_specs::is_gemini_v3_or_above(final_model_name);
+            let is_explicit_tier = lower_model.ends_with("-high")
+                || lower_model.ends_with("-medium")
+                || lower_model.ends_with("-low")
+                || lower_model.ends_with("-extra-low");
+
+            // [ANTI-POLLUTION] 对齐 Anthropic 与 OpenAI：对于 Gemini >= 3 或显式档位模型，彻底忽略客户端思考与预算参数，直接权威锁定满血规格预算 default_budget
+            let should_override_budget = !has_thinking || is_v3_or_above || is_explicit_tier;
+
+            if should_override_budget {
                 tracing::debug!(
-                    "[Gemini-Wrap] Auto-injecting default thinking for {}",
+                    "[Gemini-Wrap] Enforcing authoritative thinking budget {} for {}",
+                    default_budget,
                     final_model_name
                 );
-
-                // [FIX] 统一注入到 generationConfig.thinkingConfig
-                // 使用动态规格提供的默认预算
-                let default_budget =
-                    crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
 
                 let gen_config = inner_request
                     .as_object_mut()

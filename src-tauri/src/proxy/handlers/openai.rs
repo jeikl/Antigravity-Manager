@@ -1,6 +1,7 @@
 // OpenAI Handler
 use axum::{
-    extract::Json, extract::State, http::StatusCode, response::IntoResponse, response::Response,
+    body::Body, extract::Json, extract::State, http::StatusCode, response::IntoResponse,
+    response::Response,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -1744,6 +1745,7 @@ pub async fn handle_chat_completions(
     upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let clean_start = std::time::Instant::now();
     // [NEW] Check for Image Model Redirection
     let model_name = body
         .get("model")
@@ -1847,6 +1849,11 @@ pub async fn handle_chat_completions(
                 refusal: None,
             });
     }
+
+    let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
+    let mut norm_ms = 0.0f64;
+    let mut think_fill_ms = 0.0f64;
+    let mut ttft_ms = 0.0f64;
 
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     info!(
@@ -1998,6 +2005,7 @@ pub async fn handle_chat_completions(
         max_attempts,
         retry_credentials.is_some(),
     ) {
+        let norm_start = std::time::Instant::now();
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -2081,12 +2089,17 @@ pub async fn handle_chat_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
+        let tf_start = std::time::Instant::now();
         let (mut gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,
             &project_id,
             &mapped_model,
             proxy_token.as_ref(),
         );
+        let tf_micros = tf_start.elapsed().as_micros() as u64;
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
         let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
             &mut gemini_body,
             &mapped_model,
@@ -2162,6 +2175,7 @@ pub async fn handle_chat_completions(
             );
         }
 
+        let upstream_req_start = std::time::Instant::now();
         let call_result = match upstream
             .call_v1_internal_with_headers(
                 method,
@@ -2292,6 +2306,7 @@ pub async fn handle_chat_completions(
                             }
 
                             // We found real data!
+                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                             first_data_chunk = Some(bytes);
                             break;
                         }
@@ -2435,6 +2450,10 @@ pub async fn handle_chat_completions(
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &client_session_id)
                         .header("X-Antigravity-Session-Id", &client_session_id)
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -2468,16 +2487,19 @@ pub async fn handle_chat_completions(
                                 )
                                 .await;
                             }
-                            return Ok((
-                                StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                    ("X-Session-Id", client_session_id.as_str()),
-                                    ("X-Antigravity-Session-Id", client_session_id.as_str()),
-                                ],
-                                Json(full_response),
-                            )
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", email.as_str())
+                                .header("X-Mapped-Model", mapped_model.as_str())
+                                .header("X-Session-Id", client_session_id.as_str())
+                                .header("X-Antigravity-Session-Id", client_session_id.as_str())
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                .body(Body::from(serde_json::to_string(&full_response).unwrap_or_default()))
+                                .unwrap()
                                 .into_response());
                         }
                         Err(e) => {
@@ -2492,10 +2514,13 @@ pub async fn handle_chat_completions(
                 }
             }
 
+            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
             let gemini_resp: Value = response
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+
+            crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
 
             // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
             // 兼容两种格式: cachedContentTokenCount (旧), total_cached_tokens (新)
@@ -2547,14 +2572,19 @@ pub async fn handle_chat_completions(
                 )
                 .await;
             }
-            return Ok((
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(openai_response),
-            )
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Account-Email", email.as_str())
+                .header("X-Mapped-Model", mapped_model.as_str())
+                .header("X-Session-Id", client_session_id.as_str())
+                .header("X-Antigravity-Session-Id", client_session_id.as_str())
+                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                .body(Body::from(serde_json::to_string(&openai_response).unwrap_or_default()))
+                .unwrap()
                 .into_response());
         }
 
@@ -2938,6 +2968,7 @@ pub async fn handle_completions(
     upstream_recorder: Option<axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let clean_start = std::time::Instant::now();
     debug!(
         "Received /v1/completions or /v1/responses payload: {} bytes",
         serialized_json_len(&body)
@@ -3806,6 +3837,11 @@ pub async fn handle_completions(
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
 
+    let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
+    let mut norm_ms = 0.0f64;
+    let mut think_fill_ms = 0.0f64;
+    let mut ttft_ms = 0.0f64;
+
     if debug_logger::is_enabled(&debug_cfg) {
         let payload = json!({
             "kind": "original_request",
@@ -3830,6 +3866,7 @@ pub async fn handle_completions(
         max_attempts,
         retry_credentials.is_some(),
     ) {
+        let norm_start = std::time::Instant::now();
         // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -3890,6 +3927,7 @@ pub async fn handle_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
+        let tf_start = std::time::Instant::now();
         let (mut gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
             transform_openai_request_with_session(
                 &openai_req,
@@ -3907,6 +3945,10 @@ pub async fn handle_completions(
                 proxy_token.as_ref(),
             )
         };
+        let tf_micros = tf_start.elapsed().as_micros() as u64;
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
         let _ = crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
             &mut gemini_body,
             &mapped_model,
@@ -3985,6 +4027,7 @@ pub async fn handle_completions(
         };
         let query_string = if list_response { Some("alt=sse") } else { None };
 
+        let upstream_req_start = std::time::Instant::now();
         let call_result = match upstream
             .call_v1_internal(
                 method,
@@ -4102,6 +4145,7 @@ pub async fn handle_completions(
                                     retry_this_account = true;
                                     break;
                                 }
+                                ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                                 first_data_chunk = Some(bytes);
                                 break;
                             }
@@ -4189,6 +4233,10 @@ pub async fn handle_completions(
                         .header("X-Mapped-Model", &mapped_model)
                         .header("X-Session-Id", &session_scope.client_id)
                         .header("X-Antigravity-Session-Id", &session_scope.client_id)
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                         .body(Body::from_stream(combined_stream))
                         .unwrap()
                         .into_response();
@@ -4235,6 +4283,7 @@ pub async fn handle_completions(
                                     retry_this_account = true;
                                     break;
                                 }
+                                ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                                 first_data_chunk = Some(bytes);
                                 break;
                             }
@@ -4333,16 +4382,19 @@ pub async fn handle_completions(
                                     .await;
                                 }
 
-                                return (
-                                    StatusCode::OK,
-                                    [
-                                        ("X-Account-Email", email.as_str()),
-                                        ("X-Mapped-Model", mapped_model.as_str()),
-                                        ("X-Session-Id", session_scope.client_id.as_str()),
-                                        ("X-Antigravity-Session-Id", session_scope.client_id.as_str()),
-                                    ],
-                                    Json(resp),
-                                )
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Type", "application/json")
+                                    .header("X-Account-Email", email.as_str())
+                                    .header("X-Mapped-Model", mapped_model.as_str())
+                                    .header("X-Session-Id", session_scope.client_id.as_str())
+                                    .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                    .body(Body::from(serde_json::to_string(&resp).unwrap_or_default()))
+                                    .unwrap()
                                     .into_response();
                             }
 
@@ -4399,14 +4451,19 @@ pub async fn handle_completions(
                                 .await;
                             }
 
-                            return (
-                                StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
-                                Json(legacy_resp),
-                            )
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", email.as_str())
+                                .header("X-Mapped-Model", mapped_model.as_str())
+                                .header("X-Session-Id", session_scope.client_id.as_str())
+                                .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                .body(Body::from(serde_json::to_string(&legacy_resp).unwrap_or_default()))
+                                .unwrap()
                                 .into_response();
                         }
                         Err(e) => {
@@ -4420,6 +4477,7 @@ pub async fn handle_completions(
                 }
             }
 
+            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
             let gemini_resp: Value = match response.json().await {
                 Ok(json) => json,
                 Err(e) => {
@@ -4432,9 +4490,11 @@ pub async fn handle_completions(
                 }
             };
 
+            crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
+
             let chat_resp = transform_openai_response(
                 &gemini_resp,
-                Some("session-123"),
+                Some(&signature_session_id_str),
                 1,
                 Some(&client_tool_names),
             );
@@ -4463,14 +4523,19 @@ pub async fn handle_completions(
                     .await;
                 }
 
-                return (
-                    StatusCode::OK,
-                    [
-                        ("X-Account-Email", email.as_str()),
-                        ("X-Mapped-Model", mapped_model.as_str()),
-                    ],
-                    Json(resp),
-                )
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .header("X-Account-Email", email.as_str())
+                    .header("X-Mapped-Model", mapped_model.as_str())
+                    .header("X-Session-Id", session_scope.client_id.as_str())
+                    .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                    .body(Body::from(serde_json::to_string(&resp).unwrap_or_default()))
+                    .unwrap()
                     .into_response();
             }
 
@@ -4515,14 +4580,19 @@ pub async fn handle_completions(
                 .await;
             }
 
-            return (
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(legacy_resp),
-            )
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Account-Email", email.as_str())
+                .header("X-Mapped-Model", mapped_model.as_str())
+                .header("X-Session-Id", session_scope.client_id.as_str())
+                .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                .body(Body::from(serde_json::to_string(&legacy_resp).unwrap_or_default()))
+                .unwrap()
                 .into_response();
         }
 
