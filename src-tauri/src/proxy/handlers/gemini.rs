@@ -827,10 +827,13 @@ pub async fn handle_generate(
             }
         }
 
-        // [FIX] 429 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
-        if status_code == 429 || status_code == 529 {
+        // [FIX] 401/403/429/529 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
+        if status_code == 401 || status_code == 403 || status_code == 429 || status_code == 529 {
             token_manager.clear_session_binding(&session_id);
             tracing::debug!("[Gemini] Unbound session {} from account {} due to status {}", session_id, email, status_code);
+        }
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id);
         }
 
         // 确定重试策略

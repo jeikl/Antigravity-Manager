@@ -2707,6 +2707,15 @@ pub async fn handle_chat_completions(
             }
         }
 
+        // [FIX] 遭遇 401/403/429/529 异常时，立即解绑当前会话，防止死锁在故障账号上
+        if status_code == 401 || status_code == 403 || status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id);
+            tracing::debug!("[OpenAI] Unbound session {} from account {} due to status {}", session_id, email, status_code);
+        }
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id);
+        }
+
         // 执行退避
         if apply_retry_strategy(
             strategy.clone(),
@@ -4627,6 +4636,15 @@ pub async fn handle_completions(
                     Some(&mapped_model),
                 )
                 .await;
+        }
+
+        // [FIX] 遭遇 401/403/429/529 异常时，立即解绑当前会话，防止死锁在故障账号上
+        if status_code == 401 || status_code == 403 || status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id_str);
+            tracing::debug!("[OpenAI] Unbound session {} from account {} due to status {}", session_id_str, email, status_code);
+        }
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id);
         }
 
         let strategy = retry_state.determine_strategy(

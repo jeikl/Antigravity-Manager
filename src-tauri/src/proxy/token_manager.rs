@@ -3866,6 +3866,16 @@ impl TokenManager {
 
         Ok(())
     }
+
+    /// Invalidate cached access token for an account (called when proxy encounters 401)
+    pub fn invalidate_access_token(&self, account_id: &str) {
+        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+            entry.timestamp = 0;
+            entry.expires_in = 0;
+        }
+        self.session_accounts.retain(|_, v| *v != account_id);
+        tracing::warn!("⚠️ Invalidated cached access_token for account {} due to 401 Unauthorized", account_id);
+    }
 }
 
 /// 截断过长的原因字符串

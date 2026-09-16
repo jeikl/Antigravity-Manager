@@ -83,7 +83,7 @@ impl SignatureCache {
 
     /// Store a tool call signature
     pub fn cache_tool_signature(&self, tool_use_id: &str, signature: String) {
-        if signature.len() < MIN_SIGNATURE_LENGTH {
+        if !crate::proxy::thinking_store::is_real_signature(&signature) {
             return;
         }
 
@@ -146,7 +146,7 @@ impl SignatureCache {
 
     /// Store model family for a signature
     pub fn cache_thinking_family(&self, signature: String, family: String) {
-        if signature.len() < MIN_SIGNATURE_LENGTH {
+        if !crate::proxy::thinking_store::is_real_signature(&signature) {
             return;
         }
 
@@ -202,7 +202,7 @@ impl SignatureCache {
         signature: String,
         message_count: usize,
     ) {
-        if signature.len() < MIN_SIGNATURE_LENGTH {
+        if !crate::proxy::thinking_store::is_real_signature(&signature) {
             return;
         }
 

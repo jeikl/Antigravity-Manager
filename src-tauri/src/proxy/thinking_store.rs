@@ -1004,7 +1004,9 @@ pub fn finalize_gemini_contents_thinking(
                     obj.remove("thought_signature");
                 }
                 let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || part.get("thoughtSignature").is_some();
+                    || (part.get("thoughtSignature").is_some()
+                        && part.get("functionCall").is_none()
+                        && part.get("functionResponse").is_none());
                 if is_thought {
                     thinking_parts.push(part);
                 } else {
@@ -1019,7 +1021,9 @@ pub fn finalize_gemini_contents_thinking(
                         .iter()
                         .find_map(|p| {
                             if p.get("functionCall").is_some() {
-                                p.get("thoughtSignature").and_then(|s| s.as_str())
+                                p.get("thoughtSignature")
+                                    .and_then(|s| s.as_str())
+                                    .filter(|s| is_real_signature(s))
                             } else {
                                 None
                             }
@@ -1031,14 +1035,31 @@ pub fn finalize_gemini_contents_thinking(
                         "thought": true,
                         "thoughtSignature": turn_sig,
                     }));
+                } else {
+                    // 确保现有 thinking_parts 上的签名合法，如果是伪造哈希则替换为保底哨兵
+                    for tp in thinking_parts.iter_mut() {
+                        if let Some(sig) = tp.get("thoughtSignature").and_then(|s| s.as_str()) {
+                            if !is_real_signature(sig) && sig != SENTINEL_SIGNATURE {
+                                tracing::warn!(
+                                    "[ThinkingStore] Replacing fake/invalid thinking thoughtSignature (len={}) with sentinel",
+                                    sig.len()
+                                );
+                                tp["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
+                            }
+                        }
+                    }
                 }
 
-                // 为所有缺失签名的工具调用打上保底哨兵
+                // 为所有缺失或携带伪造签名的工具调用置换为保底哨兵
                 for part in other_parts.iter_mut() {
-                    if part.get("functionCall").is_some()
-                        && part.get("thoughtSignature").is_none()
-                    {
-                        part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
+                    if part.get("functionCall").is_some() {
+                        let needs_fix = match part.get("thoughtSignature").and_then(|s| s.as_str()) {
+                            Some(sig) => !is_real_signature(sig) && sig != SENTINEL_SIGNATURE,
+                            None => true,
+                        };
+                        if needs_fix {
+                            part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
+                        }
                     }
                 }
 
@@ -1285,8 +1306,45 @@ fn client_id_from_store_key(store_key: &str) -> &str {
     store_key.split_once(':').map(|(_, rest)| rest).unwrap_or(store_key)
 }
 
-fn is_real_signature(sig: &str) -> bool {
-    sig.len() >= MIN_SIGNATURE_LENGTH && sig != SENTINEL_SIGNATURE
+/// 检查是否为纯十六进制哈希或客户端占位字符串
+pub fn is_hex_hash(sig: &str) -> bool {
+    let s = sig.trim();
+    if s.is_empty() {
+        return true;
+    }
+    // 纯十六进制哈希特征（32位MD5、40位SHA1、64位SHA256、128位SHA512）
+    if (s.len() == 32 || s.len() == 40 || s.len() == 64 || s.len() == 128)
+        && s.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return true;
+    }
+    // 纯小写十六进制文本（客户端自行散列）
+    if s.len() >= 32 && s.len() <= 128 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        return true;
+    }
+    false
+}
+
+/// 判断是否为合法的 Google 官方 thoughtSignature
+pub fn is_real_signature(sig: &str) -> bool {
+    let s = sig.trim();
+    if s.is_empty() || s == SENTINEL_SIGNATURE {
+        return false;
+    }
+    if s.len() < MIN_SIGNATURE_LENGTH || s.len() > 65536 {
+        return false;
+    }
+    if is_hex_hash(s) {
+        return false;
+    }
+    // 真实 Google 签名是 Base64 / Base64URL 编码字符
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+    {
+        return false;
+    }
+    true
 }
 
 pub fn is_placeholder_thought(s: &str) -> bool {
@@ -2140,6 +2198,47 @@ mod tests {
         let (turns, _) = store.session_stats(key).unwrap();
         assert_eq!(turns, 12, "placeholder fill must not prune live tool turns");
         let _ = crate::modules::proxy_db::delete_thinking_records_for_session(key);
+    }
+
+    #[test]
+    fn test_corrupted_sha256_signature_defense() {
+        let fake_sha256 = "4997b34e54bd48568dcfa54fea40fc7bc469ddf5cdd088480c805692d62857b4";
+        assert!(is_hex_hash(fake_sha256));
+        assert!(!is_real_signature(fake_sha256));
+
+        // Valid Google protobuf signature
+        let real_sig = "Ep4MCpsMARFNMg9NDlK9RXXz5Mzq9mniX9KSQBBzbUx3k85w/qDgtcE+28NH+1EvPeULAprqUquvYXGMzUXGy1xJoMnqdkC4vqebuhyd2Xhs0oz+OhqcOTwLhGYOG0KBKQ87Hfw4q/sMCSgf2gz4vFMa6V6kKMJepYlPXKFJJF4ok+W6lUt3PfYln8K9Dh7wB/40iHiZ2BnJd++6hfUwu9Bz1n795S50l0yCj84EaSCDDF334Erxq7Fo";
+        assert!(!is_hex_hash(real_sig));
+        assert!(is_real_signature(real_sig));
+
+        // Sentinel
+        assert!(!is_real_signature(SENTINEL_SIGNATURE));
+
+        // Verify finalize_gemini_contents_thinking cleans fake sha256
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Thinking something",
+                    "thought": true,
+                    "thoughtSignature": fake_sha256
+                },
+                {
+                    "functionCall": {
+                        "name": "read_file",
+                        "args": {"path": "test.txt"},
+                        "id": "call_123"
+                    },
+                    "thoughtSignature": fake_sha256
+                }
+            ]
+        })];
+
+        finalize_gemini_contents_thinking(&mut contents, true);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], SENTINEL_SIGNATURE, "Fake thinking signature must be replaced with sentinel");
+        assert_eq!(parts[1]["thoughtSignature"], SENTINEL_SIGNATURE, "Fake functionCall signature must be replaced with sentinel");
     }
 }
 

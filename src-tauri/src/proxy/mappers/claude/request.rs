@@ -856,7 +856,7 @@ fn has_valid_signature_for_function_calls(
 ) -> bool {
     // 1. Check global store (deprecated but kept for compatibility)
     if let Some(sig) = global_sig {
-        if sig.len() >= MIN_SIGNATURE_LENGTH {
+        if crate::proxy::thinking_store::is_real_signature(sig) {
             tracing::debug!(
                 "[Signature-Check] Found valid signature in global store (len: {})",
                 sig.len()
@@ -868,7 +868,7 @@ fn has_valid_signature_for_function_calls(
     // 2. [NEW] Check Session Cache - this is critical for retry scenarios
     // When retrying, the signature may not be in messages but exists in Session Cache
     if let Some(sig) = crate::proxy::SignatureCache::global().get_session_signature(session_id) {
-        if sig.len() >= MIN_SIGNATURE_LENGTH {
+        if crate::proxy::thinking_store::is_real_signature(&sig) {
             tracing::info!(
                 "[Signature-Check] Found valid signature in SESSION cache (session: {}, len: {})",
                 session_id,
@@ -888,7 +888,7 @@ fn has_valid_signature_for_function_calls(
                         ..
                     } = block
                     {
-                        if sig.len() >= MIN_SIGNATURE_LENGTH {
+                        if crate::proxy::thinking_store::is_real_signature(sig) {
                             tracing::debug!(
                                 "[Signature-Check] Found valid signature in message history (len: {})",
                                 sig.len()
@@ -1017,14 +1017,14 @@ fn build_contents(
             for b in blocks {
                 match b {
                     ContentBlock::Thinking { signature: Some(s), .. } => {
-                        if s == SENTINEL_SIGNATURE || s.len() >= MIN_SIGNATURE_LENGTH {
+                        if s == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s) {
                             turn_signature = Some(s.clone());
                             break;
                         }
                     }
                     ContentBlock::ToolUse { id, signature, .. } => {
                         if let Some(s) = signature {
-                            if s == SENTINEL_SIGNATURE || s.len() >= MIN_SIGNATURE_LENGTH {
+                            if s == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s) {
                                 turn_signature = Some(s.clone());
                                 break;
                             }
@@ -1161,32 +1161,33 @@ fn build_contents(
 
                         let mut effective_sig = None;
 
-                        // 1. Check incoming signature if long enough or sentinel
+                        // 1. Check incoming signature if valid real signature or sentinel
                         if let Some(sig) = signature {
-                            if sig == SENTINEL_SIGNATURE || sig.len() >= MIN_SIGNATURE_LENGTH {
+                            if !is_retry && (sig == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(sig)) {
                                 let cached_family =
                                     crate::proxy::SignatureCache::global().get_signature_family(sig);
 
                                 match cached_family {
                                     Some(family) => {
-                                        let compatible =
-                                            !is_retry && is_model_compatible(&family, mapped_model);
+                                        let compatible = is_model_compatible(&family, mapped_model);
                                         if compatible {
                                             effective_sig = Some(sig.clone());
                                         } else {
                                             tracing::warn!(
-                                                "[Thinking-Signature] {} signature (Family: {}, Target: {}).",
-                                                if is_retry { "Stripping historical" } else { "Incompatible" },
+                                                "[Thinking-Signature] Incompatible signature (Family: {}, Target: {}).",
                                                 family, mapped_model
                                             );
                                         }
                                     }
                                     None => {
-                                        if !is_retry {
-                                            effective_sig = Some(sig.clone());
-                                        }
+                                        effective_sig = Some(sig.clone());
                                     }
                                 }
+                            } else if !is_retry && !crate::proxy::thinking_store::is_real_signature(sig) && sig != SENTINEL_SIGNATURE {
+                                tracing::warn!(
+                                    "[Thinking-Signature] Discarded fake/corrupted signature from client (len={})",
+                                    sig.len()
+                                );
                             }
                         }
 
@@ -1290,17 +1291,22 @@ fn build_contents(
                         // Signature resolution logic
                         // Priority: Client -> Tool-specific cache -> Turn Context -> Turn Signature -> Session cache at msg_index
                         // Strictly isolated to this turn: NEVER fall back to latest session or global store!
-                        let final_sig = signature.as_ref()
-                            .filter(|s| s.as_str() == SENTINEL_SIGNATURE || s.len() >= MIN_SIGNATURE_LENGTH)
-                            .cloned()
-                            .or_else(|| crate::proxy::SignatureCache::global().get_tool_signature(id))
-                            .or_else(|| last_thought_signature.as_ref().cloned())
-                            .or_else(|| turn_signature.clone())
-                            .or_else(|| {
-                                // 只按当前轮次回填，禁止 latest/global 串签（官方回退会导致思考死循环）
-                                crate::proxy::SignatureCache::global()
-                                    .get_session_signature_at(session_id, msg_index)
-                            });
+                        let final_sig = if is_retry {
+                            None
+                        } else {
+                            signature.as_ref()
+                                .filter(|s| s.as_str() == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s))
+                                .cloned()
+                                .or_else(|| crate::proxy::SignatureCache::global().get_tool_signature(id))
+                                .or_else(|| last_thought_signature.as_ref().filter(|s| s.as_str() == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s)).cloned())
+                                .or_else(|| turn_signature.as_ref().filter(|s| s.as_str() == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s)).cloned())
+                                .or_else(|| {
+                                    // 只按当前轮次回填，禁止 latest/global 串签（官方回退会导致思考死循环）
+                                    crate::proxy::SignatureCache::global()
+                                        .get_session_signature_at(session_id, msg_index)
+                                        .filter(|s| s.as_str() == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s))
+                                })
+                        };
                         // [FIX #752] Validate signature before using
                         let is_google_cloud = mapped_model.starts_with("projects/");
                         let needs_sentinel = !is_google_cloud
@@ -1309,18 +1315,17 @@ fn build_contents(
 
                         let mut signature_assigned = false;
                         if let Some(sig) = final_sig {
-                            // [NEW] If this is a retry, do NOT backfill signatures to avoid issues.
-                            if is_retry && signature.is_none() {
+                            if is_retry {
                                 tracing::warn!("[Tool-Signature] Skipping signature backfill for tool_use: {} during retry.", id);
                             } else if sig == SENTINEL_SIGNATURE {
                                 if !is_google_cloud {
                                     part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
                                     signature_assigned = true;
                                 }
-                            } else if sig.len() < MIN_SIGNATURE_LENGTH {
+                            } else if !crate::proxy::thinking_store::is_real_signature(&sig) {
                                 tracing::warn!(
-                                    "[Tool-Signature] Signature too short for tool_use: {} (len: {} < {}), skipping.",
-                                    id, sig.len(), MIN_SIGNATURE_LENGTH
+                                    "[Tool-Signature] Invalid/fake signature for tool_use: {} (len: {}), skipping.",
+                                    id, sig.len()
                                 );
                             } else {
                                 // Check signature compatibility (optional for tool_use)
@@ -1447,7 +1452,7 @@ fn build_contents(
                         let tool_res_sig = crate::proxy::SignatureCache::global()
                             .get_tool_signature(tool_use_id)
                             .or_else(|| last_thought_signature.as_ref().cloned());
-                        if let Some(sig) = tool_res_sig {
+                        if let Some(sig) = tool_res_sig.filter(|s| s.as_str() == SENTINEL_SIGNATURE || crate::proxy::thinking_store::is_real_signature(s)) {
                             part["thoughtSignature"] = json!(sig);
                         }
 
