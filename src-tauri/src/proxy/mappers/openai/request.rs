@@ -1318,7 +1318,7 @@ pub fn transform_openai_request_with_session(
         super::context_blocks::build_system_instruction_parts(&system_instructions, global_prompt);
     if !system_parts.is_empty() {
         inner_request["systemInstruction"] = json!({
-            "role": "system",
+            "role": "user",
             "parts": system_parts
         });
     }
@@ -1983,8 +1983,8 @@ mod tests {
         let budget = gen_config["thinkingConfig"]["thinkingBudget"]
             .as_u64()
             .unwrap();
-        // Should use user budget (16000)
-        assert_eq!(budget, 16000);
+        // [ANTI-POLLUTION] Gemini 3 Pro unconditionally locks to authoritative default budget (49152)
+        assert_eq!(budget, 49152);
     }
     #[test]
     fn test_gemini_3_pro_image_not_thinking() {
