@@ -565,6 +565,9 @@ pub async fn handle_messages(
         }
     };
 
+    // [Stage 1 Timing] 初始会话清洗计时
+    let clean_start = std::time::Instant::now();
+
     // [CRITICAL FIX] 预先清理所有消息中的 cache_control 字段 (Issue #744)
     // 必须在序列化之前处理，以确保 z.ai 和 Google Flow 都不受历史消息缓存标记干扰
     clean_cache_control_from_messages(&mut request.messages);
@@ -835,9 +838,19 @@ pub async fn handle_messages(
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
 
+    // [Stage Timing] 阶段耗时度量变量 (毫秒，保留微秒级浮点精度)
+    let mut clean_micros = clean_start.elapsed().as_micros() as u64;
+    let mut clean_ms: f64 = clean_micros as f64 / 1000.0;
+    let mut norm_ms: f64 = 0.0;
+    let mut think_fill_ms: f64 = 0.0;
+    let mut ttft_ms: f64 = 0.0;
+
     for attempt in 0..max_attempts {
+        // [Stage 2 Timing] 中转归一计时起点
+        let norm_start = std::time::Instant::now();
+
         // 2. 模型路由解析
-        let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
         );
@@ -1096,7 +1109,7 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let mut gemini_body = match transform_claude_request_in(
+        let (mut gemini_body, transform_timing) = match crate::proxy::mappers::claude::transform_claude_request_in_timed(
             &request_with_mapped,
             &project_id,
             retried_without_thinking,
@@ -1104,13 +1117,13 @@ pub async fn handle_messages(
             &session_id_str,
             token_obj.as_ref(),
         ) {
-            Ok(b) => {
+            Ok((b, timing)) => {
                 debug!(
                     "[{}] Transformed Gemini Body: {}",
                     trace_id,
                     serde_json::to_string_pretty(&b).unwrap_or_default()
                 );
-                b
+                (b, timing)
             }
             Err(e) => {
                 let headers = [
@@ -1136,6 +1149,11 @@ pub async fn handle_messages(
             &mut gemini_body,
             &mapped_model,
         );
+
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        let tf_micros = transform_timing.think_fill_micros;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
 
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
@@ -1207,7 +1225,8 @@ pub async fn handle_messages(
             }
         }
 
-        // Upstream call configuration continued...
+        // [Stage 4 Timing] 等待谷歌上游首包计时起点
+        let upstream_req_start = std::time::Instant::now();
 
         let call_result = match upstream
             .call_v1_internal_with_headers(
@@ -1353,6 +1372,7 @@ pub async fn handle_messages(
                             }
 
                             // We found real data!
+                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                             first_data_chunk = Some(bytes);
                             break;
                         }
@@ -1440,6 +1460,10 @@ pub async fn handle_messages(
                                     "X-Context-Purified",
                                     if is_purified { "true" } else { "false" },
                                 )
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                                 .body(Body::from_stream(combined_stream))
                                 .unwrap();
                         } else {
@@ -1463,6 +1487,10 @@ pub async fn handle_messages(
                                             "X-Context-Purified",
                                             if is_purified { "true" } else { "false" },
                                         )
+                                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                                         .body(Body::from(
                                             serde_json::to_string(&full_response).unwrap(),
                                         ))

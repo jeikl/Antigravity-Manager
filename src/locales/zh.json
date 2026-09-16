@@ -1222,6 +1222,23 @@
       "search_placeholder": "搜索此报文...",
       "no_upstream_payload": "无中转报文 (直接转发或未记录)"
     },
+    "timing": {
+      "title": "耗时分类诊断",
+      "clean": "初始会话清洗",
+      "clean_desc": "清理缓存控制 / 合并同角色 / 破损思考过滤 / 提纯去噪",
+      "norm": "中转归一",
+      "norm_desc": "模型路由 / 账号调度 / 协议转Gemini格式",
+      "thinking": "Thinking块、签名填充",
+      "thinking_desc": "ThinkingStore回填 / 补全思维块与哨兵签名",
+      "ttft": "等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）",
+      "ttft_desc": "网关发出请求至接收到上游首个有效数据块",
+      "stream": "首包到这个包响应完的时间",
+      "stream_desc": "首个数据块到达至整条响应流结束",
+      "total": "总耗时",
+      "copy_timing": "复制耗时分类",
+      "copied_timing": "已复制耗时",
+      "legacy_hint": "历史记录未采集微观阶段耗时"
+    },
     "dialog": {
       "clear_title": "清除监控日志",
       "clear_msg": "确定要清除所有监控记录吗？此操作无法撤销。"

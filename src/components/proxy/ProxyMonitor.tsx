@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import ModalDialog from '../common/ModalDialog';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
-import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, RefreshCw, User, Sparkles, FileCode2, Eye, EyeOff } from 'lucide-react';
+import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, RefreshCw, User, Sparkles, FileCode2, Eye, EyeOff, Clock } from 'lucide-react';
 
 import { AppConfig } from '../../types/config';
 import { formatCompactNumber } from '../../utils/format';
@@ -588,6 +588,353 @@ function extractConcisePayload(
     return JSON.stringify(concise, null, 2);
 }
 
+interface StageTimingInfo {
+    cleanSec?: number;
+    normSec?: number;
+    thinkingSec?: number;
+    ttftSec?: number;
+    streamSec?: number;
+    totalSec?: number;
+    isOldRecordWithoutStages?: boolean;
+}
+
+const parseTimingFromHeadersAndBody = (
+    headersJson?: string,
+    responseBody?: string,
+    durationMs?: number
+): StageTimingInfo | null => {
+    let cleanSec: number | undefined;
+    let normSec: number | undefined;
+    let thinkingSec: number | undefined;
+    let ttftSec: number | undefined;
+    let streamSec: number | undefined;
+    let totalSec: number | undefined;
+
+    // 1. Check if responseBody has _timing object
+    if (responseBody) {
+        try {
+            const bodyObj = JSON.parse(responseBody);
+            if (bodyObj && typeof bodyObj === 'object' && bodyObj._timing) {
+                const t = bodyObj._timing;
+                if (typeof t.clean_s === 'number') cleanSec = t.clean_s;
+                else if (typeof t.clean_ms === 'number') cleanSec = t.clean_ms / 1000;
+
+                if (typeof t.norm_s === 'number') normSec = t.norm_s;
+                else if (typeof t.norm_ms === 'number') normSec = t.norm_ms / 1000;
+
+                if (typeof t.thinking_s === 'number') thinkingSec = t.thinking_s;
+                else if (typeof t.thinking_ms === 'number') thinkingSec = t.thinking_ms / 1000;
+
+                if (typeof t.ttft_s === 'number') ttftSec = t.ttft_s;
+                else if (typeof t.ttft_ms === 'number') ttftSec = t.ttft_ms / 1000;
+
+                if (typeof t.stream_s === 'number') streamSec = t.stream_s;
+                else if (typeof t.stream_ms === 'number') streamSec = t.stream_ms / 1000;
+
+                if (typeof t.total_s === 'number') totalSec = t.total_s;
+                else if (typeof t.total_ms === 'number') totalSec = t.total_ms / 1000;
+            }
+        } catch {}
+    }
+
+    // 2. Parse from headersJson if any are still missing
+    if (headersJson) {
+        try {
+            const headersObj = JSON.parse(headersJson);
+            if (headersObj && typeof headersObj === 'object') {
+                const getVal = (key: string): number | undefined => {
+                    const matchKey = Object.keys(headersObj).find(
+                        (k) => k.toLowerCase() === key.toLowerCase()
+                    );
+                    if (!matchKey) return undefined;
+                    const v = headersObj[matchKey];
+                    if (typeof v === 'number') return v;
+                    if (typeof v === 'string') {
+                        const parsed = parseFloat(v);
+                        return isNaN(parsed) ? undefined : parsed;
+                    }
+                    if (Array.isArray(v) && v.length > 0) {
+                        const parsed = parseFloat(String(v[0]));
+                        return isNaN(parsed) ? undefined : parsed;
+                    }
+                    return undefined;
+                };
+
+                if (cleanSec === undefined) {
+                    const ms = getVal('x-timing-clean-ms');
+                    if (ms !== undefined) cleanSec = ms / 1000;
+                }
+                if (normSec === undefined) {
+                    const ms = getVal('x-timing-norm-ms');
+                    if (ms !== undefined) normSec = ms / 1000;
+                }
+                if (thinkingSec === undefined) {
+                    const ms = getVal('x-timing-thinking-ms');
+                    if (ms !== undefined) thinkingSec = ms / 1000;
+                }
+                if (ttftSec === undefined) {
+                    const ms = getVal('x-timing-ttft-ms');
+                    if (ms !== undefined) ttftSec = ms / 1000;
+                }
+                if (streamSec === undefined) {
+                    const ms = getVal('x-timing-stream-ms');
+                    if (ms !== undefined) streamSec = ms / 1000;
+                }
+                if (totalSec === undefined) {
+                    const ms = getVal('x-timing-total-ms');
+                    if (ms !== undefined) totalSec = ms / 1000;
+                }
+            }
+        } catch {}
+    }
+
+    // 3. Fallback for totalSec if durationMs exists
+    if (totalSec === undefined && durationMs !== undefined && durationMs > 0) {
+        totalSec = durationMs / 1000;
+    }
+
+    // If we have neither totalSec nor any stages, return null
+    if (totalSec === undefined && cleanSec === undefined && ttftSec === undefined) {
+        return null;
+    }
+
+    const isOldRecordWithoutStages =
+        cleanSec === undefined &&
+        normSec === undefined &&
+        thinkingSec === undefined &&
+        ttftSec === undefined;
+
+    return {
+        cleanSec,
+        normSec,
+        thinkingSec,
+        ttftSec,
+        streamSec,
+        totalSec,
+        isOldRecordWithoutStages,
+    };
+};
+
+const formatSeconds = (sec?: number): string => {
+    if (sec === undefined || sec === null || isNaN(sec)) return '-';
+    if (sec < 0.001) {
+        return `${sec.toFixed(4)}s`;
+    }
+    if (sec < 1) {
+        return `${sec.toFixed(3)}s`;
+    }
+    return `${sec.toFixed(2)}s`;
+};
+
+interface TimingDiagnosticsCardProps {
+    timing: StageTimingInfo;
+    onCopyText: (text: string) => void;
+}
+
+const TimingDiagnosticsCard: React.FC<TimingDiagnosticsCardProps> = ({ timing, onCopyText }) => {
+    const { t } = useTranslation();
+    const [isExpanded, setIsExpanded] = useState(true);
+    const [isCopied, setIsCopied] = useState(false);
+
+    const totalSec = timing.totalSec || 0;
+
+    const stages = useMemo(() => [
+        {
+            key: 'clean',
+            label: t('monitor.timing.clean', '初始会话清洗'),
+            desc: t('monitor.timing.clean_desc', '清理缓存控制 / 合并同角色 / 历史提纯'),
+            sec: timing.cleanSec,
+            color: 'bg-indigo-500',
+            textColor: 'text-indigo-600 dark:text-indigo-400',
+        },
+        {
+            key: 'norm',
+            label: t('monitor.timing.norm', '中转归一'),
+            desc: t('monitor.timing.norm_desc', '模型映射 / 账号调度 / 协议转Gemini格式'),
+            sec: timing.normSec,
+            color: 'bg-purple-500',
+            textColor: 'text-purple-600 dark:text-purple-400',
+        },
+        {
+            key: 'thinking',
+            label: t('monitor.timing.thinking', 'Thinking块、签名填充'),
+            desc: t('monitor.timing.thinking_desc', 'ThinkingStore回填 / 补全思维块与哨兵签名'),
+            sec: timing.thinkingSec,
+            color: 'bg-amber-500',
+            textColor: 'text-amber-600 dark:text-amber-400',
+        },
+        {
+            key: 'ttft',
+            label: t('monitor.timing.ttft', '等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）'),
+            desc: t('monitor.timing.ttft_desc', '网关发出请求至接收到上游首个有效数据块'),
+            sec: timing.ttftSec,
+            color: 'bg-emerald-500',
+            textColor: 'text-emerald-600 dark:text-emerald-400',
+        },
+        {
+            key: 'stream',
+            label: t('monitor.timing.stream', '首包到这个包响应完的时间'),
+            desc: t('monitor.timing.stream_desc', '首个数据块到达至整条响应流结束'),
+            sec: timing.streamSec,
+            color: 'bg-sky-500',
+            textColor: 'text-sky-600 dark:text-sky-400',
+        },
+    ], [timing, t]);
+
+    const handleCopy = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        const lines: string[] = [];
+        if (timing.cleanSec !== undefined) lines.push(`初始会话清洗：${formatSeconds(timing.cleanSec)}`);
+        if (timing.normSec !== undefined) lines.push(`中转归一：${formatSeconds(timing.normSec)}`);
+        if (timing.thinkingSec !== undefined) lines.push(`Thinking块、签名填充：${formatSeconds(timing.thinkingSec)}`);
+        if (timing.ttftSec !== undefined) lines.push(`等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）：${formatSeconds(timing.ttftSec)}`);
+        if (timing.streamSec !== undefined) lines.push(`首包到这个包响应完的时间：${formatSeconds(timing.streamSec)}`);
+        lines.push(`总耗时：${formatSeconds(timing.totalSec)}`);
+
+        onCopyText(lines.join('\n'));
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
+    };
+
+    if (timing.isOldRecordWithoutStages) {
+        return (
+            <div className="mb-3 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-800/80 bg-slate-100/50 dark:bg-slate-900/40">
+                <div className="px-3 py-2 bg-slate-200/60 dark:bg-[#161b22] border-b border-slate-200 dark:border-slate-800/80 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <Clock size={12} className="text-slate-500 dark:text-slate-400" />
+                        <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">
+                            {t('monitor.timing.title', '耗时分类诊断')}
+                        </span>
+                        <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/70 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/60">
+                            {t('monitor.timing.total', '总耗时')}: {formatSeconds(timing.totalSec)}
+                        </span>
+                    </div>
+                    <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                        {t('monitor.timing.legacy_hint', '历史记录未采集微观阶段耗时')}
+                    </span>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="mb-3 rounded-xl overflow-hidden border border-emerald-500/25 dark:border-emerald-500/20 bg-emerald-50/20 dark:bg-[#0c141c] shadow-sm">
+            {/* Card Header */}
+            <div className="px-3 py-2 bg-emerald-500/10 dark:bg-[#131f2b] border-b border-emerald-500/20 flex items-center justify-between gap-2 select-none">
+                <div className="flex items-center gap-2 min-w-0">
+                    <Clock size={13} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-emerald-900 dark:text-emerald-200 truncate">
+                        {t('monitor.timing.title', '耗时分类诊断')}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-black bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 shrink-0">
+                        {t('monitor.timing.total', '总耗时')}: {formatSeconds(timing.totalSec)}
+                    </span>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                    <button
+                        type="button"
+                        onClick={handleCopy}
+                        className="btn btn-ghost btn-xs h-6 px-2 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/15 text-[10px] font-medium gap-1"
+                        title={isCopied ? t('monitor.timing.copied_timing', '已复制耗时') : t('monitor.timing.copy_timing', '复制耗时分类')}
+                    >
+                        {isCopied ? <CheckCircle size={11} className="text-emerald-500" /> : <Copy size={11} />}
+                        <span>{isCopied ? t('monitor.timing.copied_timing', '已复制耗时') : t('monitor.timing.copy_timing', '复制耗时分类')}</span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setIsExpanded((prev) => !prev)}
+                        className="btn btn-ghost btn-xs p-1 h-6 min-h-0 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/15"
+                        title={isExpanded ? '收起耗时诊断' : '展开耗时诊断'}
+                    >
+                        <ChevronDown size={13} className={`transition-transform duration-200 ${isExpanded ? '' : '-rotate-90'}`} />
+                    </button>
+                </div>
+            </div>
+
+            {/* Expandable Body */}
+            {isExpanded && (
+                <div className="p-3 space-y-2.5 font-mono text-[11px]">
+                    {/* Multi-stage Stacked Progress Bar */}
+                    {totalSec > 0 && (
+                        <div className="space-y-1">
+                            <div className="h-2 w-full bg-slate-200/80 dark:bg-slate-800 rounded-full flex overflow-hidden shadow-inner">
+                                {stages.map((st) => {
+                                    if (st.sec === undefined || st.sec <= 0) return null;
+                                    const pct = Math.min(100, Math.max(0.5, (st.sec / totalSec) * 100));
+                                    return (
+                                        <div
+                                            key={st.key}
+                                            style={{ width: `${pct}%` }}
+                                            className={`${st.color} h-full transition-all duration-300 relative group`}
+                                            title={`${st.label}: ${formatSeconds(st.sec)} (${((st.sec / totalSec) * 100).toFixed(1)}%)`}
+                                        />
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Stage Metrics Grid */}
+                    <div className="grid grid-cols-1 gap-1.5 pt-0.5">
+                        {stages.map((st) => {
+                            const hasVal = st.sec !== undefined;
+                            const pct = hasVal && totalSec > 0 ? ((st.sec! / totalSec) * 100).toFixed(1) : undefined;
+                            return (
+                                <div
+                                    key={st.key}
+                                    className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-white/70 dark:bg-[#16202c]/80 border border-slate-200/70 dark:border-slate-800/80 hover:border-emerald-500/30 transition-colors"
+                                >
+                                    <div className="flex items-center gap-2 min-w-0">
+                                        <span className={`w-2 h-2 rounded-full ${st.color} shrink-0`} />
+                                        <div className="min-w-0">
+                                            <span className="font-semibold text-slate-800 dark:text-slate-200 truncate block text-[11px]">
+                                                {st.label}
+                                            </span>
+                                            <span className="text-[9px] text-slate-400 dark:text-slate-500 truncate block">
+                                                {st.desc}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex items-baseline gap-2 shrink-0 text-right font-mono">
+                                        <span className={`text-[11px] font-bold ${hasVal ? st.textColor : 'text-slate-400'}`}>
+                                            {formatSeconds(st.sec)}
+                                        </span>
+                                        {pct !== undefined && (
+                                            <span className="text-[10px] text-slate-400 dark:text-slate-500 w-10 text-right">
+                                                {pct}%
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+
+                        {/* Total Duration Row */}
+                        <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/10 dark:bg-emerald-950/40 border border-emerald-500/30 font-bold">
+                            <div className="flex items-center gap-2 min-w-0">
+                                <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+                                <span className="text-emerald-900 dark:text-emerald-300 text-[11px]">
+                                    {t('monitor.timing.total', '总耗时')}
+                                </span>
+                            </div>
+                            <div className="flex items-baseline gap-2 shrink-0 text-right font-mono">
+                                <span className="text-[12px] font-black text-emerald-700 dark:text-emerald-300">
+                                    {formatSeconds(timing.totalSec)}
+                                </span>
+                                <span className="text-[10px] text-emerald-600/70 dark:text-emerald-400/70 w-10 text-right">
+                                    100%
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
 // ==========================================
 // 单栏报文展示卡片（含语法高亮、独立搜索、跳转与复制）
 // ==========================================
@@ -603,6 +950,7 @@ interface PayloadViewerCardProps {
     emptyPlaceholder: string;
     onCopy: (content: string) => Promise<void>;
     isCopied: boolean;
+    duration?: number;
 }
 
 const renderHighlightedJson = (
@@ -721,11 +1069,17 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
     emptyPlaceholder,
     onCopy,
     isCopied,
+    duration,
 }) => {
     const { t } = useTranslation();
     const [searchTerm, setSearchTerm] = useState('');
     const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
     const containerRef = useRef<HTMLDivElement>(null);
+
+    const timingInfo = useMemo(() => {
+        if (cardId !== 'resp') return null;
+        return parseTimingFromHeadersAndBody(headersJson, rawPayload, duration);
+    }, [cardId, headersJson, rawPayload, duration]);
 
     const activeContent = useMemo(() => {
         if (viewMode === 'concise') {
@@ -919,6 +1273,9 @@ const PayloadViewerCard: React.FC<PayloadViewerCardProps> = ({
                 tabIndex={0}
                 className="flex-1 overflow-y-auto overflow-x-auto p-3.5 bg-slate-50/40 dark:bg-[#0d1117] font-mono text-[11px] outline-none focus:ring-1 focus:ring-blue-500/20"
             >
+                {timingInfo && (
+                    <TimingDiagnosticsCard timing={timingInfo} onCopyText={onCopy} />
+                )}
                 {prettyHeaders && (
                     <div className="mb-3 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800/80 bg-slate-100/50 dark:bg-slate-900/40">
                         <div className="px-2.5 py-1 bg-slate-200/60 dark:bg-[#161b22] border-b border-slate-200 dark:border-slate-800/80 flex items-center justify-between">
@@ -1572,6 +1929,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     headersJson={selectedLog.response_headers}
                                     viewMode={payloadViewMode}
                                     emptyPlaceholder={t('monitor.details.payload_empty', '无响应报文')}
+                                    duration={selectedLog.duration}
                                     onCopy={async (text) => {
                                         const success = await copyToClipboard(text);
                                         if (success) {

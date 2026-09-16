@@ -373,14 +373,32 @@ fn reorder_gemini_parts(parts: &mut Vec<Value>) {
     parts.extend(tool_parts);
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TransformTiming {
+    pub think_fill_micros: u64,
+}
+
 pub fn transform_claude_request_in(
+    claude_req: &ClaudeRequest,
+    project_id: &str,
+    is_retry: bool,
+    account_id: Option<&str>,
+    session_id: &str,
+    token: Option<&crate::proxy::token_manager::ProxyToken>,
+) -> Result<Value, String> {
+    transform_claude_request_in_timed(claude_req, project_id, is_retry, account_id, session_id, token)
+        .map(|(body, _)| body)
+}
+
+pub fn transform_claude_request_in_timed(
     claude_req: &ClaudeRequest,
     project_id: &str,
     is_retry: bool,
     account_id: Option<&str>,
     _session_id: &str,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 支持动态规格
-) -> Result<Value, String> {
+) -> Result<(Value, TransformTiming), String> {
+    let mut timing = TransformTiming::default();
     let message_count = claude_req.messages.len();
 
     // [CRITICAL FIX] 预先清理所有消息中的 cache_control 字段
@@ -590,6 +608,7 @@ pub fn transform_claude_request_in(
         &mapped_model,
         &session_id,
         is_retry,
+        &mut timing,
     )?;
 
     // 3. Tools
@@ -734,7 +753,7 @@ pub fn transform_claude_request_in(
         crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
     }
 
-    Ok(body)
+    Ok((body, timing))
 }
 
 /// Check if thinking mode should be enabled by default for a given model
@@ -1625,6 +1644,7 @@ fn build_google_contents(
     mapped_model: &str,
     session_id: &str, // [NEW v3.3.17] Session ID for signature caching
     is_retry: bool,
+    timing: &mut TransformTiming,
 ) -> Result<Value, String> {
     let mut contents = Vec::new();
     let mut last_thought_signature: Option<String> = None;
@@ -1693,6 +1713,7 @@ fn build_google_contents(
     let should_finalize_thinking =
         is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model);
 
+    let think_start = std::time::Instant::now();
     if should_finalize_thinking {
         crate::proxy::thinking_store::hydrate_gemini_contents(session_id, &mut merged_contents);
     }
@@ -1701,6 +1722,7 @@ fn build_google_contents(
         &mut merged_contents,
         should_finalize_thinking,
     );
+    timing.think_fill_micros = think_start.elapsed().as_micros() as u64;
 
     Ok(json!(merged_contents))
 }

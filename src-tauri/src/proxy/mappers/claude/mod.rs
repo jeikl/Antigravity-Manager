@@ -14,6 +14,7 @@ pub use collector::collect_stream_to_json;
 pub use models::*;
 pub use request::{
     clean_cache_control_from_messages, merge_consecutive_messages, transform_claude_request_in,
+    transform_claude_request_in_timed, TransformTiming,
 };
 pub use response::transform_response;
 pub use streaming::{PartProcessor, StreamingState};

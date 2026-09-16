@@ -1229,6 +1229,23 @@
       "search_placeholder": "Search payload...",
       "no_upstream_payload": "No forwarded payload (direct forwarding or unrecorded)"
     },
+    "timing": {
+      "title": "Stage Timing Diagnostics",
+      "clean": "Initial Session Clean",
+      "clean_desc": "Cache control stripping / message deduplication / purification",
+      "norm": "Normalization & Transit",
+      "norm_desc": "Model routing / account scheduling / Gemini format conversion",
+      "thinking": "Thinking & Signature Fill",
+      "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
+      "ttft": "Time To First Token (TTFT)",
+      "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
+      "stream": "Stream Transfer Duration",
+      "stream_desc": "First chunk arrival to stream completion",
+      "total": "Total Duration",
+      "copy_timing": "Copy Timing",
+      "copied_timing": "Copied",
+      "legacy_hint": "Micro-stage timing not recorded for historical logs"
+    },
     "dialog": {
       "clear_title": "Clear Proxy Logs",
       "clear_msg": "Are you sure you want to clear all proxy logs? This action cannot be undone."

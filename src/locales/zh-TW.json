@@ -1045,6 +1045,23 @@
       "search_placeholder": "搜尋此封包...",
       "no_upstream_payload": "無轉出封包 (直接轉發或未記錄)"
     },
+    "timing": {
+      "title": "耗時分類診斷",
+      "clean": "初始會話清洗",
+      "clean_desc": "清理快取控制 / 合併同角色 / 破損思考過濾 / 提純去噪",
+      "norm": "中轉歸一",
+      "norm_desc": "模型路由 / 帳號調度 / 協議轉Gemini格式",
+      "thinking": "Thinking塊、簽名填充",
+      "thinking_desc": "ThinkingStore回填 / 補全思維塊與哨兵簽名",
+      "ttft": "等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）",
+      "ttft_desc": "網關發出請求至接收到上游首個有效資料塊",
+      "stream": "首包到這個包響應完的時間",
+      "stream_desc": "首個資料塊到達至整條響應流結束",
+      "total": "總耗時",
+      "copy_timing": "複製耗時分類",
+      "copied_timing": "已複製耗時",
+      "legacy_hint": "歷史記錄未採集微觀階段耗時"
+    },
     "dialog": {
       "clear_title": "清除監控紀錄",
       "clear_msg": "確定要清除所有監控紀錄嗎？此操作無法撤銷。"

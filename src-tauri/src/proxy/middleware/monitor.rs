@@ -562,8 +562,10 @@ pub async fn monitor_middleware(
         let (parts, body) = response.into_parts();
         let mut stream = body.into_data_stream();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let start_instant = start;
 
         tokio::spawn(async move {
+            let stream_start = std::time::Instant::now();
             let mut all_stream_data = Vec::new();
             let mut last_few_bytes = Vec::new();
 
@@ -589,6 +591,26 @@ pub async fn monitor_middleware(
                 }
             }
             drop(stream);
+
+            let stream_ms = stream_start.elapsed().as_micros() as f64 / 1000.0;
+            let total_ms = start_instant.elapsed().as_micros() as f64 / 1000.0;
+            log.duration = total_ms.round() as u64;
+
+            let mut headers_map: serde_json::Map<String, Value> = log
+                .response_headers
+                .as_ref()
+                .and_then(|h| serde_json::from_str(h).ok())
+                .unwrap_or_default();
+
+            headers_map.insert(
+                "x-timing-stream-ms".to_string(),
+                serde_json::json!(format!("{:.3}", stream_ms)),
+            );
+            headers_map.insert(
+                "x-timing-total-ms".to_string(),
+                serde_json::json!(format!("{:.3}", total_ms)),
+            );
+            log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
             // Parse and consolidate stream data into readable format
             if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
@@ -927,6 +949,32 @@ pub async fn monitor_middleware(
                             .insert("tool_calls".to_string(), Value::Array(clean_tool_calls));
                     }
                 }
+
+                // [Timing Diagnostics] 注入耗时诊断元数据 (秒)
+                let mut timing_obj = serde_json::Map::new();
+                if let Some(clean) = headers_map.get("x-timing-clean-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = clean.parse::<f64>() {
+                        timing_obj.insert("clean_s".to_string(), serde_json::json!(n / 1000.0));
+                    }
+                }
+                if let Some(norm) = headers_map.get("x-timing-norm-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = norm.parse::<f64>() {
+                        timing_obj.insert("norm_s".to_string(), serde_json::json!(n / 1000.0));
+                    }
+                }
+                if let Some(th) = headers_map.get("x-timing-thinking-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = th.parse::<f64>() {
+                        timing_obj.insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
+                    }
+                }
+                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = ttft.parse::<f64>() {
+                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                    }
+                }
+                timing_obj.insert("stream_s".to_string(), serde_json::json!(stream_ms / 1000.0));
+                timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
+                consolidated.insert("_timing".to_string(), Value::Object(timing_obj));
                 if has_actual_content {
                     let mut usage_obj = serde_json::Map::new();
                     let input_toks = log.input_tokens.unwrap_or(0);
@@ -1061,6 +1109,21 @@ pub async fn monitor_middleware(
             Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
         )
     } else if content_type.contains("application/json") || content_type.contains("text/") {
+        let total_ms = start.elapsed().as_micros() as f64 / 1000.0;
+        log.duration = total_ms.round() as u64;
+
+        let mut headers_map: serde_json::Map<String, Value> = log
+            .response_headers
+            .as_ref()
+            .and_then(|h| serde_json::from_str(h).ok())
+            .unwrap_or_default();
+
+        headers_map.insert(
+            "x-timing-total-ms".to_string(),
+            serde_json::json!(format!("{:.3}", total_ms)),
+        );
+        log.response_headers = serde_json::to_string(&Value::Object(headers_map)).ok();
+
         let (parts, body) = response.into_parts();
         match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
             Ok(bytes) => {
