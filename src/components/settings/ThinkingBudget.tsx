@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { Save, Check, ChevronDown } from "lucide-react";
 import {
@@ -41,6 +41,31 @@ const DEFAULT_CONFIG: ThinkingBudgetConfig = {
     custom_tiered: -1,
 };
 
+type BudgetFieldKey =
+    | "flash_low"
+    | "flash_medium"
+    | "flash_high"
+    | "flash_tiered"
+    | "pro_low"
+    | "pro_high"
+    | "claude_budget"
+    | "claude_low"
+    | "claude_medium"
+    | "claude_high";
+
+const BUDGET_DEFAULTS: Record<BudgetFieldKey, number> = {
+    flash_low: 1000,
+    flash_medium: 4000,
+    flash_high: 10000,
+    flash_tiered: -1,
+    pro_low: 1001,
+    pro_high: 10001,
+    claude_budget: 16000,
+    claude_low: 1024,
+    claude_medium: 4096,
+    claude_high: 16000,
+};
+
 export default function ThinkingBudget({
     config = DEFAULT_CONFIG,
     onChange,
@@ -57,6 +82,37 @@ export default function ThinkingBudget({
         ...DEFAULT_CONFIG,
         ...config,
     };
+
+    // 预算输入框本地编辑文本状态，允许用户清空退格为 "" 或输入负号 "-"
+    const [inputValues, setInputValues] = useState<Record<string, string>>(() => {
+        const init: Record<string, string> = {};
+        for (const [key, defaultVal] of Object.entries(BUDGET_DEFAULTS)) {
+            const val = (config as any)?.[key];
+            init[key] = val !== undefined && val !== null ? String(val) : String(defaultVal);
+        }
+        return init;
+    });
+
+    // 外部配置实质性更新时同步（保留正在编辑的空值状态）
+    const lastConfigRef = useRef(config);
+    useEffect(() => {
+        if (config && config !== lastConfigRef.current) {
+            lastConfigRef.current = config;
+            setInputValues((prev) => {
+                const next = { ...prev };
+                for (const key of Object.keys(BUDGET_DEFAULTS)) {
+                    const val = (config as any)?.[key];
+                    if (val !== undefined && val !== null) {
+                        const parsed = parseInt(prev[key], 10);
+                        if (parsed !== val && prev[key] !== "" && prev[key] !== "-") {
+                            next[key] = String(val);
+                        }
+                    }
+                }
+                return next;
+            });
+        }
+    }, [config]);
 
     const handleControlSourceChange = (source: ThinkingControlSource) => {
         onChange({
@@ -86,13 +142,62 @@ export default function ThinkingBudget({
         });
     };
 
-    const handleNumberFieldChange = (field: keyof ThinkingBudgetConfig, val: string) => {
-        const parsed = parseInt(val, 10);
-        const finalVal = isNaN(parsed) ? -1 : parsed;
-        onChange({
-            ...currentConfig,
-            [field]: finalVal,
-        });
+    // 输入框变更处理：允许清空为 ""，允许 "-"，不自动补 -1
+    const handleInputChange = (field: BudgetFieldKey, rawVal: string) => {
+        if (rawVal !== "" && rawVal !== "-" && !/^-?\d+$/.test(rawVal)) {
+            return;
+        }
+        setInputValues((prev) => ({
+            ...prev,
+            [field]: rawVal,
+        }));
+
+        // 如果是合法完整数字，实时同步给配置对象；空值时不写入，留待最后保存阶段回填默认值
+        const trimmed = rawVal.trim();
+        if (trimmed !== "" && trimmed !== "-") {
+            const parsed = parseInt(trimmed, 10);
+            if (!isNaN(parsed)) {
+                onChange({
+                    ...currentConfig,
+                    [field]: parsed,
+                });
+            }
+        }
+    };
+
+    // 最后保存配置阶段：对处于清空/非法状态的预算输入框自动回填为默认值
+    const handleSave = async () => {
+        const nextInputs = { ...inputValues };
+        const nextConfig: ThinkingBudgetConfig = { ...currentConfig };
+
+        for (const [key, defaultVal] of Object.entries(BUDGET_DEFAULTS)) {
+            const valStr = (nextInputs[key] ?? "").trim();
+            let finalVal: number;
+            if (valStr === "" || valStr === "-" || isNaN(parseInt(valStr, 10))) {
+                finalVal = defaultVal;
+                nextInputs[key] = String(defaultVal);
+            } else {
+                finalVal = parseInt(valStr, 10);
+                nextInputs[key] = String(finalVal);
+            }
+            (nextConfig as any)[key] = finalVal;
+        }
+
+        // 回填到输入框界面显示
+        setInputValues(nextInputs);
+        // 同步给父组件配置
+        onChange(nextConfig);
+
+        if (onSave) {
+            setIsSaving(true);
+            try {
+                await onSave();
+                setIsSaved(true);
+                setTimeout(() => setIsSaved(false), 2000);
+            } finally {
+                setIsSaving(false);
+            }
+        }
     };
 
     const controlSource = currentConfig.control_source || "gateway";
@@ -328,12 +433,12 @@ export default function ThinkingBudget({
                                             })}
                                         </label>
                                         <input
-                                            type="number"
-                                            min={-1}
-                                            step={100}
-                                            value={currentConfig.flash_low ?? 1000}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="1000"
+                                            value={inputValues.flash_low ?? ""}
                                             onChange={(e) =>
-                                                handleNumberFieldChange("flash_low", e.target.value)
+                                                handleInputChange("flash_low", e.target.value)
                                             }
                                             className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                         />
@@ -350,12 +455,12 @@ export default function ThinkingBudget({
                                             })}
                                         </label>
                                         <input
-                                            type="number"
-                                            min={-1}
-                                            step={500}
-                                            value={currentConfig.flash_medium ?? 4000}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="4000"
+                                            value={inputValues.flash_medium ?? ""}
                                             onChange={(e) =>
-                                                handleNumberFieldChange("flash_medium", e.target.value)
+                                                handleInputChange("flash_medium", e.target.value)
                                             }
                                             className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                         />
@@ -372,12 +477,12 @@ export default function ThinkingBudget({
                                             })}
                                         </label>
                                         <input
-                                            type="number"
-                                            min={-1}
-                                            step={1000}
-                                            value={currentConfig.flash_high ?? 10000}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="10000"
+                                            value={inputValues.flash_high ?? ""}
                                             onChange={(e) =>
-                                                handleNumberFieldChange("flash_high", e.target.value)
+                                                handleInputChange("flash_high", e.target.value)
                                             }
                                             className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                         />
@@ -394,12 +499,12 @@ export default function ThinkingBudget({
                                             })}
                                         </label>
                                         <input
-                                            type="number"
-                                            min={-1}
-                                            step={1000}
-                                            value={currentConfig.flash_tiered ?? -1}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="-1"
+                                            value={inputValues.flash_tiered ?? ""}
                                             onChange={(e) =>
-                                                handleNumberFieldChange("flash_tiered", e.target.value)
+                                                handleInputChange("flash_tiered", e.target.value)
                                             }
                                             className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                         />
@@ -480,12 +585,12 @@ export default function ThinkingBudget({
                                         })}
                                     </label>
                                     <input
-                                        type="number"
-                                        min={-1}
-                                        step={100}
-                                        value={currentConfig.pro_low ?? 1001}
+                                        type="text"
+                                        inputMode="numeric"
+                                        placeholder="1001"
+                                        value={inputValues.pro_low ?? ""}
                                         onChange={(e) =>
-                                            handleNumberFieldChange("pro_low", e.target.value)
+                                            handleInputChange("pro_low", e.target.value)
                                         }
                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                     />
@@ -502,12 +607,12 @@ export default function ThinkingBudget({
                                         })}
                                     </label>
                                     <input
-                                        type="number"
-                                        min={-1}
-                                        step={1000}
-                                        value={currentConfig.pro_high ?? 10001}
+                                        type="text"
+                                        inputMode="numeric"
+                                        placeholder="10001"
+                                        value={inputValues.pro_high ?? ""}
                                         onChange={(e) =>
-                                            handleNumberFieldChange("pro_high", e.target.value)
+                                            handleInputChange("pro_high", e.target.value)
                                         }
                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
                                     />
@@ -590,31 +695,39 @@ export default function ThinkingBudget({
                                             </p>
                                         </div>
                                         <div className="flex items-center gap-1.5 flex-wrap">
-                                            {[4096, 8192, 16000, 32000, -1].map((val) => (
-                                                <button
-                                                    key={val}
-                                                    type="button"
-                                                    onClick={() => onChange({ ...currentConfig, claude_budget: val })}
-                                                    className={`px-2.5 py-1 rounded-lg text-xs font-mono font-semibold transition-all cursor-pointer ${
-                                                        (currentConfig.claude_budget ?? 16000) === val
-                                                            ? "bg-purple-600 hover:bg-purple-500 text-white shadow-xs"
-                                                            : "bg-white dark:bg-base-200 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-200 hover:border-purple-400 hover:text-purple-600 dark:hover:text-purple-300"
-                                                    }`}
-                                                >
-                                                    {val === -1 ? t("proxy.config.thinking_budget.preset_adaptive", { defaultValue: "自适应 (-1)" }) : `${val.toLocaleString()}`}
-                                                </button>
-                                            ))}
+                                            {[4096, 8192, 16000, 32000, -1].map((val) => {
+                                                const currentBudgetNum = inputValues.claude_budget !== "" && inputValues.claude_budget !== "-"
+                                                    ? parseInt(inputValues.claude_budget, 10)
+                                                    : currentConfig.claude_budget;
+                                                return (
+                                                    <button
+                                                        key={val}
+                                                        type="button"
+                                                        onClick={() => {
+                                                            setInputValues((prev) => ({ ...prev, claude_budget: String(val) }));
+                                                            onChange({ ...currentConfig, claude_budget: val });
+                                                        }}
+                                                        className={`px-2.5 py-1 rounded-lg text-xs font-mono font-semibold transition-all cursor-pointer ${
+                                                            currentBudgetNum === val
+                                                                ? "bg-purple-600 hover:bg-purple-500 text-white shadow-xs"
+                                                                : "bg-white dark:bg-base-200 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-200 hover:border-purple-400 hover:text-purple-600 dark:hover:text-purple-300"
+                                                        }`}
+                                                    >
+                                                        {val === -1 ? t("proxy.config.thinking_budget.preset_adaptive", { defaultValue: "自适应 (-1)" }) : `${val.toLocaleString()}`}
+                                                    </button>
+                                                );
+                                            })}
                                         </div>
                                     </div>
 
                                     <div className="flex items-center gap-3">
                                         <input
-                                            type="number"
-                                            min={-1}
-                                            step={1000}
-                                            value={currentConfig.claude_budget ?? 16000}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="16000"
+                                            value={inputValues.claude_budget ?? ""}
                                             onChange={(e) =>
-                                                handleNumberFieldChange("claude_budget", e.target.value)
+                                                handleInputChange("claude_budget", e.target.value)
                                             }
                                             className="w-48 px-3 py-1.5 border border-purple-300 dark:border-purple-800/80 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-bold text-purple-700 dark:text-purple-300 focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500 shadow-2xs"
                                         />
@@ -654,11 +767,11 @@ export default function ThinkingBudget({
                                                         {t("proxy.config.thinking_budget.tier_low", { defaultValue: "Low 档位" })}
                                                     </label>
                                                     <input
-                                                        type="number"
-                                                        min={-1}
-                                                        step={512}
-                                                        value={currentConfig.claude_low ?? 1024}
-                                                        onChange={(e) => handleNumberFieldChange("claude_low", e.target.value)}
+                                                        type="text"
+                                                        inputMode="numeric"
+                                                        placeholder="1024"
+                                                        value={inputValues.claude_low ?? ""}
+                                                        onChange={(e) => handleInputChange("claude_low", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
@@ -670,11 +783,11 @@ export default function ThinkingBudget({
                                                         {t("proxy.config.thinking_budget.tier_medium", { defaultValue: "Medium 档位" })}
                                                     </label>
                                                     <input
-                                                        type="number"
-                                                        min={-1}
-                                                        step={1024}
-                                                        value={currentConfig.claude_medium ?? 4096}
-                                                        onChange={(e) => handleNumberFieldChange("claude_medium", e.target.value)}
+                                                        type="text"
+                                                        inputMode="numeric"
+                                                        placeholder="4096"
+                                                        value={inputValues.claude_medium ?? ""}
+                                                        onChange={(e) => handleInputChange("claude_medium", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
@@ -686,11 +799,11 @@ export default function ThinkingBudget({
                                                         {t("proxy.config.thinking_budget.tier_high", { defaultValue: "High 档位" })}
                                                     </label>
                                                     <input
-                                                        type="number"
-                                                        min={-1}
-                                                        step={1000}
-                                                        value={currentConfig.claude_high ?? 16000}
-                                                        onChange={(e) => handleNumberFieldChange("claude_high", e.target.value)}
+                                                        type="text"
+                                                        inputMode="numeric"
+                                                        placeholder="16000"
+                                                        value={inputValues.claude_high ?? ""}
+                                                        onChange={(e) => handleInputChange("claude_high", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
@@ -733,16 +846,7 @@ export default function ThinkingBudget({
                     <button
                         type="button"
                         disabled={isSaving}
-                        onClick={async () => {
-                            setIsSaving(true);
-                            try {
-                                await onSave();
-                                setIsSaved(true);
-                                setTimeout(() => setIsSaved(false), 2000);
-                            } finally {
-                                setIsSaving(false);
-                            }
-                        }}
+                        onClick={handleSave}
                         className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-all active:scale-95 shrink-0 cursor-pointer ${
                             isSaved
                                 ? "bg-emerald-600 hover:bg-emerald-500 text-white"
