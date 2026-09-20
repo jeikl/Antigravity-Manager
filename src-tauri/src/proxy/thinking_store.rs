@@ -776,9 +776,7 @@ impl ThinkingStore {
             let has_function_call = parts.iter().any(|p| p.get("functionCall").is_some());
             let is_claude_target = target_model
                 .map(|m| m.to_lowercase().contains("claude"))
-                .unwrap_or(false)
-                || is_claude_signature(rec.signature.as_deref().unwrap_or_default())
-                || store_key.to_lowercase().contains("claude");
+                .unwrap_or_else(|| store_key.to_lowercase().contains("claude"));
 
             // 核心法则：优先复用真实加密签名，无论是工具调用还是纯文本轮次；
             // 绝不盲目覆盖真实签名！仅当缺少真实签名且目标非 Claude 模型时，才使用哨兵占位
@@ -1352,17 +1350,7 @@ pub fn finalize_gemini_contents_thinking_with_model(
                 let has_function_call = other_parts.iter().any(|p| p.get("functionCall").is_some());
                 let is_claude_turn = target_model
                     .map(|m| m.to_lowercase().contains("claude"))
-                    .unwrap_or(false)
-                    || thinking_parts.iter().any(|tp| {
-                        tp.get("thoughtSignature")
-                            .and_then(|s| s.as_str())
-                            .map(is_claude_signature)
-                            .unwrap_or(false)
-                    })
-                    || turn_real_sig
-                        .as_deref()
-                        .map(is_claude_signature)
-                        .unwrap_or(false);
+                    .unwrap_or(false);
 
                 if has_function_call {
                     if thinking_parts.is_empty() {
@@ -1892,20 +1880,15 @@ pub fn is_real_signature(sig: &str) -> bool {
 
 /// 判断签名是否属于 Claude 家族的签名
 pub fn is_claude_signature(sig: &str) -> bool {
-    if sig.starts_with("Eu8") {
-        return true;
-    }
     use base64::Engine;
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(sig) {
-        if let Ok(s) = std::str::from_utf8(&decoded) {
-            if s.starts_with("Eu8")
-                || (s.len() >= 50 && (s.contains("claude") || s.contains("thinking")))
-            {
-                return true;
-            }
-        }
         if decoded.windows(6).any(|w| w == b"claude") {
             return true;
+        }
+        if let Ok(inner) = base64::engine::general_purpose::STANDARD.decode(&decoded) {
+            if inner.windows(6).any(|w| w == b"claude") {
+                return true;
+            }
         }
     }
     false
@@ -1919,12 +1902,10 @@ pub fn ensure_google_claude_thought_signature(sig: &str) -> String {
         return sig.to_string();
     }
     use base64::Engine;
-    // 如果已经由 Base64 包装过（即 base64 decode 出来是合法的 "Eu8..." ASCII 字符串），无需重复包装
+    // 如果已经由 Base64 包装过（即 base64 decode 出来能再解出 b"claude"），无需重复包装
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(sig) {
-        if let Ok(s) = std::str::from_utf8(&decoded) {
-            if s.starts_with("Eu8")
-                || (s.len() >= 50 && (s.contains("claude") || s.contains("thinking")))
-            {
+        if let Ok(inner) = base64::engine::general_purpose::STANDARD.decode(&decoded) {
+            if inner.windows(6).any(|w| w == b"claude") {
                 return sig.to_string();
             }
         }
@@ -1940,11 +1921,11 @@ pub fn ensure_raw_claude_thought_signature(sig: &str) -> String {
     }
     use base64::Engine;
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(sig) {
-        if let Ok(s) = String::from_utf8(decoded) {
-            if s.starts_with("Eu8")
-                || (s.len() >= 50 && (s.contains("claude") || s.contains("thinking")))
-            {
-                return s;
+        if let Ok(inner) = base64::engine::general_purpose::STANDARD.decode(&decoded) {
+            if inner.windows(6).any(|w| w == b"claude") {
+                if let Ok(s) = String::from_utf8(decoded) {
+                    return s;
+                }
             }
         }
     }
@@ -1956,11 +1937,11 @@ pub fn ensure_raw_claude_thought_signature(sig: &str) -> String {
 pub fn normalize_signature_for_comparison(sig: &str) -> std::borrow::Cow<'_, str> {
     use base64::Engine;
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(sig) {
-        if let Ok(s) = String::from_utf8(decoded) {
-            if s.starts_with("Eu8")
-                || (s.len() >= 50 && (s.contains("claude") || s.contains("thinking")))
-            {
-                return std::borrow::Cow::Owned(s);
+        if let Ok(inner) = base64::engine::general_purpose::STANDARD.decode(&decoded) {
+            if inner.windows(6).any(|w| w == b"claude") {
+                if let Ok(s) = String::from_utf8(decoded) {
+                    return std::borrow::Cow::Owned(s);
+                }
             }
         }
     }
