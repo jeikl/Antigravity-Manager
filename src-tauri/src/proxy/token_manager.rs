@@ -2194,11 +2194,15 @@ impl TokenManager {
                                 // 清除所有限流记录
                                 self.rate_limit_tracker.clear_for_optimistic_reset();
 
-                                // 再次尝试选择账号
+                                // 再次尝试选择账号 (必须重新校验剩余限流状态，严禁放行周配额耗尽等长锁定账号)
                                 let final_token = tokens_snapshot.iter().find(|t| {
                                     !attempted.contains(&t.account_id)
                                         && !(quota_protection_enabled
                                             && t.protected_models.contains(&normalized_target))
+                                        && !self.rate_limit_tracker.is_rate_limited(
+                                            &t.account_id,
+                                            Some(&normalized_target),
+                                        )
                                 });
 
                                 if let Some(t) = final_token {
