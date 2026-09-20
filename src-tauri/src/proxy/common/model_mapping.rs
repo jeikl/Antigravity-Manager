@@ -332,6 +332,38 @@ pub fn resolve_model_route(
 /// - `claude-sonnet-4-5`: All Claude Sonnet variants (3-5-sonnet, sonnet-4-5, etc.)
 ///
 /// Returns `None` if the model doesn't match any of the 3 protected categories.
+/// 判断是否为 Gemini 3.5 Flash 及以上的高阶 Flash 模型（与 3.1 Pro 共享高级配额）
+/// 严格语义通配：gemini-{ver}-flash*，当版本数值 ver >= 3.5 时生效（支持未来任意 3.10、4.x 等）
+fn is_high_tier_flash(lower: &str) -> bool {
+    if !lower.contains("flash") {
+        return false;
+    }
+
+    if let Some(pos) = lower.find("gemini-") {
+        let rest = &lower[pos + 7..];
+        if let Some(flash_pos) = rest.find("-flash") {
+            let ver = &rest[..flash_pos];
+            let mut parts = ver.split('.');
+            if let Some(major_s) = parts.next() {
+                if let Ok(major) = major_s.parse::<u32>() {
+                    if major > 3 {
+                        return true;
+                    }
+                    if major == 3 {
+                        if let Some(minor_s) = parts.next() {
+                            if let Ok(minor) = minor_s.parse::<u32>() {
+                                return minor >= 5;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
@@ -345,12 +377,17 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-image".to_string());
     }
 
-    // 2. gemini-3-flash (包含所有 flash 变体)
+    // 2. 3.5 Flash 及以上的高阶 Flash 模型（如 3.5-flash, 3.7-flash, 3.8-flash 等）与 3.1 Pro 共享高级配额
+    if is_high_tier_flash(&lower) {
+        return Some("gemini-3-pro-high".to_string());
+    }
+
+    // 3. gemini-3-flash (包含普通 1.5-flash, 2.0-flash, 2.5-flash, 3.0-flash 等基础 flash 变体)
     if lower.contains("flash") {
         return Some("gemini-3-flash".to_string());
     }
 
-    // 3. gemini-3-pro-high (包含 pro 变体)
+    // 4. gemini-3-pro-high (包含 pro 变体)
     if lower.contains("pro") && !lower.contains("image") {
         return Some("gemini-3-pro-high".to_string());
     }

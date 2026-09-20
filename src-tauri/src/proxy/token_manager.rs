@@ -3748,24 +3748,13 @@ impl TokenManager {
                 let is_gemini_group = group_name.to_lowercase().contains("gemini");
 
                 let target_models = if is_claude_group || group_name.to_lowercase().contains("3p") {
-                    vec![
-                        "claude".to_string(),
-                        "claude-sonnet-4-6".to_string(),
-                        "claude-opus-4-6".to_string(),
-                        "claude-3-5-sonnet".to_string(),
-                    ]
+                    vec!["claude".to_string(), "claude-sonnet-4-6".to_string()]
                 } else if is_gemini_group || group_name.to_lowercase().contains("gemini") {
                     vec![
                         "gemini-3-pro-high".to_string(),
-                        "gemini-3.1-pro-high".to_string(),
-                        "gemini-1.5-pro".to_string(),
-                        "gemini-2.5-pro".to_string(),
-                        "gemini-pro".to_string(),
                         "gemini-3-flash".to_string(),
                         "gemini-3.1-flash-image".to_string(),
                         "gemini-3-pro-image".to_string(),
-                        "gemini-3.8-flash-tiered".to_string(),
-                        "gemini-3.8-flash-high".to_string(),
                     ]
                 } else {
                     vec![]
