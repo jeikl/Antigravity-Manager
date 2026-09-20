@@ -157,7 +157,12 @@ impl SignatureCache {
                 signature.len(),
                 family
             );
-            cache.insert(signature, CacheEntry::new(family));
+            let norm = crate::proxy::thinking_store::normalize_signature_for_comparison(&signature)
+                .into_owned();
+            cache.insert(signature.clone(), CacheEntry::new(family.clone()));
+            if norm != signature {
+                cache.insert(norm, CacheEntry::new(family));
+            }
 
             if cache.len() > FAMILY_CACHE_LIMIT {
                 let before = cache.len();
@@ -182,6 +187,14 @@ impl SignatureCache {
                     return Some(entry.data.clone());
                 } else {
                     tracing::debug!("[SignatureCache] Signature family entry expired");
+                }
+            }
+            let alt = crate::proxy::thinking_store::normalize_signature_for_comparison(signature);
+            if alt.as_ref() != signature {
+                if let Some(entry) = cache.get(alt.as_ref()) {
+                    if !entry.is_expired() {
+                        return Some(entry.data.clone());
+                    }
                 }
             }
         }

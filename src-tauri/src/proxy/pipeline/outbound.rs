@@ -216,7 +216,9 @@ impl OutboundThinkingPipeline {
                 "thinking": th,
             });
             if let Some(ref sig) = payload.signature {
-                th_block["signature"] = json!(sig);
+                let client_sig =
+                    crate::proxy::thinking_store::ensure_raw_claude_thought_signature(sig);
+                th_block["signature"] = json!(client_sig);
             }
             content.push(th_block);
         }

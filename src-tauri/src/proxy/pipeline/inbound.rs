@@ -17,9 +17,10 @@ impl InboundThinkingPipeline {
         target_model: &str,
         is_thinking_enabled: bool,
         session_id: Option<&str>,
-        _is_retry: bool,
+        is_retry: bool,
     ) {
         let trusts_signature = protocol.trusts_client_signature();
+        let is_claude = target_model.to_lowercase().contains("claude");
 
         // 1. 协议策略清洗与位置规范化
         for content in contents.iter_mut() {
@@ -34,7 +35,7 @@ impl InboundThinkingPipeline {
                     let mut extra_thinking_parts = Vec::new();
                     let mut other_parts = Vec::new();
 
-                    for part in parts.drain(..) {
+                    for mut part in parts.drain(..) {
                         let is_thought = part
                             .get("thought")
                             .and_then(|v| v.as_bool())
@@ -49,7 +50,6 @@ impl InboundThinkingPipeline {
                                 crate::proxy::thinking_store::is_placeholder_thought(text);
 
                             // 校验客户端签名有效性与模型兼容性
-                            let is_claude = target_model.to_lowercase().contains("claude");
                             let mut effective_sig = None;
                             if let Some(sig) = part
                                 .get("thoughtSignature")
@@ -76,7 +76,12 @@ impl InboundThinkingPipeline {
                                         None => true,
                                     };
                                     if compatible {
-                                        effective_sig = Some(sig.to_string());
+                                        let final_sig = if is_claude {
+                                            crate::proxy::thinking_store::ensure_google_claude_thought_signature(sig)
+                                        } else {
+                                            sig.to_string()
+                                        };
+                                        effective_sig = Some(final_sig);
                                     }
                                 }
                             }
@@ -131,11 +136,16 @@ impl InboundThinkingPipeline {
                                         } else {
                                             &clean_thought
                                         };
-                                        thinking_part = Some(json!({
+                                        let mut t_obj = json!({
                                             "text": final_thought,
                                             "thought": true,
-                                            "thoughtSignature": crate::proxy::thinking_store::SENTINEL_SIGNATURE,
-                                        }));
+                                        });
+                                        if !is_claude {
+                                            t_obj["thoughtSignature"] = json!(
+                                                crate::proxy::thinking_store::SENTINEL_SIGNATURE
+                                            );
+                                        }
+                                        thinking_part = Some(t_obj);
                                     }
                                     // 若已有思考块，该遗留思考块作为陈旧副本剥离，防止二次污染正文
                                     continue;
@@ -143,6 +153,27 @@ impl InboundThinkingPipeline {
 
                                 other_parts.push(part);
                             } else {
+                                if is_claude {
+                                    if let Some(sig) =
+                                        part.get("thoughtSignature").and_then(|s| s.as_str())
+                                    {
+                                        if sig == crate::proxy::thinking_store::SENTINEL_SIGNATURE {
+                                            if let Some(obj) = part.as_object_mut() {
+                                                obj.remove("thoughtSignature");
+                                            }
+                                        } else {
+                                            let wrapped = crate::proxy::thinking_store::ensure_google_claude_thought_signature(sig);
+                                            if wrapped != sig {
+                                                if let Some(obj) = part.as_object_mut() {
+                                                    obj.insert(
+                                                        "thoughtSignature".to_string(),
+                                                        json!(wrapped),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 other_parts.push(part);
                             }
                         }
@@ -161,16 +192,21 @@ impl InboundThinkingPipeline {
         }
 
         // 2. 状态机无损复活 (Hydration)
-        if is_thinking_enabled {
+        if is_thinking_enabled && !is_retry {
             if let Some(s_id) = session_id {
-                crate::proxy::thinking_store::hydrate_gemini_contents(s_id, contents);
+                crate::proxy::thinking_store::hydrate_gemini_contents_with_model(
+                    s_id,
+                    contents,
+                    Some(target_model),
+                );
             }
         }
 
         // 3. 终审把关与脱敏规范化 (Finalize)
-        crate::proxy::thinking_store::finalize_gemini_contents_thinking(
+        crate::proxy::thinking_store::finalize_gemini_contents_thinking_with_model(
             contents,
             is_thinking_enabled,
+            Some(target_model),
         );
     }
 
@@ -290,5 +326,108 @@ mod tests {
         assert_eq!(parts[0]["text"], "分析了案例数据，准备调用工具。");
         assert_eq!(parts[1]["text"], "正在执行检查。");
         assert!(parts[2].get("functionCall").is_some());
+    }
+
+    #[test]
+    fn test_claude_model_packages_signature_for_google_vertex() {
+        let raw_claude_sig = "Eu8CCpIBCBIQAhgCKkAtARbmpPNxYxc/Yz+mpbWJOqMo9c9RF4ESxACD0e/d6SZTpwmbrf9gPP/XMGZ9+kBkTMBfdK7ICuVonHJuu1AcMg9jbGF1ZGUtb3B1cy00LTY4AEIIdGhpbmtpbmdaDDg4NDM1NDkxOTA1MnIQLmWKBlED8AVhXRwj5Lb+PogBAagBosG91QawAQISDFXhwclEQyYNjsDteRoMuuu1Y/dUbn7sPe5OIjBoGvxrSlIgU78kwl701wfF0Rj0BCaCpE6a+KRGaB5pO2vL3ox4+yqum5a8o7mQ8+kqiQFDBTvaDITieiRVrkA8EKBUrpV0rLDyEcL7iQnAMsdQOk31ZKDeBddhEVX+Tb7Qs9mNWXNW9cbrs82iea09O+j2IMs0ibbWXPHB20IlkhVc5q9MmKBYgeQSTzKz+8Tgf7EDd78lkYieVk6GHqQaNiWD1Sl+RO0mIDGwURmOON6Fyw6WkCh/WSF+ORgB";
+        let expected_google_vertex_sig = "RXU4Q0NwSUJDQklRQWhnQ0trQXRBUmJtcFBOeFl4Yy9ZeittcGJXSk9xTW85YzlSRjRFU3hBQ0QwZS9kNlNaVHB3bWJyZjlnUFAvWE1HWjkra0JrVE1CZmRLN0lDdVZvbkhKdXUxQWNNZzlqYkdGMVpHVXRiM0IxY3kwMExUWTRBRUlJZEdocGJtdHBibWRhRERnNE5ETTFORGt4T1RBMU1uSVFMbVdLQmxFRDhBVmhYUndqNUxiK1BvZ0JBYWdCb3NHOTFRYXdBUUlTREZYaHdjbEVReVlOanNEdGVSb011dXUxWS9kVWJuN3NQZTVPSWpCb0d2eHJTbElnVTc4a3dsNzAxd2ZGMFJqMEJDYUNwRTZhK0tSR2FCNXBPMnZMM294NCt5cXVtNWE4bzdtUTgra3FpUUZEQlR2YURJVGllaVJWcmtBOEVLQlVycFYwckxEeUVjTDdpUW5BTXNkUU9rMzFaS0RlQmRkaEVWWCtUYjdRczltTldYTlc5Y2JyczgyaWVhMDlPK2oySU1zMGliYldYUEhCMjBJbGtoVmM1cTlNbUtCWWdlUVNUekt6KzhUZ2Y3RURkNzhsa1lpZVZrNkdIcVFhTmlXRDFTbCtSTzBtSURHd1VSbU9PTjZGeXc2V2tDaC9XU0YrT1JnQg==";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Let me think about this.",
+                    "thought": true,
+                    "thoughtSignature": raw_claude_sig
+                },
+                {
+                    "text": "Here is the response."
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::AnthropicClaude,
+            "claude-opus-4-6-thinking",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], expected_google_vertex_sig);
+        assert_eq!(parts[1]["text"], "Here is the response.");
+    }
+
+    #[test]
+    fn test_claude_model_from_openai_protocol_packages_signature() {
+        let raw_claude_sig = "Eu8CCpIBCBIQAhgCKkAtARbmpPNxYxc/Yz+mpbWJOqMo9c9RF4ESxACD0e/d6SZTpwmbrf9gPP/XMGZ9+kBkTMBfdK7ICuVonHJuu1AcMg9jbGF1ZGUtb3B1cy00LTY4AEIIdGhpbmtpbmdaDDg4NDM1NDkxOTA1MnIQLmWKBlED8AVhXRwj5Lb+PogBAagBosG91QawAQISDFXhwclEQyYNjsDteRoMuuu1Y/dUbn7sPe5OIjBoGvxrSlIgU78kwl701wfF0Rj0BCaCpE6a+KRGaB5pO2vL3ox4+yqum5a8o7mQ8+kqiQFDBTvaDITieiRVrkA8EKBUrpV0rLDyEcL7iQnAMsdQOk31ZKDeBddhEVX+Tb7Qs9mNWXNW9cbrs82iea09O+j2IMs0ibbWXPHB20IlkhVc5q9MmKBYgeQSTzKz+8Tgf7EDd78lkYieVk6GHqQaNiWD1Sl+RO0mIDGwURmOON6Fyw6WkCh/WSF+ORgB";
+        let expected_google_vertex_sig = "RXU4Q0NwSUJDQklRQWhnQ0trQXRBUmJtcFBOeFl4Yy9ZeittcGJXSk9xTW85YzlSRjRFU3hBQ0QwZS9kNlNaVHB3bWJyZjlnUFAvWE1HWjkra0JrVE1CZmRLN0lDdVZvbkhKdXUxQWNNZzlqYkdGMVpHVXRiM0IxY3kwMExUWTRBRUlJZEdocGJtdHBibWRhRERnNE5ETTFORGt4T1RBMU1uSVFMbVdLQmxFRDhBVmhYUndqNUxiK1BvZ0JBYWdCb3NHOTFRYXdBUUlTREZYaHdjbEVReVlOanNEdGVSb011dXUxWS9kVWJuN3NQZTVPSWpCb0d2eHJTbElnVTc4a3dsNzAxd2ZGMFJqMEJDYUNwRTZhK0tSR2FCNXBPMnZMM294NCt5cXVtNWE4bzdtUTgra3FpUUZEQlR2YURJVGllaVJWcmtBOEVLQlVycFYwckxEeUVjTDdpUW5BTXNkUU9rMzFaS0RlQmRkaEVWWCtUYjdRczltTldYTlc5Y2JyczgyaWVhMDlPK2oySU1zMGliYldYUEhCMjBJbGtoVmM1cTlNbUtCWWdlUVNUekt6KzhUZ2Y3RURkNzhsa1lpZVZrNkdIcVFhTmlXRDFTbCtSTzBtSURHd1VSbU9PTjZGeXc2V2tDaC9XU0YrT1JnQg==";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Thinking process",
+                    "thought": true,
+                    "thoughtSignature": raw_claude_sig
+                },
+                {
+                    "text": "Answer from OpenAI gateway"
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIResponses,
+            "claude-sonnet-4-6",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thoughtSignature"], expected_google_vertex_sig);
+        assert_eq!(parts[1]["text"], "Answer from OpenAI gateway");
+    }
+
+    #[test]
+    fn test_gemini_native_signature_preserved_without_double_encoding() {
+        let gemini_sig = "EudDCuRDAWkUfRO9pMXsHitwdfey4TDAgCv1WzzMfBXVamvaqJ01BJPawr58";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Gemini thinking",
+                    "thought": true,
+                    "thoughtSignature": gemini_sig
+                },
+                {
+                    "text": "Gemini answer"
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::GeminiNative,
+            "gemini-3.8-flash-high",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        // Gemini 原生签名绝不被二次编码，必须原样保留
+        assert_eq!(parts[0]["thoughtSignature"], gemini_sig);
+        assert_eq!(parts[1]["text"], "Gemini answer");
     }
 }
