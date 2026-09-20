@@ -3723,7 +3723,7 @@ impl TokenManager {
         earliest_ts
     }
 
-    /// [NEW] 检查并同步零配额持续熔断（5小时窗口或周配额用光直接持续熔断至重置时间）
+    /// [NEW] 检查并同步零配额持续熔断（周配额归零无条件锁定，5小时窗口归零结合开关；配额恢复自动解封）
     fn sync_zero_quota_circuit_breaker(&self, account_id: &str, account: &serde_json::Value) {
         let lock_on_zero = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
             cfg.enabled && cfg.lock_on_zero_quota
@@ -3731,16 +3731,12 @@ impl TokenManager {
             false
         };
 
-        if !lock_on_zero {
-            return;
-        }
-
         let quota = match account.get("quota") {
             Some(q) => q,
             None => return,
         };
 
-        // 1. 优先检查 quota_groups 中的 5h 和 weekly buckets，按模型组精准隔离，杜绝全账号误杀
+        // 1. 优先检查 quota_groups 中的 5h 和 weekly buckets，按模型组精准隔离
         if let Some(groups) = quota.get("quota_groups").and_then(|g| g.as_array()) {
             for group in groups {
                 let group_name = group
@@ -3751,7 +3747,39 @@ impl TokenManager {
                     || group_name.to_lowercase().contains("gpt");
                 let is_gemini_group = group_name.to_lowercase().contains("gemini");
 
+                let target_models = if is_claude_group || group_name.to_lowercase().contains("3p") {
+                    vec![
+                        "claude".to_string(),
+                        "claude-sonnet-4-6".to_string(),
+                        "claude-opus-4-6".to_string(),
+                        "claude-3-5-sonnet".to_string(),
+                    ]
+                } else if is_gemini_group || group_name.to_lowercase().contains("gemini") {
+                    vec![
+                        "gemini-3-pro-high".to_string(),
+                        "gemini-3.1-pro-high".to_string(),
+                        "gemini-1.5-pro".to_string(),
+                        "gemini-2.5-pro".to_string(),
+                        "gemini-pro".to_string(),
+                        "gemini-3-flash".to_string(),
+                        "gemini-3.1-flash-image".to_string(),
+                        "gemini-3-pro-image".to_string(),
+                        "gemini-3.8-flash-tiered".to_string(),
+                        "gemini-3.8-flash-high".to_string(),
+                    ]
+                } else {
+                    vec![]
+                };
+
+                if target_models.is_empty() {
+                    continue;
+                }
+
                 if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                    let mut weekly_exhausted: Option<String> = None;
+                    let mut five_hour_exhausted: Option<String> = None;
+                    let mut has_positive_quota = false;
+
                     for bucket in buckets {
                         let remaining_fraction = bucket
                             .get("remaining_fraction")
@@ -3763,36 +3791,72 @@ impl TokenManager {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
 
-                        // 如果 5h 或 weekly 配额耗尽 (<= 0.001)
+                        let window = bucket
+                            .get("window")
+                            .or_else(|| bucket.get("bucket_id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+
+                        let is_weekly = window.contains("week") || window.contains("7d");
+                        let is_5h = window.contains("5h") || window.contains("hour");
+
                         if remaining_fraction <= 0.001 && !reset_time.is_empty() {
-                            let bucket_id = bucket
-                                .get("bucket_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-
-                            let target_models = if is_claude_group || bucket_id.contains("3p") {
-                                vec!["claude".to_string(), "claude-sonnet-4-6".to_string()]
-                            } else if is_gemini_group || bucket_id.contains("gemini") {
-                                vec![
-                                    "gemini-3-flash".to_string(),
-                                    "gemini-3.1-pro-high".to_string(),
-                                    "gemini-3.1-flash-image".to_string(),
-                                    "gemini-3.8-flash-tiered".to_string(),
-                                    "gemini-3.8-flash-high".to_string(),
-                                ]
-                            } else {
-                                vec![]
-                            };
-
-                            for tm in &target_models {
-                                self.rate_limit_tracker.set_lockout_until_iso_with_cap(
-                                    account_id,
-                                    reset_time,
-                                    crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
-                                    Some(tm.clone()),
-                                    false,
-                                );
+                            if is_weekly {
+                                weekly_exhausted = Some(reset_time.to_string());
+                            } else if is_5h {
+                                five_hour_exhausted = Some(reset_time.to_string());
                             }
+                        } else if remaining_fraction > 0.001 {
+                            has_positive_quota = true;
+                        }
+                    }
+
+                    // [规则 1: 持续锁定]
+                    // - 周配额耗尽属于绝对硬约束，无需依赖可选开关；
+                    // - 5小时窗口耗尽结合 lock_on_zero 开关
+                    let lock_reset_time = if let Some(ref w_reset) = weekly_exhausted {
+                        Some(w_reset.as_str())
+                    } else if lock_on_zero {
+                        five_hour_exhausted.as_deref()
+                    } else {
+                        None
+                    };
+
+                    if let Some(reset_time) = lock_reset_time {
+                        for tm in &target_models {
+                            self.rate_limit_tracker.set_lockout_until_iso_with_cap(
+                                account_id,
+                                reset_time,
+                                crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+                                Some(tm.clone()),
+                                false,
+                            );
+                        }
+                        tracing::warn!(
+                            "[CircuitBreaker] 账号 {} 的模型组 {} 配额已耗尽，已持续锁定至 {}",
+                            account_id,
+                            group_name,
+                            reset_time
+                        );
+                    } else if weekly_exhausted.is_none()
+                        && (five_hour_exhausted.is_none() || !lock_on_zero)
+                        && has_positive_quota
+                    {
+                        // [规则 2: 提前重置自动恢复 (Early Provider Reset Reconciliation)]
+                        // 若刷新配额确认该模型组配额已为正值且不再耗尽，立即解除此前的模型级持续锁定
+                        let mut any_cleared = false;
+                        for tm in &target_models {
+                            if self.rate_limit_tracker.clear_model(account_id, tm) {
+                                any_cleared = true;
+                            }
+                        }
+                        if any_cleared {
+                            tracing::info!(
+                                "[CircuitBreaker] 账号 {} 的模型组 {} 配额已提前恢复，已自动解除此前的持续锁定",
+                                account_id,
+                                group_name
+                            );
                         }
                     }
                 }

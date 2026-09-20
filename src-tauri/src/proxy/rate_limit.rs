@@ -131,6 +131,22 @@ impl RateLimitTracker {
                         .as_secs();
                 }
             }
+
+            // [双重守卫] 若直接匹配未命中，通过归一化标准 ID 兜底检查（确保 gemini-*-pro 等所有变体对齐标准组锁定）
+            if let Some(std_id) = crate::proxy::common::model_mapping::normalize_to_standard_id(m) {
+                if std_id != m {
+                    let std_key = self.get_limit_key(account_id, Some(&std_id));
+                    if let Some(info) = self.limits.get(&std_key) {
+                        if info.reset_time > now {
+                            return info
+                                .reset_time
+                                .duration_since(now)
+                                .unwrap_or(Duration::from_secs(0))
+                                .as_secs();
+                        }
+                    }
+                }
+            }
         }
 
         0
@@ -190,6 +206,20 @@ impl RateLimitTracker {
         };
 
         let key = self.get_limit_key(account_id, model.as_deref());
+
+        // [防倒退保护] 若已有更长、未过期的锁定时间，防止被后续较短的重置时间覆盖（如周配额 5 天不被 5H 窗口覆盖）
+        if let Some(existing) = self.limits.get(&key) {
+            if existing.reset_time > now && existing.reset_time > effective_reset_time {
+                tracing::info!(
+                    "Retaining existing longer lockout for {} (existing: {}s > new: {}s)",
+                    key,
+                    existing.retry_after_sec,
+                    retry_sec
+                );
+                return;
+            }
+        }
+
         self.limits.insert(key, info);
 
         if let Some(m) = &model {
@@ -777,11 +807,6 @@ impl RateLimitTracker {
         let now = SystemTime::now();
         self.limits.retain(|_, info| {
             info.reason == RateLimitReason::QuotaExhausted
-                && info
-                    .model
-                    .as_deref()
-                    .and_then(normalize_image_model_id)
-                    .is_some()
                 && info
                     .reset_time
                     .duration_since(info.detected_at)
